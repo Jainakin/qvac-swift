@@ -1,0 +1,154 @@
+{
+  "uint_0": {
+    "codec": "uint",
+    "value": 0,
+    "hex": "00"
+  },
+  "uint_1": {
+    "codec": "uint",
+    "value": 1,
+    "hex": "01"
+  },
+  "uint_252": {
+    "codec": "uint",
+    "value": 252,
+    "hex": "fc"
+  },
+  "uint_253": {
+    "codec": "uint",
+    "value": 253,
+    "hex": "fdfd00"
+  },
+  "uint_65535": {
+    "codec": "uint",
+    "value": 65535,
+    "hex": "fdffff"
+  },
+  "uint_65536": {
+    "codec": "uint",
+    "value": 65536,
+    "hex": "fe00000100"
+  },
+  "uint_4294967295": {
+    "codec": "uint",
+    "value": 4294967295,
+    "hex": "feffffffff"
+  },
+  "uint_4294967296": {
+    "codec": "uint",
+    "value": 4294967296,
+    "hex": "ff0000000001000000"
+  },
+  "int_0": {
+    "codec": "int",
+    "value": 0,
+    "hex": "00"
+  },
+  "int_-1": {
+    "codec": "int",
+    "value": -1,
+    "hex": "01"
+  },
+  "int_1": {
+    "codec": "int",
+    "value": 1,
+    "hex": "02"
+  },
+  "int_-100": {
+    "codec": "int",
+    "value": -100,
+    "hex": "c7"
+  },
+  "int_100": {
+    "codec": "int",
+    "value": 100,
+    "hex": "c8"
+  },
+  "int_-65536": {
+    "codec": "int",
+    "value": -65536,
+    "hex": "feffff0100"
+  },
+  "uint32_0": {
+    "codec": "uint32",
+    "value": 0,
+    "hex": "00000000"
+  },
+  "uint32_1": {
+    "codec": "uint32",
+    "value": 1,
+    "hex": "01000000"
+  },
+  "uint32_0xdeadbeef": {
+    "codec": "uint32",
+    "value": 3735928559,
+    "hex": "efbeadde"
+  },
+  "uint32_max": {
+    "codec": "uint32",
+    "value": 4294967295,
+    "hex": "ffffffff"
+  },
+  "bool_true": {
+    "codec": "bool",
+    "value": true,
+    "hex": "01"
+  },
+  "bool_false": {
+    "codec": "bool",
+    "value": false,
+    "hex": "00"
+  },
+  "utf8_empty": {
+    "codec": "utf8",
+    "value": "",
+    "hex": "00"
+  },
+  "utf8_hello": {
+    "codec": "utf8",
+    "value": "hello",
+    "hex": "0568656c6c6f"
+  },
+  "utf8_emoji": {
+    "codec": "utf8",
+    "value": "hi 🌊 qvac",
+    "hex": "0c686920f09f8c8a2071766163"
+  },
+  "buffer_empty": {
+    "codec": "buffer",
+    "value": "",
+    "hex": "00"
+  },
+  "buffer_3bytes": {
+    "codec": "buffer",
+    "value": "010203",
+    "hex": "03010203"
+  },
+  "buffer_300bytes": {
+    "codec": "buffer",
+    "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "hex": "fd2c01aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "optBuffer_null": {
+    "codec": "optionalBuffer",
+    "value": null,
+    "hex": "00"
+  },
+  "optBuffer_empty": {
+    "codec": "optionalBuffer",
+    "value": "",
+    "hex": "00"
+  },
+  "optBuffer_3bytes": {
+    "codec": "optionalBuffer",
+    "value": "0a0b0c",
+    "hex": "030a0b0c"
+  },
+  "frame_init_config_request": {
+    "codec": "frame",
+    "description": "Full bare-rpc REQUEST frame carrying __init_config payload",
+    "bodyLength": 97,
+    "hex": "61000000010101005c7b2274797065223a225f5f696e69745f636f6e666967222c22636f6e666967223a7b7d2c2272756e74696d65436f6e74657874223a7b2272756e74696d65223a2262617265222c22706c6174666f726d223a2264617277696e227d7d",
+    "json": "{\"type\":\"__init_config\",\"config\":{},\"runtimeContext\":{\"runtime\":\"bare\",\"platform\":\"darwin\"}}"
+  }
+}

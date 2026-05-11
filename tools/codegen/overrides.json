@@ -1,0 +1,11 @@
+{
+  "_comment": "Per-(side/discriminator) overrides for the type generator. See tools/codegen/README.md.",
+
+  "omitFields": {
+    "_comment": "Fields the JS client carries in its function-call surface but DOES NOT send on the wire. JS callback fields (onProgress, logger) live entirely in the client process and are converted to/from streaming AsyncSequences on the Swift side. The generator strips them from the generated structs so the Codable output exactly matches the wire-level JSON.",
+    "request/loadModel": ["onProgress", "logger"],
+    "request/downloadAsset": ["onProgress"],
+    "request/rag": ["onProgress"],
+    "request/finetune": ["onProgress"]
+  }
+}

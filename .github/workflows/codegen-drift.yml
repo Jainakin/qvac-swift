@@ -1,0 +1,72 @@
+name: Codegen Upstream Drift
+
+# Daily check against the latest @qvac/sdk. If the SDK schemas have changed and our
+# checked-in generated output is stale, this opens (or updates) an issue automatically.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # 06:00 UTC daily
+  workflow_dispatch:
+
+jobs:
+  drift:
+    name: Check vs. @qvac/sdk@latest
+    runs-on: macos-14
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install latest @qvac/sdk
+        run: |
+          mkdir -p spike-js && cd spike-js
+          npm init -y >/dev/null
+          npm install --legacy-peer-deps @qvac/sdk@latest
+      - name: Install codegen deps
+        run: (cd tools/codegen && npm install --no-fund --no-audit)
+      - name: Run codegen
+        run: tools/codegen/run.sh
+      - name: Diff
+        id: diff
+        run: |
+          if git diff --quiet Sources/QVACClient/Generated/; then
+            echo "drift=false" >> $GITHUB_OUTPUT
+          else
+            echo "drift=true" >> $GITHUB_OUTPUT
+            git --no-pager diff Sources/QVACClient/Generated/ > drift.patch
+          fi
+      - name: Upload drift patch (artifact)
+        if: steps.diff.outputs.drift == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegen-drift
+          path: drift.patch
+      - name: Open or update tracking issue
+        if: steps.diff.outputs.drift == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = `@qvac/sdk@latest has schema changes our checked-in codegen output doesn't reflect.\n\n` +
+                         `### To apply\n\`\`\`bash\n./tools/codegen/run.sh\ngit add Sources/QVACClient/Generated/\ngit commit -m "regen against @qvac/sdk@latest"\n\`\`\`\n\n` +
+                         `Artifact: download \`codegen-drift\` from this workflow run for the diff.`;
+            const title = 'codegen drift: upstream @qvac/sdk has new shapes';
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'codegen-drift'
+            });
+            const existing = issues.data.find(i => i.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.number, body
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['codegen-drift']
+              });
+            }

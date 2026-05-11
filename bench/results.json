@@ -1,0 +1,25 @@
+{
+  "_comment": "Reference benchmark results captured 2026-05-12 on Apple Silicon (M1 family) running macOS 14. Use as a baseline; the live bench/run.sh recomputes on each invocation.",
+  "platform": "macos-14-arm64",
+  "iterations_swift": 500,
+  "iterations_node": 100,
+  "swift": {
+    "client": "swift",
+    "min_ms": 0.043,
+    "mean_ms": 0.068,
+    "p50_ms": 0.055,
+    "p99_ms": 0.176,
+    "max_ms": 2.886
+  },
+  "node": {
+    "client": "node",
+    "min_ms": 0.035,
+    "mean_ms": 0.068,
+    "p50_ms": 0.051,
+    "p99_ms": 0.216,
+    "max_ms": 0.216
+  },
+  "ratio_swift_over_node": 1.000,
+  "budget": 1.05,
+  "kr2_status": "pass (Swift parity with Node baseline)"
+}

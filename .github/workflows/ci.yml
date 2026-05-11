@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs on the same branch when a new commit lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Unit tests on macOS arm64. No Bare runtime needed.
+  # ----------------------------------------------------------------------------
+  unit-macos:
+    name: Unit · macOS-14 arm64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+      - name: Build (debug)
+        run: swift build
+      - name: Unit tests
+        run: swift test --filter QVACClientUnitTests
+
+  # ----------------------------------------------------------------------------
+  # Codegen freshness — re-run generators, fail if any drift vs. checked-in output.
+  # Satisfies AC-11 (idempotent codegen) and KR-3 (<30s budget).
+  # ----------------------------------------------------------------------------
+  codegen-freshness:
+    name: Codegen freshness check · AC-11
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install JS deps (cached)
+        run: |
+          (cd tools/codegen && npm install --no-fund --no-audit)
+          # The type generator needs the *built* @qvac/sdk JS; install it under spike-js.
+          (cd spike-js && npm install --legacy-peer-deps --no-fund --no-audit)
+      - name: Re-run codegen
+        run: tools/codegen/run.sh
+      - name: Verify no drift
+        run: |
+          git diff --exit-code Sources/QVACClient/Generated/ \
+            || (echo "::error::Generated files drift from checked-in. Run tools/codegen/run.sh and commit." && exit 1)
+
+  # ----------------------------------------------------------------------------
+  # Live integration tests — spawn a real Bare worker on macOS, run against the
+  # currently installed @qvac/sdk.
+  # ----------------------------------------------------------------------------
+  integration-macos:
+    name: Integration · macOS-14 arm64 · live Bare worker
+    runs-on: macos-14
+    needs: [unit-macos]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Bare runtime + @qvac/sdk
+        run: |
+          npm install -g bare-runtime
+          mkdir -p spike-js
+          cd spike-js
+          npm init -y >/dev/null
+          npm install --legacy-peer-deps \
+            @qvac/sdk \
+            tar-stream hyperdrive hyperdb hyperswarm corestore pear-pipe llm-splitter \
+            bare-net bare-rpc bare-buffer bare-fs bare-os bare-path bare-process \
+            bare-stream bare-abort-controller bare-crypto bare-dns bare-fetch \
+            bare-http1 bare-https bare-link bare-runtime bare-subprocess bare-zlib \
+            compact-encoding events fast-safe-stringify which-runtime \
+            @modelcontextprotocol/sdk
+      - name: Locate bare binary
+        run: |
+          which bare
+          bare --version
+          echo "QVAC_BARE_BIN=$(which bare)" >> $GITHUB_ENV
+          echo "QVAC_WORKER_SCRIPT=$(pwd)/spike-js/node_modules/@qvac/sdk/dist/server/worker.js" >> $GITHUB_ENV
+      - name: Integration tests
+        env:
+          QVAC_BARE_BIN: ${{ env.QVAC_BARE_BIN }}
+          QVAC_WORKER_SCRIPT: ${{ env.QVAC_WORKER_SCRIPT }}
+        run: swift test --filter QVACClientIntegrationTests
+
+  # ----------------------------------------------------------------------------
+  # iOS simulator build — confirms the BareKit binaryTarget links and the iOS
+  # transport compiles. Runtime validation is the BareKitProbeApp's own test
+  # job (added in QVAC-222).
+  # ----------------------------------------------------------------------------
+  build-ios-sim:
+    name: Build · iOS Simulator
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build for iOS Simulator (generic)
+        run: |
+          xcodebuild \
+            -scheme QVACClient \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath /tmp/qvac-dd \
+            build | xcbeautify --renderer github-actions || true
+          # xcbeautify is optional; the real signal is exit code.
+          xcodebuild \
+            -scheme QVACClient \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath /tmp/qvac-dd \
+            build

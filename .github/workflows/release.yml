@@ -1,0 +1,105 @@
+name: Release
+
+# Fires on tag pushes matching `v*` (e.g. v0.1.0, v0.2.0-rc.1).
+# Validates the package, generates iOS bundle/xcframeworks, creates a GitHub Release
+# with the artifacts uploaded as binaryTarget-consumable zips.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  validate:
+    name: Validate package
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (debug, macOS arm64)
+        run: swift build
+      - name: Test (unit only — keeps CI fast)
+        run: swift test --filter QVACClientUnitTests
+      - name: Codegen freshness check
+        run: |
+          (cd tools/codegen && npm install --no-fund --no-audit)
+          tools/codegen/run.sh
+          git diff --exit-code Sources/QVACClient/Generated/
+
+  generate-ios-artifacts:
+    name: Generate iOS worker bundle + addon xcframeworks
+    runs-on: macos-14
+    needs: [validate]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install @qvac/sdk + addons + bare-link / bare-pack
+        run: |
+          mkdir -p spike-js && cd spike-js
+          npm init -y >/dev/null
+          npm install --legacy-peer-deps \
+            @qvac/sdk @qvac/cli \
+            @qvac/llm-llamacpp @qvac/embed-llamacpp \
+            @qvac/transcription-whispercpp @qvac/transcription-parakeet \
+            @qvac/translation-nmtcpp @qvac/tts-onnx \
+            @qvac/ocr-onnx @qvac/diffusion-cpp \
+            bare-link bare-pack
+      - name: Generate worker.mobile.bundle.js
+        run: |
+          cd spike-js
+          node node_modules/@qvac/cli/dist/index.js bundle sdk \
+            --host ios-arm64 \
+            --host ios-arm64-simulator \
+            --host ios-x64-simulator \
+            --defer expo-file-system --defer react-native-bare-kit \
+            --quiet
+          cp qvac/worker.bundle.js ../Sources/QVACClient/Resources/worker.mobile.bundle.js
+      - name: Run bare-link to produce iOS xcframeworks
+        run: |
+          mkdir -p artifacts
+          cd spike-js
+          node -e "
+            const link = require('bare-link');
+            (async () => {
+              for await (const r of link('.', { hosts: ['ios-arm64', 'ios-arm64-simulator', 'ios-x64-simulator'], out: '../artifacts' })) {
+                if (r.endsWith('.xcframework')) console.log(r);
+              }
+            })();
+          "
+      - name: Package + checksum each xcframework
+        run: |
+          mkdir -p release-assets
+          cd artifacts
+          for fw in *.xcframework; do
+              zip -r -q "../release-assets/${fw}.zip" "$fw"
+              shasum -a 256 "../release-assets/${fw}.zip" > "../release-assets/${fw}.zip.sha256"
+          done
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: macos-14
+    needs: [generate-ios-artifacts]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+      - name: Notify Swift Package Index
+        # SPI auto-detects new tags within a few minutes; this is a courtesy ping.
+        run: |
+          curl -sf "https://swiftpackageindex.com/api/packages/${GITHUB_REPOSITORY,,}/refresh" || true
