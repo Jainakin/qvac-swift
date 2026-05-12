@@ -353,9 +353,23 @@ from §7), and capture a physical-device KR-5 screenshot.
 - `swift test --filter QVACClientUnitTests` — 70 tests pass in 0.28 s.
 - `swift test --filter AllRPCTypesRoundTripTests` — 30 RPC discriminators round-trip live against a real Bare worker.
 - `tools/codegen/run.sh` — completes in 1 s, produces zero diff against checked-in `Sources/QVACClient/Generated/`.
-- `bench/run.sh 100` — Swift 50.9 µs / Node 60.7 µs / ratio **0.84** (Swift faster than Node, well inside the 5% KR-2 budget). Numbers measured locally on Apple Silicon M-series; CI uses a 1.20 budget instead because GitHub-hosted runners have ~3-15% noise per call; the local result is the grant-relevant one. `bench/result.json` is gitignored so a reviewer reproduces it on their own hardware.
+- `bench/run.sh 100` (local) — Swift 50.9 µs / Node 60.7 µs / ratio **0.84** (Swift faster than Node, well inside the 5% KR-2 budget). Numbers measured locally on Apple Silicon M-series.
+- `bench/run.sh 1000` (CI macos-14, runner-noise budget 1.20) — Swift 77.6 µs / Node 70.7 µs / ratio **1.099**, inside CI budget. GitHub-hosted runners have ~3-15% noise per sub-millisecond call; the local result is the grant-relevant one. `bench/result.json` is gitignored so a reviewer reproduces it on their own hardware.
 - `grep -rn 'TODO|FIXME|XXX|HACK' Sources Tests tools` — zero hits in our source tree.
 - `grep -rn '/Users/hardik' Sources Tests tools bench Examples docs` — **after §A1 fix below**, zero hits everywhere. Before §A1 there were 3 stale fallback paths in test files that would silently skip on a fresh clone — caught by the second-audit pass and listed as a self-honesty failure in §A.
+
+### CI run 25725352206 (commit e225778) — all 8 jobs green
+
+| Job | Conclusion |
+|---|---|
+| Unit · macOS-14 arm64 | ✅ success |
+| Codegen freshness check · AC-11 | ✅ success |
+| Integration · macOS-14 arm64 · live Bare worker | ✅ success (LiveWorker + QVACClient + AllRPCTypesRoundTrip suites) |
+| Integration · macOS-14 · live worker + tiny model | ✅ success (full load → completion → cancel-in-flight → unload with SmolLM2-135M) |
+| Integration · macOS-14 · live RAG | ✅ success (ingest/search/delete with all-MiniLM-L6) |
+| Benchmark · KR-2 (Swift vs Node) | ✅ success (Swift 77.6 µs / Node 70.7 µs / ratio 1.099) |
+| Test · iOS Simulator | ✅ success (hosted XCTest on macos-15 + iPhone 17 family + Xcode 16) |
+| Build · Examples/QVACChat | ✅ success (both iOS sim + macOS targets) |
 
 ---
 
