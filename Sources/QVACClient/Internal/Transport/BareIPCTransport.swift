@@ -11,6 +11,9 @@
 #if canImport(BareKit) && os(iOS)
 import Foundation
 import BareKit
+import OSLog
+
+private let _bareKitLogger = Logger(subsystem: "io.qvac.client", category: "barekit")
 
 public final class BareIPCTransport: BareTransport, @unchecked Sendable {
 
@@ -29,8 +32,11 @@ public final class BareIPCTransport: BareTransport, @unchecked Sendable {
     }
 
     public struct Configuration {
-        /// Inline JavaScript source for the worklet. Typical use: the QVAC `worker.mobile.bundle.js`
-        /// loaded from the app bundle as `Data`.
+        /// Inline raw bare-bundle binary for the worklet (length-prefix + JSON header + assets).
+        /// Typical use: the QVAC `worker.mobile.bundle` resource shipped in `QVACClient.bundle`
+        /// (produced by `tools/bundle/unwrap-bundle.mjs` from `qvac bundle sdk` output).
+        /// NOTE: pass raw bundle bytes here, not a JS wrapper — bare-module's `.bundle`
+        /// extension handler parses this verbatim and rejects JS source.
         public var workletSource: Data
         /// Virtual file name used by the worklet's module loader for stack traces / require resolution.
         public var workletEntryName: String
@@ -63,19 +69,30 @@ public final class BareIPCTransport: BareTransport, @unchecked Sendable {
     private let lock = NSLock()
 
     public static func connect(_ config: Configuration) throws -> BareIPCTransport {
+        _bareKitLogger.info("BareIPCTransport.connect: building BareWorkletConfiguration")
         guard let configObj = BareWorkletConfiguration.default() else {
+            _bareKitLogger.error("BareWorkletConfiguration.default() returned nil")
             throw Error.workletInitFailed
         }
         if config.memoryLimit > 0 { configObj.memoryLimit = config.memoryLimit }
         if let assets = config.assets { configObj.assets = assets }
+
+        _bareKitLogger.info("BareIPCTransport.connect: allocating BareWorklet")
         guard let worklet = BareWorklet(configuration: configObj) else {
+            _bareKitLogger.error("BareWorklet(configuration:) returned nil")
             throw Error.workletInitFailed
         }
+
+        _bareKitLogger.info("BareIPCTransport.connect: starting worklet entry=\(config.workletEntryName, privacy: .public) bundleBytes=\(config.workletSource.count, privacy: .public) argv=\(config.arguments, privacy: .public)")
         worklet.start(config.workletEntryName, source: config.workletSource, arguments: config.arguments)
+        _bareKitLogger.info("BareIPCTransport.connect: worklet.start returned (fire-and-forget); allocating IPC")
+
         guard let ipc = BareIPC(worklet: worklet) else {
+            _bareKitLogger.error("BareIPC(worklet:) returned nil — terminating worklet")
             worklet.terminate()
             throw Error.ipcInitFailed
         }
+        _bareKitLogger.info("BareIPCTransport.connect: IPC ready")
         return BareIPCTransport(worklet: worklet, ipc: ipc)
     }
 
@@ -89,6 +106,7 @@ public final class BareIPCTransport: BareTransport, @unchecked Sendable {
             guard let self = self else { return }
             // Drain everything available on this fire — read() returns nil when empty.
             while let chunk = ipcRef.read(), chunk.count > 0 {
+                _bareKitLogger.info("BareIPC <- worker: \(chunk.count, privacy: .public) bytes (first16=\((chunk as Data).prefix(16).map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public))")
                 self.lock.lock()
                 let cont = self.readContinuation
                 self.lock.unlock()
@@ -113,9 +131,11 @@ public final class BareIPCTransport: BareTransport, @unchecked Sendable {
     }
 
     public func write(_ data: Data) async throws {
+        _bareKitLogger.info("BareIPC -> worker: \(data.count, privacy: .public) bytes (first16=\(data.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public))")
         do {
             try await ipc.write(data)
         } catch let err {
+            _bareKitLogger.error("BareIPC -> worker FAILED: \(err.localizedDescription, privacy: .public)")
             throw Error.writeFailed(underlying: err)
         }
     }

@@ -139,7 +139,7 @@ EOF
             ],
             path: "Sources/QVACClient",
             resources: [
-                .copy("Resources/worker.mobile.bundle.js"),
+                .copy("Resources/worker.mobile.bundle"),
             ]
         ),
         .testTarget(

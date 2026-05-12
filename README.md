@@ -33,8 +33,27 @@ targets: [
 ```
 
 iOS 17+, macOS 14+, both arm64. The package vendors a pre-built
-`worker.mobile.bundle.js` as an SPM resource — no extra setup on iOS. The bundle
+`worker.mobile.bundle` as an SPM resource — no extra setup on iOS. The bundle
 is ~10 MB compressed; App Store thinning trims it further per device.
+
+### Monorepo developer setup (one-time, contributors only)
+
+The dev-mode `Package.swift` references ~35 vendored xcframeworks under
+`spike-swift/Vendor/` (BareKit + every native addon the iOS bundle dlopens). They
+are NOT git-tracked — ~400 MB of binary artifacts. Run the vendor script once
+before your first `swift build`:
+
+```bash
+./tools/dev/vendor-from-release.sh v0.0.1-rc1
+```
+
+This reads the committed bundle's `addons` table, computes the transitive
+`@rpath` closure, and downloads the matching `.xcframework`s from the GitHub
+Release into `spike-swift/Vendor/`. Subsequent `swift build` / `xcodebuild` calls
+will resolve cleanly.
+
+External SPM consumers (via `.package(url:)`) don't run this script — they get
+the URL-based release manifest where SPM fetches the xcframeworks transparently.
 
 ## Quickstart
 

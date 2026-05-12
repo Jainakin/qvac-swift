@@ -10,8 +10,12 @@ final class ChatViewModel: ObservableObject {
     @Published var modelId: String? = nil
     @Published var prompt: String = "What is QVAC in one sentence?"
     @Published var output: String = ""
+    // The official HuggingFaceTB/SmolLM2-135M-Instruct-GGUF repo flipped its
+    // /resolve/ endpoint to require auth ("Invalid username or password") even
+    // for anonymous public-model downloads. We default to bartowski's mirror of
+    // the same model, which still serves 302 → CDN to anonymous clients.
     @Published var modelURL: String =
-        "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct-GGUF/resolve/main/smollm2-135m-instruct-q4_k_m.gguf"
+        "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf"
     @Published var loadPercent: Double = 0
     @Published var isBusy: Bool = false
 
@@ -51,10 +55,15 @@ final class ChatViewModel: ObservableObject {
         output = ""
         status = "Streaming completion…"
         do {
+            // generationParams schema is .strict() — only the keys in
+            // @qvac/sdk's generationParamsSchema are accepted:
+            // temp, top_p, top_k, predict, seed, frequency_penalty,
+            // presence_penalty, repeat_penalty. `predict` is the max-tokens
+            // budget (-1 = until stop, -2 = until ctx full).
             let run = try await client.completion(
                 modelId: modelId,
                 history: [.user(prompt)],
-                generationParams: .object(["max_new_tokens": .number(120)])
+                generationParams: .object(["predict": .number(120)])
             )
             for try await tok in run.tokenStream {
                 await MainActor.run { self.output += tok }
@@ -120,33 +129,196 @@ struct ContentView: View {
     @StateObject private var vm = ChatViewModel()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("QVAC Chat — Swift Client demo").font(.title2).bold()
-            Text(vm.status).font(.caption).foregroundStyle(.secondary)
-            if vm.loadPercent > 0 && vm.loadPercent < 100 {
-                ProgressView(value: vm.loadPercent, total: 100)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                header
+                statusCard
+                modelCard
+                promptCard
+                outputCard
             }
-            Divider()
-            TextField("Model URL", text: $vm.modelURL)
-                .textFieldStyle(.roundedBorder)
-            HStack {
-                Button("Load") { Task { await vm.loadModel() } }.disabled(vm.isBusy)
-                Button("Unload") { Task { await vm.unload() } }.disabled(vm.modelId == nil)
-            }
-            Divider()
-            Text("Prompt")
-            TextEditor(text: $vm.prompt).frame(minHeight: 60).border(.gray.opacity(0.3))
-            Button("Run completion") { Task { await vm.runCompletion() } }
-                .disabled(vm.modelId == nil || vm.isBusy)
-            Divider()
-            Text("Output").bold()
-            ScrollView {
-                Text(vm.output)
-                    .font(.system(.body, design: .monospaced))
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            .padding(.bottom, 24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .dynamicTypeSize(...DynamicTypeSize.xLarge)
+    }
+
+    // MARK: - Sections
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("QVAC Chat")
+                .font(.largeTitle.bold())
+                .lineLimit(1)
+                .minimumScaleFactor(0.5)
+            Text("Swift Client Demo")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var statusCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: vm.isBusy ? "ellipsis.circle" : "checkmark.circle")
+                        .foregroundStyle(.secondary)
+                    Text(vm.status)
+                        .font(.callout)
+                        .foregroundStyle(.primary)
+                        .lineLimit(6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if vm.loadPercent > 0 && vm.loadPercent < 100 {
+                    ProgressView(value: vm.loadPercent, total: 100)
+                        .progressViewStyle(.linear)
+                }
             }
         }
-        .padding()
+    }
+
+    private var modelCard: some View {
+        Card(title: "Model") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Model URL")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                TextField("https://.../model.gguf", text: $vm.modelURL, axis: .vertical)
+                    .lineLimit(2...5)
+                    .font(.system(.caption2, design: .monospaced))
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .padding(10)
+                    .background(softBackground)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                HStack(spacing: 10) {
+                    Button {
+                        Task { await vm.loadModel() }
+                    } label: {
+                        Text("Load")
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                            .frame(maxWidth: .infinity, minHeight: 32)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(vm.isBusy)
+
+                    Button {
+                        Task { await vm.unload() }
+                    } label: {
+                        Text("Unload")
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                            .frame(maxWidth: .infinity, minHeight: 32)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(vm.modelId == nil)
+                }
+                if let id = vm.modelId {
+                    Text("Loaded model: \(id)")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    private var promptCard: some View {
+        Card(title: "Prompt") {
+            VStack(alignment: .leading, spacing: 10) {
+                TextField("Ask anything…", text: $vm.prompt, axis: .vertical)
+                    .lineLimit(3...8)
+                    .font(.callout)
+                    .padding(10)
+                    .background(softBackground)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                Button {
+                    Task { await vm.runCompletion() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "play.fill")
+                        Text("Run")
+                    }
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .frame(maxWidth: .infinity, minHeight: 36)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(vm.modelId == nil || vm.isBusy)
+            }
+        }
+    }
+
+    private var outputCard: some View {
+        Card(title: "Output") {
+            if vm.output.isEmpty {
+                Text("(no output yet)")
+                    .foregroundStyle(.tertiary)
+                    .font(.callout)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 6)
+            } else {
+                Text(vm.output)
+                    .font(.system(.footnote, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .background(softBackground)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+        }
+    }
+
+    // MARK: - Style helpers
+
+    private var softBackground: Color {
+        #if os(iOS)
+        return Color(.secondarySystemBackground)
+        #else
+        return Color.gray.opacity(0.12)
+        #endif
+    }
+}
+
+private struct Card<Content: View>: View {
+    let title: String?
+    @ViewBuilder let content: () -> Content
+
+    init(title: String? = nil, @ViewBuilder content: @escaping () -> Content) {
+        self.title = title
+        self.content = content
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let title {
+                Text(title.uppercased())
+                    .font(.caption2.weight(.bold))
+                    .tracking(0.5)
+                    .foregroundStyle(.secondary)
+            }
+            content()
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(cardBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var cardBackground: Color {
+        #if os(iOS)
+        return Color(.tertiarySystemBackground)
+        #else
+        return Color.gray.opacity(0.08)
+        #endif
     }
 }
 

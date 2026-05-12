@@ -9,6 +9,41 @@
 // All methods are isolated to this actor; cross-actor calls are explicit `await`s.
 
 import Foundation
+import OSLog
+
+/// Default `BareRPCLogger` implementation that forwards to Apple's unified
+/// logging system. Visible in Xcode's console (when the app is launched from
+/// Xcode), in `Console.app` (when filtering by subsystem `io.qvac.client`),
+/// and in `log stream --predicate 'subsystem == "io.qvac.client"'`.
+///
+/// Used as the default logger in ``QVACClient/init(configuration:runtimeContext:config:initHandshakeTimeout:logger:)``
+/// so users get init / handshake / frame visibility out of the box without
+/// having to plumb anything. Pass `nil` to opt out.
+public struct QVACOSLogger: BareRPCLogger {
+    public static let `default` = QVACOSLogger()
+    private let logger = Logger(subsystem: "io.qvac.client", category: "rpc")
+    public init() {}
+    public func log(_ level: BareRPCLogLevel, _ message: String) {
+        switch level {
+        case .debug: logger.debug("\(message, privacy: .public)")
+        case .info:  logger.info("\(message, privacy: .public)")
+        case .warn:  logger.warning("\(message, privacy: .public)")
+        case .error: logger.error("\(message, privacy: .public)")
+        }
+    }
+}
+
+/// Internal sentinel used by the init-handshake timeout path. Never surfaced
+/// to callers — translated to a ``QVACError/transport(reason:underlying:)`` in
+/// ``QVACClient/init(configuration:runtimeContext:config:initHandshakeTimeout:logger:)``.
+struct QVACInitHandshakeTimeout: Error {}
+
+/// `BareRPCLogger` that drops every line — used when the caller opts out by
+/// passing `nil` for the `logger` parameter so the call sites can still emit
+/// `log.log(...)` without checking for nil at every site.
+struct NoOpRPCLogger: BareRPCLogger {
+    func log(_ level: BareRPCLogLevel, _ message: String) {}
+}
 
 public actor QVACClient {
 
@@ -48,11 +83,21 @@ public actor QVACClient {
         }
 
         #if os(iOS)
-        /// iOS convenience — point at a `worker.mobile.bundle.js` shipped as a bundle resource.
+        /// iOS convenience — point at a raw bare-bundle binary (`worker.mobile.bundle`)
+        /// shipped as a bundle resource. The file is the unwrapped output of
+        /// `@qvac/cli bundle sdk`, processed by `tools/bundle/unwrap-bundle.mjs` so
+        /// `bare-module`'s `.bundle` extension handler can parse it directly.
+        ///
+        /// `arguments` MUST follow the QVAC worker's argv contract — see
+        /// `defaultWorkletArguments(homeDirectory:)` for the canonical shape. The
+        /// worker decides RPC vs direct mode by JSON-parsing `argv[2]`; an empty
+        /// argv (or argv[2] that isn't valid JSON) silently runs it in direct
+        /// mode, which skips RPC setup entirely and causes every Swift call to
+        /// hang on the `__init_config` reply.
         public static func iOS(
             workletBundleData: Data,
             entryName: String = "/worker.bundle",
-            arguments: [String] = [],
+            arguments: [String] = Self.defaultWorkletArguments(),
             memoryLimit: UInt = 0
         ) -> Configuration {
             return .iOSWorklet(BareIPCTransport.Configuration(
@@ -63,16 +108,17 @@ public actor QVACClient {
             ))
         }
 
-        /// iOS convenience that auto-loads the bundled `worker.mobile.bundle.js` resource
-        /// shipped with the SPM package (vendored at release time by `tools/build/release.sh`).
+        /// iOS convenience that auto-loads the bundled `worker.mobile.bundle` resource
+        /// shipped with the SPM package (regenerated at release time —
+        /// `@qvac/cli bundle sdk` → `tools/bundle/unwrap-bundle.mjs`).
         /// Use this when you depend on QVACClient via SPM and want the default plugin set.
         public static func iOSWithBundledResource(
             entryName: String = "/worker.bundle",
-            arguments: [String] = [],
+            arguments: [String] = Self.defaultWorkletArguments(),
             memoryLimit: UInt = 0
         ) throws -> Configuration {
-            guard let url = Bundle.module.url(forResource: "worker.mobile.bundle", withExtension: "js") else {
-                throw QVACError.transport(reason: "worker.mobile.bundle.js not bundled in QVACClient resources")
+            guard let url = Bundle.module.url(forResource: "worker.mobile", withExtension: "bundle") else {
+                throw QVACError.transport(reason: "worker.mobile.bundle not bundled in QVACClient resources")
             }
             let data = try Data(contentsOf: url)
             return iOS(
@@ -81,6 +127,26 @@ public actor QVACClient {
                 arguments: arguments,
                 memoryLimit: memoryLimit
             )
+        }
+
+        /// Build the canonical `process.argv` for the QVAC worker.
+        ///
+        /// Mirrors `@qvac/sdk`'s expo-rpc-client.js worker-start call:
+        ///   - argv[0] = "qvac-swift-client" (placeholder, also picked up as a
+        ///     HOME_DIR fallback in BareKit mode)
+        ///   - argv[1] = "worker.js" (script-name placeholder)
+        ///   - argv[2] = JSON config; setting *any* valid JSON here flips the
+        ///     worker into RPC mode (see `@qvac/sdk/dist/server/env.js`).
+        ///
+        /// `HOME_DIR` is set to the iOS app's Documents directory by default —
+        /// the worker uses it for model cache, hyperdb workspaces, log files,
+        /// etc. Pass an explicit URL to override.
+        public static func defaultWorkletArguments(homeDirectory: URL? = nil) -> [String] {
+            let home = homeDirectory
+                ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+                ?? URL(fileURLWithPath: NSTemporaryDirectory())
+            let configJSON = #"{"HOME_DIR":"\#(home.path)"}"#
+            return ["qvac-swift-client", "worker.js", configJSON]
         }
         #endif
 
@@ -147,42 +213,86 @@ public actor QVACClient {
 
     /// Construct + spawn the worker + perform the `__init_config` handshake.
     /// Equivalent to JS's lazy-init-on-first-call pattern, but explicit.
+    ///
+    /// The init handshake is bounded by ``initHandshakeTimeout`` (default 60s).
+    /// If the worker bundle crashes during startup or runs in direct mode (no
+    /// RPC handler), the call throws ``QVACError/transport(reason:underlying:)``
+    /// rather than hanging.
     public init(
         configuration: Configuration,
         runtimeContext: QVACRuntimeContext? = .current,
-        config: JSONValue? = nil
+        config: JSONValue? = nil,
+        initHandshakeTimeout: Duration = .seconds(60),
+        logger: BareRPCLogger? = QVACOSLogger.default
     ) async throws {
+        let log = logger ?? NoOpRPCLogger()
+        log.log(.info, "QVACClient init: starting transport")
+
         switch configuration {
         #if os(macOS)
         case .macOSSubprocess(let cfg):
             do {
                 self.transport = try await UnixDomainSocketTransport.connect(cfg)
             } catch let e as UnixDomainSocketTransport.SpawnError {
+                log.log(.error, "QVACClient init: macOS subprocess connect failed — \(e)")
                 throw QVACError.transport(reason: e.description, underlying: e)
             }
         #endif
         #if os(iOS)
         case .iOSWorklet(let cfg):
             do {
+                log.log(.info, "QVACClient init: spawning BareKit worklet (entry=\(cfg.workletEntryName), argv=\(cfg.arguments))")
                 self.transport = try BareIPCTransport.connect(cfg)
+                log.log(.info, "QVACClient init: BareKit worklet + IPC ready")
             } catch let e as BareIPCTransport.Error {
+                log.log(.error, "QVACClient init: BareIPCTransport.connect failed — \(e)")
                 throw QVACError.transport(reason: e.description, underlying: e)
             }
         #endif
         }
-        self.rpc = BareRPCClient(transport: transport)
+        self.rpc = BareRPCClient(transport: transport, logger: logger)
 
+        log.log(.info, "QVACClient init: sending __init_config (timeout=\(initHandshakeTimeout))")
         do {
-            try await QVACHandshake.sendInitConfig(
-                on: rpc, config: config, runtimeContext: runtimeContext
-            )
+            try await withInitTimeout(initHandshakeTimeout) {
+                try await QVACHandshake.sendInitConfig(
+                    on: self.rpc, config: config, runtimeContext: runtimeContext
+                )
+            }
+            log.log(.info, "QVACClient init: handshake OK, client ready")
             self.initialized = true
         } catch let e as QVACInitConfigFailed {
+            log.log(.error, "QVACClient init: __init_config rejected by worker — \(e.description)")
             await rpc.close()
             throw QVACError.transport(reason: e.description, underlying: e)
+        } catch is QVACInitHandshakeTimeout {
+            let msg = "worker did not reply to __init_config within \(initHandshakeTimeout). " +
+                "Most likely the worker bundle crashed during startup, or `arguments` " +
+                "did not include a valid JSON config in argv[2] (which silently runs the " +
+                "worker in direct mode — see Configuration.defaultWorkletArguments)."
+            log.log(.error, "QVACClient init: \(msg)")
+            await rpc.close()
+            throw QVACError.transport(reason: msg)
         } catch {
+            log.log(.error, "QVACClient init: handshake failed — \(error)")
             await rpc.close()
             throw error
+        }
+    }
+
+    private func withInitTimeout<T: Sendable>(
+        _ timeout: Duration,
+        _ body: @Sendable @escaping () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await body() }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw QVACInitHandshakeTimeout()
+            }
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
         }
     }
 

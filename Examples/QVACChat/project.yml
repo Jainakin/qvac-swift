@@ -27,6 +27,14 @@ targets:
         CFBundleDisplayName: QVAC Chat
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
+        # Empty UILaunchScreen tells iOS to size the app to the full device
+        # screen (modern, iOS 14+). Without it, iOS letterboxes the app to
+        # a 320x480 iPhone-4 compatibility canvas with black bars top/bottom.
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
     dependencies:
       - package: QVACSwift
         product: QVACClient

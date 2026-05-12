@@ -50,10 +50,11 @@ jobs:
             bare-pack \
             compact-encoding events fast-safe-stringify which-runtime \
             @modelcontextprotocol/sdk
-      - name: Regenerate worker.mobile.bundle.js (best effort)
+      - name: Regenerate + unwrap worker.mobile.bundle (best effort)
         # Drops --quiet so bare-pack's stderr is visible. The committed
-        # Sources/QVACClient/Resources/worker.mobile.bundle.js is the source of
-        # truth; if regen succeeds we update it, if it fails we keep the committed
+        # Sources/QVACClient/Resources/worker.mobile.bundle is the source of
+        # truth; if regen succeeds we update it (after stripping the JS wrapper
+        # via tools/bundle/unwrap-bundle.mjs), if it fails we keep the committed
         # bundle (continue-on-error: true). For a real consumer-facing release we
         # want regen to succeed — this step's failure is a soft warning until then.
         continue-on-error: true
@@ -65,8 +66,10 @@ jobs:
             --host ios-x64-simulator \
             --defer expo-file-system --defer react-native-bare-kit
           if [ -f qvac/worker.bundle.js ]; then
-              cp qvac/worker.bundle.js ../Sources/QVACClient/Resources/worker.mobile.bundle.js
-              echo "[release] regenerated worker.mobile.bundle.js"
+              node ../tools/bundle/unwrap-bundle.mjs \
+                  qvac/worker.bundle.js \
+                  ../Sources/QVACClient/Resources/worker.mobile.bundle
+              echo "[release] regenerated + unwrapped worker.mobile.bundle"
           else
               echo "::warning::bundle regen produced no qvac/worker.bundle.js — using committed bundle"
           fi
