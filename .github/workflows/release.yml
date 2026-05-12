@@ -31,7 +31,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Install @qvac/sdk + addons + bare-link / bare-pack
+      - name: Install @qvac/sdk + addons + bare deps
+        # Match the integration jobs' install list so bare-pack / bare-link see all
+        # the transitive bare-* / hyper* packages they need to resolve.
         run: |
           mkdir -p spike-js && cd spike-js
           npm init -y >/dev/null
@@ -41,17 +43,33 @@ jobs:
             @qvac/transcription-whispercpp @qvac/transcription-parakeet \
             @qvac/translation-nmtcpp @qvac/tts-onnx \
             @qvac/ocr-onnx @qvac/diffusion-cpp \
-            bare-link bare-pack
-      - name: Generate worker.mobile.bundle.js
+            tar-stream hyperdrive hyperdb hyperswarm corestore pear-pipe llm-splitter \
+            bare-net bare-rpc bare-buffer bare-fs bare-os bare-path bare-process \
+            bare-stream bare-abort-controller bare-crypto bare-dns bare-fetch \
+            bare-http1 bare-https bare-link bare-runtime bare-subprocess bare-zlib \
+            bare-pack \
+            compact-encoding events fast-safe-stringify which-runtime \
+            @modelcontextprotocol/sdk
+      - name: Regenerate worker.mobile.bundle.js (best effort)
+        # Drops --quiet so bare-pack's stderr is visible. The committed
+        # Sources/QVACClient/Resources/worker.mobile.bundle.js is the source of
+        # truth; if regen succeeds we update it, if it fails we keep the committed
+        # bundle (continue-on-error: true). For a real consumer-facing release we
+        # want regen to succeed — this step's failure is a soft warning until then.
+        continue-on-error: true
         run: |
           cd spike-js
           node node_modules/@qvac/cli/dist/index.js bundle sdk \
             --host ios-arm64 \
             --host ios-arm64-simulator \
             --host ios-x64-simulator \
-            --defer expo-file-system --defer react-native-bare-kit \
-            --quiet
-          cp qvac/worker.bundle.js ../Sources/QVACClient/Resources/worker.mobile.bundle.js
+            --defer expo-file-system --defer react-native-bare-kit
+          if [ -f qvac/worker.bundle.js ]; then
+              cp qvac/worker.bundle.js ../Sources/QVACClient/Resources/worker.mobile.bundle.js
+              echo "[release] regenerated worker.mobile.bundle.js"
+          else
+              echo "::warning::bundle regen produced no qvac/worker.bundle.js — using committed bundle"
+          fi
       - name: Run bare-link to produce iOS xcframeworks
         run: |
           mkdir -p artifacts
