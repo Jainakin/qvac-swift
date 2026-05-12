@@ -103,3 +103,17 @@ jobs:
         # SPI auto-detects new tags within a few minutes; this is a courtesy ping.
         run: |
           curl -sf "https://swiftpackageindex.com/api/packages/${GITHUB_REPOSITORY,,}/refresh" || true
+
+      - name: Verify Package.swift is consumer-mode for a tagged release
+        # Tagged releases must use binaryTarget(url:checksum:) so external SPM
+        # consumers (`.package(url:, from:)`) can resolve. If the tagged commit
+        # still has dev-mode local paths, surface a clear warning here so the
+        # maintainer remembers to run tools/release/prepare-release.sh and move
+        # the tag. We don't fail the workflow — the artifacts upload is still
+        # useful — but we make the regression visible.
+        run: |
+          if grep -q 'path: "spike-swift/Vendor/BareKit.xcframework"' Package.swift; then
+            echo "::warning::Package.swift at this tag is in DEV MODE (path-based BareKit). SPM consumers using \`.package(url:, from:)\` cannot resolve. Run tools/release/prepare-release.sh ${GITHUB_REF_NAME} locally, commit, and re-tag."
+          else
+            echo "Package.swift looks consumer-ready (URL-based binaryTargets)."
+          fi

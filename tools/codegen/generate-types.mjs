@@ -49,6 +49,114 @@ const requestSchema  = z.toJSONSchema(common.requestSchema,  toJsonSchemaOpts)
 const responseSchema = z.toJSONSchema(common.responseSchema, toJsonSchemaOpts)
 
 // ------------------------------------------------------------------------------------
+// §27 auto-callback detection
+//
+// JS-only callback fields like `onProgress`/`logger` show up as `z.function(...)` in the
+// Zod schemas. They live entirely in the client process and never travel on the wire,
+// so the generated Swift struct must NOT contain them.
+//
+// The JSON Schema output renders them as `{}` (because of `unrepresentable: 'any'`),
+// which is indistinguishable from a legitimate `JSONValue` payload field at that
+// level. So instead of guessing from JSON Schema, we introspect the Zod schema tree
+// directly here and build a `{side/discriminator -> [fieldNames]}` map that augments
+// the manual `overrides.omitFields`.
+// ------------------------------------------------------------------------------------
+
+/// Unwrap an optional / nullable / default Zod wrapper to find the innermost type def.
+function innermostZodDef(node) {
+  let cur = node?._zod?.def
+  // Wrappers expose their inner type at .innerType (.def.innerType holds another Zod node).
+  while (cur && ['optional', 'nullable', 'default', 'readonly', 'pipe', 'lazy'].includes(cur.type)) {
+    const inner = cur.innerType ?? cur.in ?? cur.out
+    if (!inner) break
+    cur = inner?._zod?.def ?? null
+  }
+  return cur
+}
+
+/// Heuristic for "this looks like a non-wire callback / control field": name follows
+/// the JS SDK convention for callbacks (`onProgress`, `onError`, …) or signal/abort/
+/// logger handles. Combined with the type check below, this gives us a reliable filter.
+const CALLBACK_NAME_PATTERNS = [
+  /^on[A-Z]/,        // onProgress, onError, onChunk, …
+  /^logger$/,
+  /^signal$/,
+  /^abortSignal$/,
+  /^abortController$/,
+  /^controller$/,
+]
+
+/// Walk a Zod object and return the list of property keys that look like JS-only
+/// callback / control handles and therefore must NOT appear in the wire-level Swift
+/// struct. Two ways to qualify:
+///   1. Innermost Zod type is `function` / `custom` — definitive.
+///   2. Innermost Zod type is `unknown` AND the field name matches a callback naming
+///      convention. `z.unknown()` is the de-facto convention in @qvac/sdk for typing
+///      JS-side function handles that don't have a wire representation.
+function callbackFieldsOfObject(objZod) {
+  const def = objZod?._zod?.def
+  if (!def || def.type !== 'object') return []
+  const shape = (typeof def.shape === 'function') ? def.shape() : def.shape
+  if (!shape) return []
+  const out = []
+  for (const [key, child] of Object.entries(shape)) {
+    const inner = innermostZodDef(child)
+    const t = inner?.type
+    if (t === 'function' || t === 'custom') {
+      out.push(key)
+      continue
+    }
+    if (t === 'unknown' && CALLBACK_NAME_PATTERNS.some(re => re.test(key))) {
+      out.push(key)
+    }
+  }
+  return out
+}
+
+/// Walk a Zod union (discriminatedUnion or union) and return
+/// `{ [discriminator]: [callbackFieldNames] }`.
+function discoverCallbackFields(unionZod) {
+  const def = unionZod?._zod?.def
+  if (!def) return {}
+  const options = def.options ?? []
+  const result = {}
+  for (const opt of options) {
+    // opt may itself be wrapped (intersection of base + variant).
+    const queue = [opt]
+    while (queue.length) {
+      const cur = queue.shift()
+      const curDef = cur?._zod?.def
+      if (!curDef) continue
+      if (curDef.type === 'object') {
+        const shape = (typeof curDef.shape === 'function') ? curDef.shape() : curDef.shape
+        const typeNode = shape?.type
+        const discriminator = typeNode?._zod?.def?.values?.[0]
+                          ?? typeNode?._zod?.def?.value
+        if (discriminator) {
+          const fields = callbackFieldsOfObject(cur)
+          if (fields.length) {
+            result[discriminator] = [...(result[discriminator] ?? []), ...fields]
+          }
+        }
+      }
+      if (curDef.type === 'intersection') {
+        if (curDef.left)  queue.push(curDef.left)
+        if (curDef.right) queue.push(curDef.right)
+      }
+      if (curDef.type === 'union' || curDef.type === 'discriminatedUnion') {
+        for (const o of (curDef.options ?? [])) queue.push(o)
+      }
+    }
+  }
+  return result
+}
+
+const autoOmit = {
+  request:  discoverCallbackFields(common.requestSchema),
+  response: discoverCallbackFields(common.responseSchema),
+}
+
+// ------------------------------------------------------------------------------------
 // Walk the schema tree and collect ALL leaf object branches.
 //
 // "Leaf branch" = a JSON Schema node of `type: "object"` with a `type: { const: X }`
@@ -322,12 +430,16 @@ function emitStruct(discriminator, node, side) {
   // Move `type` first (visually) so generated code is readable.
   props.sort(([a], [b]) => (a === 'type' ? -1 : b === 'type' ? 1 : a.localeCompare(b)))
 
-  // Apply per-side per-discriminator override of which fields to OMIT entirely
-  // (e.g. `onProgress` JS callback fields that don't go on the wire).
-  const omit = new Set(
-    (overrides.omitFields?.[`${side}/${discriminator}`] ?? [])
-      .concat(overrides.omitFields?.['*'] ?? [])
-  )
+  // Apply two sources of "omit this field" instructions:
+  //   1. Per-side per-discriminator entries in overrides.json (manual escape hatch).
+  //   2. Auto-detected `z.function`/`z.custom` callback fields from the Zod schema
+  //      (§27 in AUDIT.md). These travel only inside the JS client process and never
+  //      hit the wire, so they must not appear in the generated Codable struct.
+  const omit = new Set([
+    ...(overrides.omitFields?.[`${side}/${discriminator}`] ?? []),
+    ...(overrides.omitFields?.['*'] ?? []),
+    ...(autoOmit[side]?.[discriminator] ?? []),
+  ])
 
   const lines = []
   lines.push(`/// Wire-level shape for the QVAC SDK "${discriminator}" ${side}.`)

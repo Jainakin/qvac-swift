@@ -15,7 +15,7 @@ public actor QVACClient {
     /// Configuration for spawning the worker. Use one of the static `.macOS(…)` /
     /// `.iOS(…)` factories rather than constructing this manually.
     public enum Configuration: @unchecked Sendable {
-        #if os(macOS) || os(Linux)
+        #if os(macOS)
         case macOSSubprocess(UDSTransportConfiguration)
         #endif
         #if os(iOS)
@@ -30,7 +30,7 @@ public actor QVACClient {
             initTimeout: TimeInterval = 30.0,
             environmentOverlay: [String: String] = [:]
         ) throws -> Configuration {
-            #if os(macOS) || os(Linux)
+            #if os(macOS)
             let workerScript = nodeModulesDir
                 .appendingPathComponent("@qvac/sdk/dist/server/worker.js")
             let bare = bareExecutable ?? Self.discoverBareOnPath()
@@ -84,17 +84,53 @@ public actor QVACClient {
         }
         #endif
 
-        #if os(macOS) || os(Linux)
+        #if os(macOS)
         private static func discoverBareOnPath() -> URL? {
-            let candidates = [
+            // 1. Common static install locations.
+            let staticCandidates = [
                 "/opt/homebrew/bin/bare",
                 "/usr/local/bin/bare",
-                "\(NSHomeDirectory())/.nvm/versions/node/current/bin/bare",
             ]
-            for c in candidates where FileManager.default.fileExists(atPath: c) {
+            for c in staticCandidates where FileManager.default.fileExists(atPath: c) {
                 return URL(fileURLWithPath: c)
             }
+            // 2. nvm: scan ~/.nvm/versions/node/v*/bin/bare. nvm uses versioned dirs
+            //    (v22.0.0), not a `current` symlink, so we pick the alphabetically last
+            //    (highest semver-ish version that has `bare` installed).
+            let nvmRoot = "\(NSHomeDirectory())/.nvm/versions/node"
+            if let versions = try? FileManager.default.contentsOfDirectory(atPath: nvmRoot) {
+                for v in versions.sorted(by: >) {
+                    let p = "\(nvmRoot)/\(v)/bin/bare"
+                    if FileManager.default.fileExists(atPath: p) {
+                        return URL(fileURLWithPath: p)
+                    }
+                }
+            }
+            // 3. $PATH search via `/usr/bin/which`. Keeps us honest if the user has bare
+            //    installed somewhere unusual (e.g. asdf, mise, custom $HOME bin).
+            if let viaWhich = whichBare() {
+                return viaWhich
+            }
             return nil
+        }
+
+        private static func whichBare() -> URL? {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+            proc.arguments = ["bare"]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = Pipe()
+            do { try proc.run() } catch { return nil }
+            proc.waitUntilExit()
+            guard proc.terminationStatus == 0,
+                  let data = try? pipe.fileHandleForReading.readToEnd(),
+                  let path = String(data: data, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !path.isEmpty,
+                  FileManager.default.fileExists(atPath: path)
+            else { return nil }
+            return URL(fileURLWithPath: path)
         }
         #endif
     }
@@ -117,7 +153,7 @@ public actor QVACClient {
         config: JSONValue? = nil
     ) async throws {
         switch configuration {
-        #if os(macOS) || os(Linux)
+        #if os(macOS)
         case .macOSSubprocess(let cfg):
             do {
                 self.transport = try await UnixDomainSocketTransport.connect(cfg)

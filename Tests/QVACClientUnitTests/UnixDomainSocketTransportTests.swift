@@ -88,6 +88,75 @@ final class UnixDomainSocketTransportTests: XCTestCase {
             XCTFail("unexpected error type: \(error)")
         }
     }
+
+    // MARK: - Security regression tests (§9, §11, §12 from AUDIT.md)
+
+    /// §12 — `environmentOverlay` must strip dynamic-linker keys so a caller can't pipe
+    /// `DYLD_INSERT_LIBRARIES` etc. into the spawned worker process.
+    func test_environmentOverlay_strips_dynamic_linker_keys() {
+        let raw: [String: String] = [
+            "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib",
+            "DYLD_FALLBACK_LIBRARY_PATH": "/tmp",
+            "LD_PRELOAD": "/tmp/evil.so",
+            "LD_LIBRARY_PATH": "/tmp",
+            "LD_AUDIT": "/tmp/audit.so",
+            "NODE_OPTIONS": "--max-old-space-size=4096", // safe; must pass through
+            "QVAC_LOG_LEVEL": "trace",                   // safe; must pass through
+        ]
+        let sanitized = UnixDomainSocketTransport.sanitizeOverlay(raw)
+        XCTAssertNil(sanitized["DYLD_INSERT_LIBRARIES"])
+        XCTAssertNil(sanitized["DYLD_FALLBACK_LIBRARY_PATH"])
+        XCTAssertNil(sanitized["LD_PRELOAD"])
+        XCTAssertNil(sanitized["LD_LIBRARY_PATH"])
+        XCTAssertNil(sanitized["LD_AUDIT"])
+        XCTAssertEqual(sanitized["NODE_OPTIONS"], "--max-old-space-size=4096")
+        XCTAssertEqual(sanitized["QVAC_LOG_LEVEL"], "trace")
+    }
+
+    /// §9 + §11 — the auto-allocated socket path must live inside a 0700 directory
+    /// (so other local users can't traverse to the socket) AND the socket file itself
+    /// must be 0600. Connect to /bin/sleep so accept times out — but by then the
+    /// listener + dir have been created and we can inspect their modes.
+    func test_socket_path_has_private_tempdir_and_locked_perms() async throws {
+        let config = UDSTransportConfiguration(
+            bareExecutable: URL(fileURLWithPath: "/bin/sleep"),
+            workerScript:  URL(fileURLWithPath: "/dev/null"),
+            workingDirectory: URL(fileURLWithPath: "/tmp"),
+            initTimeout: 0.3
+        )
+        // The connect will fail (worker never connects), but the listener was created
+        // before failure. We capture the socket path observation via a brief delay-and-
+        // scan; simpler: instrument by calling the static allocator directly.
+        let alloc = try UnixDomainSocketTransport_TestHook.allocateOwnedSocketPath()
+        defer { _ = rmdir(alloc.ownedDir) }
+        // Parent dir must be 0700.
+        var dirStat = stat()
+        XCTAssertEqual(stat(alloc.ownedDir, &dirStat), 0)
+        let dirPerms = dirStat.st_mode & 0o777
+        XCTAssertEqual(dirPerms, 0o700, "tempdir perms must be 0700, got \(String(dirPerms, radix: 8))")
+
+        // Now create a listener inside and assert the socket is 0600.
+        let fd = try UnixDomainSocketTransport_TestHook.makeListener(at: alloc.socketPath)
+        defer { _ = Darwin.close(fd); unlink(alloc.socketPath) }
+        var sockStat = stat()
+        XCTAssertEqual(stat(alloc.socketPath, &sockStat), 0)
+        let sockPerms = sockStat.st_mode & 0o777
+        XCTAssertEqual(sockPerms, 0o600, "socket perms must be 0600, got \(String(sockPerms, radix: 8))")
+
+        _ = config // silence "unused" — kept for documentation of the threat model
+    }
+}
+
+/// Internal access to the transport's static path/listener helpers for the security
+/// regression tests above. Same module via `@testable import`, but exposes the static
+/// methods through a typed re-export so the test reads cleanly.
+private enum UnixDomainSocketTransport_TestHook {
+    static func allocateOwnedSocketPath() throws -> (socketPath: String, ownedDir: String) {
+        try UnixDomainSocketTransport.__testAllocateOwnedSocketPath()
+    }
+    static func makeListener(at path: String) throws -> Int32 {
+        try UnixDomainSocketTransport.__testMakeListener(at: path)
+    }
 }
 
 #endif

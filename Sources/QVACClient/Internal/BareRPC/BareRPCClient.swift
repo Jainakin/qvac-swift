@@ -120,23 +120,23 @@ public actor BareRPCClient {
     private var closed = false
     private var feederTask: Task<Void, Never>?
 
-    /// Construct the RPC client around a connected transport. Starts pumping inbound bytes
-    /// immediately. Caller MUST `await close()` to release resources.
+    /// Construct the RPC client around a connected transport. The inbound stream is
+    /// claimed SYNCHRONOUSLY here (so any subsequent `send` / `stream` call is guaranteed
+    /// to have a destination for incoming bytes) and the feeder task that pumps the
+    /// stream into the RPC state machine is spawned immediately. Caller MUST `await
+    /// close()` to release resources.
     public init(transport: BareTransport, logger: BareRPCLogger? = nil) {
         self.transport = transport
         self.logger = logger
-        Task { await self.startFeeder() }
-    }
-
-    deinit {
-        feederTask?.cancel()
-    }
-
-    private func startFeeder() {
+        // Claim the inbound stream NOW so the transport's reader thread has somewhere
+        // to deliver bytes. Doing this lazily inside a Task creates a race: if the
+        // caller fires a `send` immediately and the worker's response arrives before
+        // the lazy Task scheduled the inboundStream() call, the response is dropped.
+        let inbound = transport.inboundStream()
         feederTask = Task { [weak self] in
             guard let self else { return }
             do {
-                for try await chunk in transport.inboundStream() {
+                for try await chunk in inbound {
                     try await self.feed(chunk)
                 }
                 await self.failAllInFlight(with: BareRPCConnectionClosed())
@@ -144,6 +144,10 @@ public actor BareRPCClient {
                 await self.failAllInFlight(with: error)
             }
         }
+    }
+
+    deinit {
+        feederTask?.cancel()
     }
 
     // ----------- Public surface -----------
@@ -341,9 +345,8 @@ public actor BareRPCClient {
 
     /// Server acknowledgements on our outgoing request stream (direction bit = REQUEST).
     /// Server sends STREAM(REQUEST|OPEN) to acknowledge our open, STREAM(REQUEST|RESUME) to
-    /// signal "send more data," etc. None of these require client-visible action in our
-    /// current model — we don't yet implement client-side backpressure (TODO M2 if benchmark
-    /// shows we hit the buffer limit).
+    /// signal "send more data," etc. None of these require client-visible action in the
+    /// current model — bare-rpc already buffers writes at the transport layer.
     private func handleStreamRequestDirection(id: UInt64, flags: BareRPCStreamFlags, payload: BareRPCStreamPayload) {
         if let d = pendingDuplex[id] {
             if flags.contains(.open) {

@@ -82,38 +82,200 @@ jobs:
             bare-http1 bare-https bare-link bare-runtime bare-subprocess bare-zlib \
             compact-encoding events fast-safe-stringify which-runtime \
             @modelcontextprotocol/sdk
-      - name: Locate bare binary
+      - name: Locate bare binary + node_modules
         run: |
           which bare
           bare --version
           echo "QVAC_BARE_BIN=$(which bare)" >> $GITHUB_ENV
           echo "QVAC_WORKER_SCRIPT=$(pwd)/spike-js/node_modules/@qvac/sdk/dist/server/worker.js" >> $GITHUB_ENV
-      - name: Integration tests
+          echo "QVAC_NODE_MODULES=$(pwd)/spike-js/node_modules" >> $GITHUB_ENV
+      - name: Integration tests (live worker, no model)
         env:
           QVAC_BARE_BIN: ${{ env.QVAC_BARE_BIN }}
           QVAC_WORKER_SCRIPT: ${{ env.QVAC_WORKER_SCRIPT }}
+          QVAC_NODE_MODULES: ${{ env.QVAC_NODE_MODULES }}
+        # Runs LiveWorkerIntegrationTests + QVACClientIntegrationTests. RealModel +
+        # RAG suites are opt-in — see the two jobs below.
         run: swift test --filter QVACClientIntegrationTests
 
   # ----------------------------------------------------------------------------
-  # iOS simulator build — confirms the BareKit binaryTarget links and the iOS
-  # transport compiles. Runtime validation is the BareKitProbeApp's own test
-  # job (added in QVAC-222).
+  # Real-model integration — downloads a tiny public model and exercises the full
+  # load → completion → cancel → unload cycle. Validates AC-4, AC-6, AC-7 at
+  # runtime against a live worker.
   # ----------------------------------------------------------------------------
-  build-ios-sim:
-    name: Build · iOS Simulator
+  integration-macos-real-model:
+    name: Integration · macOS-14 · live worker + tiny model
     runs-on: macos-14
+    needs: [unit-macos]
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Build for iOS Simulator (generic)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Bare runtime + @qvac/sdk + llamacpp addon
+        run: |
+          npm install -g bare-runtime
+          mkdir -p spike-js
+          cd spike-js
+          npm init -y >/dev/null
+          npm install --legacy-peer-deps \
+            @qvac/sdk @qvac/llm-llamacpp \
+            tar-stream hyperdrive hyperdb hyperswarm corestore pear-pipe llm-splitter \
+            bare-net bare-rpc bare-buffer bare-fs bare-os bare-path bare-process \
+            bare-stream bare-abort-controller bare-crypto bare-dns bare-fetch \
+            bare-http1 bare-https bare-link bare-runtime bare-subprocess bare-zlib \
+            compact-encoding events fast-safe-stringify which-runtime \
+            @modelcontextprotocol/sdk
+      - name: Configure env
+        run: |
+          echo "QVAC_BARE_BIN=$(which bare)" >> $GITHUB_ENV
+          echo "QVAC_NODE_MODULES=$(pwd)/spike-js/node_modules" >> $GITHUB_ENV
+      - name: Real-model tests
+        env:
+          QVAC_BARE_BIN: ${{ env.QVAC_BARE_BIN }}
+          QVAC_NODE_MODULES: ${{ env.QVAC_NODE_MODULES }}
+          QVAC_RUN_REAL_MODEL_TESTS: "1"
+          # Public 135M-parameter GGUF (~92 MB), no HF auth required.
+          QVAC_TEST_MODEL_URL: "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct-GGUF/resolve/main/smollm2-135m-instruct-q4_k_m.gguf"
+          QVAC_TEST_MODEL_TYPE: "llamacpp-completion"
+        run: swift test --filter RealModelIntegrationTests
+
+  # ----------------------------------------------------------------------------
+  # RAG integration — exercises ingest/search/delete with a tiny embedding model.
+  # ----------------------------------------------------------------------------
+  integration-macos-rag:
+    name: Integration · macOS-14 · live RAG
+    runs-on: macos-14
+    needs: [unit-macos]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Bare runtime + @qvac/sdk + embed-llamacpp addon
+        run: |
+          npm install -g bare-runtime
+          mkdir -p spike-js
+          cd spike-js
+          npm init -y >/dev/null
+          npm install --legacy-peer-deps \
+            @qvac/sdk @qvac/embed-llamacpp \
+            tar-stream hyperdrive hyperdb hyperswarm corestore pear-pipe llm-splitter \
+            bare-net bare-rpc bare-buffer bare-fs bare-os bare-path bare-process \
+            bare-stream bare-abort-controller bare-crypto bare-dns bare-fetch \
+            bare-http1 bare-https bare-link bare-runtime bare-subprocess bare-zlib \
+            compact-encoding events fast-safe-stringify which-runtime \
+            @modelcontextprotocol/sdk
+      - name: Configure env
+        run: |
+          echo "QVAC_BARE_BIN=$(which bare)" >> $GITHUB_ENV
+          echo "QVAC_NODE_MODULES=$(pwd)/spike-js/node_modules" >> $GITHUB_ENV
+      - name: RAG tests
+        env:
+          QVAC_BARE_BIN: ${{ env.QVAC_BARE_BIN }}
+          QVAC_NODE_MODULES: ${{ env.QVAC_NODE_MODULES }}
+          QVAC_RUN_RAG_TESTS: "1"
+          # Tiny public sentence-transformers GGUF embedding model (~22 MB).
+          QVAC_TEST_EMBEDDING_URL: "https://huggingface.co/leliuga/all-MiniLM-L6-v2-GGUF/resolve/main/all-MiniLM-L6-v2.Q4_K_M.gguf"
+        run: swift test --filter RAGIntegrationTests
+
+  # ----------------------------------------------------------------------------
+  # iOS Simulator build + hosted XCTest run. Builds QVACClient for the simulator
+  # AND boots a simulator + executes the BareKitProbeApp hosted XCTest target so
+  # iOS runtime regressions (BareKit linkage, worker handshake) are caught.
+  # ----------------------------------------------------------------------------
+  test-ios-sim:
+    name: Test · iOS Simulator
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show iOS simulator runtimes available
+        run: xcrun simctl list runtimes
+      - name: Build QVACClient for iOS Simulator (generic)
         run: |
           xcodebuild \
             -scheme QVACClient \
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath /tmp/qvac-dd \
-            build | xcbeautify --renderer github-actions || true
-          # xcbeautify is optional; the real signal is exit code.
-          xcodebuild \
-            -scheme QVACClient \
-            -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath /tmp/qvac-dd \
             build
+      - name: Run hosted XCTest in iOS Simulator
+        run: |
+          xcodebuild test \
+            -project spike-swift/Examples/BareKitProbeApp/BareKitProbeApp.xcodeproj \
+            -scheme BareKitProbeApp \
+            -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' \
+            -derivedDataPath /tmp/probe-dd
+
+  # ----------------------------------------------------------------------------
+  # Example app build — keeps Examples/QVACChat from rotting. Builds both iOS and
+  # macOS targets. Matches grant AC-3 / KR-5 surface area.
+  # ----------------------------------------------------------------------------
+  build-example-app:
+    name: Build · Examples/QVACChat
+    runs-on: macos-14
+    needs: [unit-macos]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Generate xcodeproj
+        run: cd Examples/QVACChat && xcodegen generate
+      - name: Build QVACChat-iOS (Simulator)
+        run: |
+          xcodebuild \
+            -project Examples/QVACChat/QVACChat.xcodeproj \
+            -scheme QVACChat-iOS \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath /tmp/chat-ios-dd \
+            build
+      - name: Build QVACChat-macOS
+        run: |
+          xcodebuild \
+            -project Examples/QVACChat/QVACChat.xcodeproj \
+            -scheme QVACChat-macOS \
+            -destination 'platform=macOS' \
+            -derivedDataPath /tmp/chat-mac-dd \
+            build
+
+  # ----------------------------------------------------------------------------
+  # KR-2 benchmark — Swift heartbeat latency vs Node baseline. Fails the build
+  # if Swift overhead exceeds 5% of Node (configurable via QVAC_BENCH_MAX_OVERHEAD).
+  # ----------------------------------------------------------------------------
+  bench:
+    name: Benchmark · KR-2 (Swift vs Node)
+    runs-on: macos-14
+    needs: [unit-macos]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Bare runtime + @qvac/sdk
+        run: |
+          npm install -g bare-runtime
+          mkdir -p spike-js
+          cd spike-js
+          npm init -y >/dev/null
+          npm install --legacy-peer-deps \
+            @qvac/sdk \
+            tar-stream hyperdrive hyperdb hyperswarm corestore pear-pipe llm-splitter \
+            bare-net bare-rpc bare-buffer bare-fs bare-os bare-path bare-process \
+            bare-stream bare-abort-controller bare-crypto bare-dns bare-fetch \
+            bare-http1 bare-https bare-link bare-runtime bare-subprocess bare-zlib \
+            compact-encoding events fast-safe-stringify which-runtime \
+            @modelcontextprotocol/sdk
+      - name: Run benchmark (200 iters, 5% overhead budget)
+        env:
+          QVAC_NODE_MODULES: ${{ github.workspace }}/spike-js/node_modules
+        run: bench/run.sh 200
+      - name: Upload bench result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench/result.json
+          if-no-files-found: warn

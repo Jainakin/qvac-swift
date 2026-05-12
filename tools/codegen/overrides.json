@@ -1,11 +1,7 @@
 {
-  "_comment": "Per-(side/discriminator) overrides for the type generator. See tools/codegen/README.md.",
+  "_comment": "Escape-hatch overrides for the type generator. The generator now auto-detects JS-only callback fields — z.function, z.custom, and z.unknown() whose name matches ^on[A-Z]/logger/signal/abortSignal/controller — and strips them automatically. Add a key here only when an upstream schema uses a non-conventional name for a callback or introduces a new unrepresentable-on-the-wire field shape the auto-detector misses.",
 
   "omitFields": {
-    "_comment": "Fields the JS client carries in its function-call surface but DOES NOT send on the wire. JS callback fields (onProgress, logger) live entirely in the client process and are converted to/from streaming AsyncSequences on the Swift side. The generator strips them from the generated structs so the Codable output exactly matches the wire-level JSON.",
-    "request/loadModel": ["onProgress", "logger"],
-    "request/downloadAsset": ["onProgress"],
-    "request/rag": ["onProgress"],
-    "request/finetune": ["onProgress"]
+    "_comment_omitFields": "Keys are <side>/<discriminator> (e.g. request/loadModel). Use * to apply to every leaf. The list is the property names to remove from the generated Codable struct."
   }
 }

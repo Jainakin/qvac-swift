@@ -139,6 +139,32 @@ final class BareRPCCodecTests: XCTestCase {
         XCTAssertNotNil(reader.next())
     }
 
+    // §10 from AUDIT.md — the reader must reject a frame whose declared length exceeds
+    // its `maxFrameSize`. A malformed/hostile peer that ships `0xFFFFFFFF` as the length
+    // prefix would otherwise grow the buffer to 4 GiB and OOM the process.
+    func test_reader_rejects_frame_larger_than_max_frame_size() {
+        let reader = BareRPCFrameReader(maxFrameSize: 1024)
+        // 4-byte little-endian length prefix = 0x00000800 = 2048 (> 1024 max).
+        let oversizeLen = Data([0x00, 0x08, 0x00, 0x00])
+        XCTAssertThrowsError(try reader.append(oversizeLen)) { err in
+            guard case BareRPCCodecError.frameTooLarge(let declared, let max) = err else {
+                return XCTFail("expected frameTooLarge, got \(err)")
+            }
+            XCTAssertEqual(declared, 2048)
+            XCTAssertEqual(max, 1024)
+        }
+    }
+
+    /// Default reader must accept the largest plausibly-legitimate frame (1 MiB ≪ the
+    /// 64 MiB default cap), to keep the cap from accidentally rejecting real traffic.
+    func test_reader_accepts_one_mib_frame_under_default_cap() throws {
+        let payload = Data(repeating: 0xab, count: 1 * 1024 * 1024)
+        let frame = BareRPCCodec.encodeRequestFrame(id: 1, command: 1, data: payload)
+        let reader = BareRPCFrameReader()
+        try reader.append(frame)
+        XCTAssertNotNil(reader.next())
+    }
+
     func test_reader_compacts_after_large_consumption() throws {
         // Feed 70KB of small frames; verify internal buffer doesn't grow unbounded.
         // Each frame is `04000000 03 01 fd 01 02` = 9 bytes (STREAM RESPONSE|OPEN id=1).

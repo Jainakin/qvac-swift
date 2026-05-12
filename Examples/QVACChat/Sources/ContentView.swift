@@ -82,18 +82,38 @@ final class ChatViewModel: ObservableObject {
         #if os(iOS)
         return try .iOSWithBundledResource()
         #elseif os(macOS)
-        // macOS: requires `bare` runtime + an `@qvac/sdk` install at a known location.
-        // For the demo we look at the bundled spike-js dir; in production the consumer
-        // points this at their own node_modules.
-        let nodeModulesDir = URL(fileURLWithPath:
-            ProcessInfo.processInfo.environment["QVAC_NODE_MODULES"]
-                ?? "/Users/hardik/Projects/qvac-swift/spike-js/node_modules"
-        )
+        guard let nodeModulesDir = resolveNodeModulesDir() else {
+            throw QVACError.transport(reason:
+                "macOS demo needs an @qvac/sdk install. Set QVAC_NODE_MODULES to your " +
+                "node_modules dir, or run from the repo root (we'll find spike-js/node_modules)."
+            )
+        }
         return try .macOS(nodeModulesDir: nodeModulesDir)
         #else
         throw QVACError.transport(reason: "unsupported platform")
         #endif
     }
+
+    #if os(macOS)
+    /// Resolve the node_modules dir, in order:
+    ///   1. QVAC_NODE_MODULES env var (explicit override).
+    ///   2. ./spike-js/node_modules under the current working directory (repo monorepo dev).
+    ///   3. nil — caller must configure.
+    private static func resolveNodeModulesDir() -> URL? {
+        if let env = ProcessInfo.processInfo.environment["QVAC_NODE_MODULES"], !env.isEmpty {
+            return URL(fileURLWithPath: env)
+        }
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let candidates = [
+            cwd.appendingPathComponent("spike-js/node_modules"),
+            cwd.appendingPathComponent("node_modules"),
+        ]
+        for c in candidates where FileManager.default.fileExists(atPath: c.path) {
+            return c
+        }
+        return nil
+    }
+    #endif
 }
 
 struct ContentView: View {

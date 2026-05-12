@@ -59,14 +59,17 @@ try await client.unloadModel(modelId: modelId)
 
 ### macOS
 
-macOS spawns the worker as a subprocess. You need `bare` runtime + a
-`node_modules/@qvac/sdk` installation:
+macOS spawns the worker as a subprocess. You need (one-time):
 
 ```bash
-# one-time setup
+# 1. bare runtime
 brew install holepunchto/tap/bare-runtime
-mkdir my-app && cd my-app && npm init -y
-npm install @qvac/sdk
+bare --version          # sanity check
+
+# 2. @qvac/sdk installed somewhere — anywhere works as long as the path is stable
+mkdir my-app && cd my-app
+npm init -y
+npm install --legacy-peer-deps @qvac/sdk
 ```
 
 ```swift
@@ -75,6 +78,13 @@ let client = try await QVACClient(configuration:
 )
 // … same API as iOS from here on
 ```
+
+Tips:
+- The `nodeModulesDir` must contain `@qvac/sdk/dist/server/worker.js`. The path is
+  validated at `connect` time; you'll see `workerNotFound` immediately if it's wrong.
+- If `bare` isn't on `/opt/homebrew/bin` or `/usr/local/bin`, pass `bareExecutable:` to
+  `Configuration.macOS(...)` explicitly. The package also scans nvm versioned dirs and
+  falls back to `which bare`.
 
 ## Architecture
 
@@ -131,25 +141,50 @@ xcodebuild -scheme QVACChat-macOS -destination 'platform=macOS'
 ## Tests
 
 ```bash
-swift test --filter QVACClientUnitTests            # 66 unit tests, no Bare worker required
-swift test --filter QVACClientIntegrationTests     # 9 live-worker integration tests on macOS
+swift test --filter QVACClientUnitTests            # 70 unit tests, no Bare worker required
+swift test --filter QVACClientIntegrationTests     # live-worker integration tests on macOS
 xcodebuild test \
     -project spike-swift/Examples/BareKitProbeApp/BareKitProbeApp.xcodeproj \
     -scheme BareKitProbeApp \
     -destination 'platform=iOS Simulator,name=iPhone 17'   # iOS hosted XCTest
 ```
 
-Real-model integration tests are gated on `QVAC_RUN_REAL_MODEL_TESTS=1` + an `HF_TOKEN`
-env var. Default `swift test` runs are fast and don't download anything.
+Integration tests are env-gated so a default `swift test` is fast and offline:
+
+| Env var | Suite that runs | What it covers |
+|---|---|---|
+| `QVAC_BARE_BIN` + `QVAC_WORKER_SCRIPT` | `LiveWorkerIntegrationTests` | init, heartbeat, downloadAsset streaming, cancel envelope, close |
+| `QVAC_BARE_BIN` + `QVAC_NODE_MODULES` | `QVACClientIntegrationTests` | full client lifecycle via public `QVACClient` API |
+| `QVAC_RUN_REAL_MODEL_TESTS=1` + above | `RealModelIntegrationTests` | full `load → completion → cancel → unload` cycle (requires `HF_TOKEN` or a public model) |
+| `QVAC_RUN_RAG_TESTS=1` + above | `RAGIntegrationTests` | full RAG ingest/search/delete vs a live worker |
+
+CI runs the first two by default; the model-bearing suites are opt-in (they download
+weights and take minutes). See `.github/workflows/ci.yml` for the wiring.
 
 ## Benchmark (KR-2)
 
 ```bash
-./bench/run.sh 500       # 500 heartbeat iters Swift vs Node
+./bench/run.sh 500       # 500 heartbeat iters Swift vs Node, prints ratio
 ```
 
-Reference numbers on M1 Mac mini, macOS 14 (see `bench/results.json`):
-**Swift 67μs mean vs. Node 68μs mean — parity, well inside the 5% budget.**
+The script runs both the Swift and the Node clients against the same Bare worker, then
+compares mean round-trip latency. KR-2 requires Swift overhead < 5% of Node. The script
+exits non-zero if the ratio exceeds `QVAC_BENCH_MAX_OVERHEAD` (default `1.05`). No
+results are committed to the repo — every reviewer regenerates them locally so the
+numbers reflect *their* hardware.
+
+## Security model
+
+The Swift client is the consumer half of a client/worker split. Threat model and the
+guarantees you should expect from this library:
+
+| Boundary | Trust assumption | What the library does |
+|---|---|---|
+| **macOS UDS socket** between client + spawned worker | only the spawning user can connect | socket sits inside a 0700 `mkdtemp` dir; socket file itself is `chmod 0600`; ~36-bit random path |
+| **`environmentOverlay` passed to `.macOS(...)`** | caller is responsible for the values | client strips `DYLD_*`/`LD_PRELOAD`/`LD_LIBRARY_PATH`/`LD_AUDIT` before exec so untrusted overlay can't inject a dylib |
+| **Inbound frames from the worker** | bounded size | `BareRPCFrameReader` caps frame size at 64 MiB; oversize frames throw `BareRPCCodecError.frameTooLarge` rather than allocating |
+| **`modelSrc`/`assetSrc` URLs** | caller-supplied, library forwards verbatim | URLs are not validated. If your app accepts these from untrusted users, **you must validate them yourself** — the worker will fetch any URL you pass |
+| **iOS bundled `worker.mobile.bundle.js`** | release-time vendored from `@qvac/sdk` | inherent supply-chain trust on upstream SDK; releases pin a specific `@qvac/sdk` version via `package-lock.json` |
 
 ## License
 

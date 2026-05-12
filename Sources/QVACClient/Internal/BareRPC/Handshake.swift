@@ -34,8 +34,6 @@ public struct QVACRuntimeContext: Codable, Equatable, Sendable {
         return QVACRuntimeContext(runtime: "bare", platform: "ios", deviceModel: nil, deviceBrand: "Apple")
         #elseif os(macOS)
         return QVACRuntimeContext(runtime: "node", platform: "darwin")
-        #elseif os(Linux)
-        return QVACRuntimeContext(runtime: "node", platform: "linux")
         #else
         return QVACRuntimeContext(runtime: "node", platform: "unknown")
         #endif

@@ -81,3 +81,9 @@ QVAC JavaScript client uses, validated byte-for-byte against the JS reference.
 - ``QVACError``
 - ``QVACErrorCode``
 - ``QVACErrorCategory``
+
+### Operational notes
+
+- <doc:Security>
+- <doc:Architecture>
+- <doc:GettingStarted>

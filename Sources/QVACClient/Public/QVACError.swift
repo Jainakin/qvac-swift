@@ -22,6 +22,12 @@ import Foundation
 public enum QVACError: Error, CustomStringConvertible, Sendable {
     case client(QVACErrorCode, message: String?)
     case server(QVACErrorCode, message: String?)
+    /// The worker returned a numeric error code outside the SDK's documented client
+    /// (50001–52000) and server (52001–54000) ranges. These typically originate from
+    /// installed addons (rag/embed/diffusion/etc.) which define their own code spaces.
+    /// The wire format parsed cleanly — the error is a legitimate server response we
+    /// just don't have a typed Swift enum case for.
+    case serverUntyped(code: Int, message: String?)
     case transport(reason: String, underlying: Error? = nil)
     case protocolViolation(String)
     case encoding(String)
@@ -32,6 +38,8 @@ public enum QVACError: Error, CustomStringConvertible, Sendable {
             return "QVAC client error \(code.rawValue) (\(code)): \(m ?? "no message")"
         case .server(let code, let m):
             return "QVAC server error \(code.rawValue) (\(code)): \(m ?? "no message")"
+        case .serverUntyped(let code, let m):
+            return "QVAC server error \(code) (addon-defined): \(m ?? "no message")"
         case .transport(let reason, _):
             return "QVAC transport error: \(reason)"
         case .protocolViolation(let r):
@@ -42,15 +50,18 @@ public enum QVACError: Error, CustomStringConvertible, Sendable {
     }
 
     /// Convenience constructor: map a numeric code from the wire into a typed error.
-    /// Returns `.client` or `.server` depending on which range the code falls in.
+    /// Returns:
+    /// - `.client(...)`        for codes 50001–52000 we have a typed enum case for
+    /// - `.server(...)`        for codes 52001–54000 we have a typed enum case for
+    /// - `.serverUntyped(...)` for any other numeric code (addon-defined / newer SDK)
+    /// Never returns `.protocolViolation` for a numeric code — an unrecognized code is
+    /// a known-shape error envelope from an addon, not a wire-format violation.
     public static func fromWire(code: Int, message: String?) -> QVACError {
-        guard let typed = QVACErrorCode(rawValue: code) else {
-            // Unknown code from a newer SDK we haven't regenerated against.
-            // Surface as a generic error rather than crashing.
-            return .protocolViolation("unknown error code \(code)" + (message.map { ": \($0)" } ?? ""))
+        if let typed = QVACErrorCode(rawValue: code) {
+            if (50001...52000).contains(code) { return .client(typed, message: message) }
+            return .server(typed, message: message)
         }
-        if (50001...52000).contains(code) { return .client(typed, message: message) }
-        return .server(typed, message: message)
+        return .serverUntyped(code: code, message: message)
     }
 }
 

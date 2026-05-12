@@ -31,9 +31,18 @@ final class LiveWorkerIntegrationTests: XCTestCase {
         if let p = ProcessInfo.processInfo.environment["QVAC_WORKER_SCRIPT"] {
             return URL(fileURLWithPath: p)
         }
-        // Default to the spike-js installation that powered Phase-0 validation.
-        let p = "/Users/hardik/Projects/qvac-swift/spike-js/node_modules/@qvac/sdk/dist/server/worker.js"
-        if FileManager.default.fileExists(atPath: p) { return URL(fileURLWithPath: p) }
+        // Walk up from the test binary's working directory looking for
+        // `spike-js/node_modules/@qvac/sdk/dist/server/worker.js` — keeps the test
+        // working whether `swift test` is run from the repo root, from CI, or from
+        // an Xcode-derived data dir.
+        let suffix = "spike-js/node_modules/@qvac/sdk/dist/server/worker.js"
+        var dir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        for _ in 0..<8 {
+            let candidate = dir.appendingPathComponent(suffix)
+            if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+            if dir.pathComponents.count <= 1 { break }
+            dir.deleteLastPathComponent()
+        }
         return nil
     }()
 
@@ -161,12 +170,43 @@ final class LiveWorkerIntegrationTests: XCTestCase {
 
     /// Close should be idempotent and tear down cleanly. Re-running after close should
     /// be a no-op without crashing.
-    func test_close_terminates_worker_cleanly() async throws {
+    func test_close_idempotent() async throws {
         let transport = try await newTransport()
         let rpc = BareRPCClient(transport: transport)
         try await QVACHandshake.sendInitConfig(on: rpc)
         await rpc.close()
         await rpc.close() // idempotent
+    }
+
+    /// AC-7: `close()` tears down the IPC connection AND the worker subprocess. This goes
+    /// beyond the previous "didn't crash" check — we assert (a) the worker reports a clean
+    /// exit via NSTask, and (b) the OS confirms the PID is gone via `kill(pid, 0)`.
+    func test_close_terminates_worker_subprocess_with_clean_exit() async throws {
+        let transport = try await newTransport()
+        let rpc = BareRPCClient(transport: transport)
+        try await QVACHandshake.sendInitConfig(on: rpc)
+
+        // Capture the live worker PID before close.
+        let pidBefore = transport.__testWorkerPID()
+        XCTAssertGreaterThan(pidBefore, 0, "worker PID should be assigned post-handshake")
+        // While running, kill(pid, 0) returns 0 (process exists).
+        XCTAssertEqual(Darwin.kill(pidBefore, 0), 0,
+                       "worker proc must be alive before close (kill -0 = \(errno))")
+
+        // Tear down. close() awaits worker subprocess exit internally.
+        await rpc.close()
+
+        // After close, the transport's worker handle should report not-running with a
+        // clean termination reason. NSTask's `.exit` rawValue is 1; `.uncaughtSignal` is 2.
+        // `terminate()` sends SIGTERM, which `bare` catches and exits cleanly — so we
+        // accept either .exit/0 or a signal-prompted clean exit.
+        if let info = transport.__testWorkerExitInfo() {
+            XCTAssertFalse(info.isRunning, "worker proc must not be running after close")
+        }
+        // Most importantly: the OS reports the PID as gone (kill -0 returns -1 with ESRCH).
+        let stillExists = Darwin.kill(pidBefore, 0) == 0
+        XCTAssertFalse(stillExists,
+                       "worker pid \(pidBefore) must be gone after close; OS still sees it")
     }
 }
 

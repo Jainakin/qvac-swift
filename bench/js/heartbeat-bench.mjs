@@ -1,13 +1,17 @@
 // Node baseline for the heartbeat latency benchmark.
 //
 // Usage:
-//   node bench/js/heartbeat-bench.mjs [iterations]
+//   node bench/js/heartbeat-bench.mjs [iterations] [resultPath]
 //
-// Output (JSON): same shape as the Swift counterpart so a comparison script can diff them.
+// Output: writes JSON to resultPath (default: ./node-result.json). The SDK's
+// runtime logging would otherwise contaminate the captured stdout, so we
+// deliberately do NOT print the JSON result to stdout.
 
 import { heartbeat, close } from '@qvac/sdk'
+import { writeFileSync } from 'node:fs'
 
 const iterations = parseInt(process.argv[2] || '1000', 10)
+const resultPath = process.argv[3] || './node-result.json'
 
 // Warm up — first call spawns the worker.
 await heartbeat()
@@ -22,18 +26,15 @@ for (let i = 0; i < iterations; i++) {
 await close()
 
 samples.sort((a, b) => a - b)
-const min = samples[0]
-const max = samples[samples.length - 1]
-const mean = samples.reduce((a, b) => a + b, 0) / samples.length
-const p50 = samples[Math.floor(samples.length / 2)]
-const p99 = samples[Math.floor(samples.length * 0.99)]
-
-console.log(JSON.stringify({
-  client: 'node',
+const result = {
+  client:    'node',
   iterations,
-  min_ms: min,
-  mean_ms: mean,
-  p50_ms: p50,
-  p99_ms: p99,
-  max_ms: max,
-}, null, 2))
+  min_ms:    samples[0],
+  mean_ms:   samples.reduce((a, b) => a + b, 0) / samples.length,
+  p50_ms:    samples[Math.floor(samples.length / 2)],
+  p99_ms:    samples[Math.floor(samples.length * 0.99)],
+  max_ms:    samples[samples.length - 1],
+}
+
+writeFileSync(resultPath, JSON.stringify(result, null, 2))
+console.error(`[node-bench] wrote ${resultPath}`)

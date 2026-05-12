@@ -11,6 +11,11 @@
 
 set -euo pipefail
 
+# Force C locale so JS string sort + property orderings are deterministic across
+# platforms (avoids locale-dependent drift in generated output).
+export LC_ALL=C
+export LANG=C
+
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 

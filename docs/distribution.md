@@ -4,26 +4,63 @@ This document covers how releases are cut and how consumers discover the package
 
 ## Release process (`v*` tags)
 
-1. Bump the version in any user-facing docs that reference it.
-2. Run the codegen freshness check locally to be sure nothing's drifted:
-   ```bash
-   ./tools/codegen/run.sh
-   git diff --exit-code Sources/QVACClient/Generated/
-   ```
-3. Tag and push:
-   ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
-   ```
-4. `.github/workflows/release.yml` fires automatically:
-   - Runs unit tests + codegen check
-   - Generates `worker.mobile.bundle.js` via `@qvac/cli bundle sdk` for iOS targets
-   - Runs `bare-link` against the addon set to produce ~40 iOS xcframeworks
-   - Zips each xcframework + emits SHA-256 checksums
-   - Creates a GitHub Release with all artifacts attached
-   - Pings the Swift Package Index refresh endpoint
-5. The Swift Package Index picks up the new tag within ~10 minutes and rebuilds its
-   compatibility matrix.
+This is a two-step flow because `Package.swift` is dual-mode:
+
+- **dev mode** (the one checked in) uses `binaryTarget(path: "spike-swift/Vendor/BareKit.xcframework")`
+  so the monorepo `swift build` works.
+- **consumer mode** uses `binaryTarget(url:checksum:)` so external apps that do
+  `.package(url: "...", from: "0.1.0")` can resolve. Generated at release time.
+
+### Step 1 — initial tag (uploads artifacts)
+
+```bash
+# Codegen freshness — be sure nothing's drifted.
+./tools/codegen/run.sh
+git diff --exit-code Sources/QVACClient/Generated/
+
+# Tag + push.
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` fires automatically:
+- Runs unit tests + codegen check
+- Generates `worker.mobile.bundle.js` via `@qvac/cli bundle sdk` for iOS targets
+- Runs `bare-link` against the addon set to produce ~40 iOS xcframeworks
+- Zips each xcframework + emits SHA-256 checksums
+- Creates a GitHub Release with all artifacts attached
+- Pings the Swift Package Index refresh endpoint
+- Prints a warning that the tagged commit's `Package.swift` is still dev-mode
+
+### Step 2 — rewrite Package.swift for consumers, move the tag
+
+After the release workflow finishes:
+
+```bash
+# Rewrites Package.swift in place using checksums computed from the just-uploaded
+# artifacts. The previous dev-mode manifest is preserved as Package.swift.dev.
+tools/release/prepare-release.sh v0.1.0
+
+# Sanity check.
+diff Package.swift.dev Package.swift   # should show URL targets replacing path targets
+swift package describe                  # should resolve successfully
+
+# Commit + move the tag to the new commit.
+git add Package.swift Package.swift.dev
+git commit -m "release: pin v0.1.0 binary targets"
+git tag -fa v0.1.0 -m "v0.1.0"
+git push origin main
+git push origin v0.1.0 --force-with-lease
+```
+
+Now `.package(url: "https://github.com/.../qvac-swift", from: "0.1.0")` resolves to the
+URL-based manifest in a clean checkout, and SPM consumers fetch the artifacts directly
+from the GitHub Release.
+
+### Step 3 — Swift Package Index reindex
+
+SPI picks up the new tag within ~10 minutes. If you want to force a reindex, hit the
+SPI refresh endpoint manually (the release workflow already does this).
 
 ## Swift Package Index submission
 
@@ -84,3 +121,76 @@ git commit -m "regen against @qvac/sdk@0.11.0"
 
 The drift workflow (`.github/workflows/codegen-drift.yml`) auto-opens a tracking issue
 when upstream changes; you don't have to poll manually.
+
+## Consumer app — App Store deployment notes
+
+For iOS apps targeting the App Store that consume `QVACClient`:
+
+### Network usage description
+
+QVACClient loads models from arbitrary HTTPS URLs through the worker. If your app
+forwards untrusted URLs (e.g. from a user clipboard / QR scan / deep link) you must
+validate them — see the Security article in DocC.
+
+If the app advertises specific model sources only, declare them in `Info.plist`:
+
+```xml
+<key>NSAppTransportSecurity</key>
+<dict>
+  <key>NSAllowsArbitraryLoads</key>
+  <false/>
+  <key>NSExceptionDomains</key>
+  <dict>
+    <key>huggingface.co</key>
+    <dict>
+      <key>NSExceptionAllowsInsecureHTTPLoads</key>
+      <false/>
+      <key>NSIncludesSubdomains</key>
+      <true/>
+    </dict>
+  </dict>
+</dict>
+```
+
+### Background fetch / long-running model loads
+
+If your UX allows the user to keep model downloads running while the app is
+backgrounded:
+
+```xml
+<key>UIBackgroundModes</key>
+<array>
+  <string>processing</string>
+</array>
+```
+
+Models often run 100–500 MB so this is a real consideration.
+
+### Privacy manifest
+
+iOS 17+ Privacy Manifest entries you'll likely need (in your app's `PrivacyInfo.xcprivacy`):
+
+- `NSPrivacyAccessedAPICategoryFileTimestamp` — the worker reads cache file metadata.
+- `NSPrivacyAccessedAPICategoryDiskSpace` — the worker checks disk space before downloads.
+- `NSPrivacyAccessedAPICategorySystemBootTime` — used by the worker's logging timestamps.
+
+(QVACClient itself doesn't call these APIs directly, but the in-process BareKit
+worker may; Apple requires the app to declare them.)
+
+### macOS sandbox / App Store
+
+For sandboxed macOS apps spawning the worker subprocess via `.macOS(...)`, you need:
+
+```xml
+<key>com.apple.security.cs.allow-jit</key>
+<true/>
+<key>com.apple.security.cs.disable-library-validation</key>
+<true/>
+<key>com.apple.security.network.client</key>
+<true/>
+```
+
+The first two are required because `bare` JITs JavaScript and loads native addons.
+The third lets the worker fetch models. The `Examples/QVACChat/Sources/Info.plist`
+in this repo is a non-sandboxed dev configuration — replace it with the above
+entries for App Store submission.

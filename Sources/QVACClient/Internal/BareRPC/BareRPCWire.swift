@@ -84,6 +84,9 @@ public struct BareRPCError: Error, Equatable, Sendable, CustomStringConvertible 
 public enum BareRPCCodecError: Error, Equatable, Sendable {
     case truncated
     case unknownType(UInt64)
+    /// The length prefix on an incoming frame exceeds `BareRPCFrameReader.maxFrameSize`.
+    /// Likely a malformed worker or a hostile peer attempting a DoS via oversize frames.
+    case frameTooLarge(declared: UInt32, max: Int)
 }
 
 // MARK: - Decoded frame
@@ -135,19 +138,19 @@ public enum BareRPCCodec {
         c.uint.preencode(&state, id)
         c.uint.preencode(&state, command)
         c.uint.preencode(&state, stream.rawValue)
-        let hasData = stream.rawValue == 0
+        let hasInlinePayload = stream.rawValue == 0
         let payload = data ?? Data()
-        if hasData { c.uint.preencode(&state, UInt64(payload.count)) }
+        if hasInlinePayload { c.uint.preencode(&state, UInt64(payload.count)) }
 
         let headerLen = state.end
-        let totalLen = headerLen + (hasData ? payload.count : 0)
+        let totalLen = headerLen + (hasInlinePayload ? payload.count : 0)
         state.buffer = Data(count: totalLen)
         state.start = 0
         c.uint.encode(&state, BareRPCMessageType.request.rawValue)
         c.uint.encode(&state, id)
         c.uint.encode(&state, command)
         c.uint.encode(&state, stream.rawValue)
-        if hasData {
+        if hasInlinePayload {
             c.uint.encode(&state, UInt64(payload.count))
             appendPayload(into: &state, payload: payload)
         }
@@ -369,7 +372,19 @@ public enum BareRPCCodec {
 /// subscript can be index-absolute after removeFirst, which silently crashes on
 /// multi-frame inputs. The buffer compacts when consumed > 64KB.
 public final class BareRPCFrameReader {
-    public init() {}
+    /// Upper bound on a single frame's declared length (the 4-byte length prefix on the
+    /// wire). Configurable per-instance for tests; defaults to 64 MiB which comfortably
+    /// holds the largest legitimate QVAC payload (a fully-decoded model file would be
+    /// downloaded out-of-band by the worker, not framed over this RPC). Anything bigger
+    /// is treated as a hostile or malformed peer and rejected as
+    /// `BareRPCCodecError.frameTooLarge`.
+    public static let defaultMaxFrameSize: Int = 64 * 1024 * 1024
+
+    public init(maxFrameSize: Int = BareRPCFrameReader.defaultMaxFrameSize) {
+        self.maxFrameSize = maxFrameSize
+    }
+
+    public let maxFrameSize: Int
 
     private enum State { case awaitingLength; case awaitingBody(needed: Int) }
 
@@ -406,6 +421,9 @@ public final class BareRPCFrameReader {
                 guard remaining >= 4 else { return }
                 var n: UInt32 = 0
                 for i in 0..<4 { n |= UInt32(byte(at: i)) << (8 * i) }
+                if Int(n) > maxFrameSize {
+                    throw BareRPCCodecError.frameTooLarge(declared: n, max: maxFrameSize)
+                }
                 consumed += 4
                 state = .awaitingBody(needed: Int(n))
             case .awaitingBody(let needed):
