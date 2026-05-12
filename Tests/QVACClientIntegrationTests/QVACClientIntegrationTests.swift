@@ -17,8 +17,17 @@ final class QVACClientIntegrationTests: XCTestCase {
 
     private static let nodeModulesDir: URL? = {
         if let p = ProcessInfo.processInfo.environment["QVAC_NODE_MODULES"] { return URL(fileURLWithPath: p) }
-        let p = "/Users/hardik/Projects/qvac-swift/spike-js/node_modules"
-        return FileManager.default.fileExists(atPath: p) ? URL(fileURLWithPath: p) : nil
+        // Walk up from cwd looking for spike-js/node_modules — works whether `swift test`
+        // is run from the repo root or from an Xcode derived-data dir.
+        let suffix = "spike-js/node_modules"
+        var dir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        for _ in 0..<8 {
+            let c = dir.appendingPathComponent(suffix)
+            if FileManager.default.fileExists(atPath: c.path) { return c }
+            if dir.pathComponents.count <= 1 { break }
+            dir.deleteLastPathComponent()
+        }
+        return nil
     }()
 
     override func setUpWithError() throws {

@@ -92,23 +92,47 @@ final class UnixDomainSocketTransportTests: XCTestCase {
     // MARK: - Security regression tests (§9, §11, §12 from AUDIT.md)
 
     /// §12 — `environmentOverlay` must strip dynamic-linker keys so a caller can't pipe
-    /// `DYLD_INSERT_LIBRARIES` etc. into the spawned worker process.
+    /// `DYLD_INSERT_LIBRARIES` etc. into the spawned worker process. Expanded post-second-
+    /// audit to also cover Malloc/ObjC/Foundation debug knobs that aid info disclosure or
+    /// heap exploitation.
     func test_environmentOverlay_strips_dynamic_linker_keys() {
         let raw: [String: String] = [
+            // dyld code-exec vectors
             "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib",
             "DYLD_FALLBACK_LIBRARY_PATH": "/tmp",
             "LD_PRELOAD": "/tmp/evil.so",
             "LD_LIBRARY_PATH": "/tmp",
             "LD_AUDIT": "/tmp/audit.so",
-            "NODE_OPTIONS": "--max-old-space-size=4096", // safe; must pass through
-            "QVAC_LOG_LEVEL": "trace",                   // safe; must pass through
+            // macOS allocator debugging
+            "MallocStackLogging": "1",
+            "MallocLogFile": "/tmp/heap.log",
+            "MallocScribble": "1",
+            // ObjC / Foundation debug
+            "OBJC_DEBUG_POOL_ALLOCATION": "YES",
+            "NSDebugEnabled": "YES",
+            "NSZombieEnabled": "YES",
+            "CFNETWORK_DIAGNOSTICS": "3",
+            // Safe — must pass through
+            "NODE_OPTIONS": "--max-old-space-size=4096",
+            "QVAC_LOG_LEVEL": "trace",
         ]
         let sanitized = UnixDomainSocketTransport.sanitizeOverlay(raw)
+        // Code-execution vectors
         XCTAssertNil(sanitized["DYLD_INSERT_LIBRARIES"])
         XCTAssertNil(sanitized["DYLD_FALLBACK_LIBRARY_PATH"])
         XCTAssertNil(sanitized["LD_PRELOAD"])
         XCTAssertNil(sanitized["LD_LIBRARY_PATH"])
         XCTAssertNil(sanitized["LD_AUDIT"])
+        // Allocator debug
+        XCTAssertNil(sanitized["MallocStackLogging"])
+        XCTAssertNil(sanitized["MallocLogFile"])
+        XCTAssertNil(sanitized["MallocScribble"])
+        // ObjC / Foundation
+        XCTAssertNil(sanitized["OBJC_DEBUG_POOL_ALLOCATION"])
+        XCTAssertNil(sanitized["NSDebugEnabled"])
+        XCTAssertNil(sanitized["NSZombieEnabled"])
+        XCTAssertNil(sanitized["CFNETWORK_DIAGNOSTICS"])
+        // Safe must survive
         XCTAssertEqual(sanitized["NODE_OPTIONS"], "--max-old-space-size=4096")
         XCTAssertEqual(sanitized["QVAC_LOG_LEVEL"], "trace")
     }

@@ -61,7 +61,20 @@ if [ "${#ARTIFACTS[@]}" -eq 0 ]; then
 fi
 echo "[prepare-release] found ${#ARTIFACTS[@]} xcframework artifacts at release"
 
-# 2. Download each + compute SHA-256. Use parallel arrays (TARGETS[i] / CHECKSUMS[i])
+# 2a. Validate every asset name before letting it flow into a generated Package.swift
+# string literal or shell command. A compromised GitHub release could otherwise inject
+# Swift code via a crafted asset name like `foo"; eval(...); ".xcframework.zip`. The
+# regex below permits exactly the shape `bare-link` / `qvac` actually produce.
+SAFE_ASSET_RE='^[A-Za-z0-9._@-]+\.xcframework\.zip$'
+for asset in "${ARTIFACTS[@]}"; do
+    if [[ ! "$asset" =~ $SAFE_ASSET_RE ]]; then
+        echo "[prepare-release] error: refusing to process asset with unsafe name: $asset" >&2
+        echo "[prepare-release]   expected pattern: $SAFE_ASSET_RE" >&2
+        exit 4
+    fi
+done
+
+# 2b. Download each + compute SHA-256. Use parallel arrays (TARGETS[i] / CHECKSUMS[i])
 # rather than an associative array — bash 3.2 (macOS default) doesn't support `declare -A`.
 TARGETS=()
 CHECKSUMS=()
@@ -70,6 +83,12 @@ for asset in "${ARTIFACTS[@]}"; do
     echo "[prepare-release]   downloading $asset..."
     gh release download "$RELEASE_TAG" --repo "$REPO" --pattern "$asset" --dir "$WORKDIR"
     sha=$(shasum -a 256 "$WORKDIR/$asset" | awk '{print $1}')
+    # Double-check the computed checksum is a 64-char hex string (defense in depth — a
+    # corrupted shasum binary or odd platform should not embed garbage into Package.swift).
+    if [[ ! "$sha" =~ ^[a-f0-9]{64}$ ]]; then
+        echo "[prepare-release] error: shasum returned non-hex for $asset: $sha" >&2
+        exit 5
+    fi
     TARGETS+=("$name")
     CHECKSUMS+=("$sha")
     echo "[prepare-release]   $name -> $sha"

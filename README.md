@@ -138,6 +138,19 @@ xcodebuild -scheme QVACChat-iOS  -destination 'platform=iOS Simulator,name=iPhon
 xcodebuild -scheme QVACChat-macOS -destination 'platform=macOS'
 ```
 
+On macOS the example needs to know where your `@qvac/sdk` `node_modules` live. The
+app's `resolveNodeModulesDir()` helper checks in this order:
+
+1. `QVAC_NODE_MODULES` env var (explicit override — set this when running the macOS
+   target from Xcode via the scheme's Environment Variables)
+2. `./spike-js/node_modules` relative to the cwd (works when launching from the
+   monorepo root)
+3. `./node_modules` relative to the cwd (works when the example is run from a sibling
+   directory that has `@qvac/sdk` installed)
+
+If none match, the app throws a clear error with instructions; iOS doesn't need this
+because the worker bundle is shipped as an SPM resource.
+
 ## Tests
 
 ```bash

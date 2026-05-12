@@ -98,14 +98,33 @@ public final class UnixDomainSocketTransport: BareTransport, @unchecked Sendable
     private var readerThread: Thread?
 
     /// Environment variable names that must never be propagated from the caller's
-    /// `environmentOverlay` — they can change the dynamic linker's behavior of the spawned
-    /// `bare` subprocess and provide an arbitrary-code-execution vector.
-    /// Matches Apple's `dyld` sanitization list (`man dyld`).
+    /// `environmentOverlay` — they can change the dynamic linker's behavior of the
+    /// spawned `bare` subprocess (arbitrary-code-execution vector) or alter the
+    /// runtime/allocator behavior in ways that aid heap exploitation or leak data.
+    /// Matches Apple's `dyld` sanitization list (`man dyld`) plus the macOS-specific
+    /// `Malloc*` allocator-debug vars and the ObjC-runtime debug vars.
     private static let dangerousEnvPrefixes: [String] = [
+        // Dynamic linker — code-execution vectors
         "DYLD_",
         "LD_PRELOAD",
         "LD_LIBRARY_PATH",
         "LD_AUDIT",
+        // macOS allocator debugging — usable in heap-exploit chains and leaks
+        // internal pointers via stack-logging traces.
+        "MallocStackLogging",
+        "MallocStackLoggingNoCompact",
+        "MallocLog",
+        "MallocLogFile",
+        "MallocCheckHeapStart",
+        "MallocCheckHeapEach",
+        "MallocGuardEdges",
+        "MallocScribble",
+        // ObjC runtime debug — info-disclosure on class lookup, method dispatch
+        "OBJC_DEBUG_",
+        "NSDebug",
+        "NSZombie",
+        // Foundation/CFNetwork debugging — info-disclosure
+        "CFNETWORK_DIAGNOSTICS",
     ]
 
     /// Spawn the worker and accept its connection. After this returns, the transport is

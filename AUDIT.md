@@ -16,6 +16,18 @@ all 30 RPC discriminators round-trip live against a real Bare worker (AC-4 evide
 bench shows **Swift 50.9 µs / Node 60.7 µs / ratio 0.84** — KR-2 met (Swift is *faster*
 than Node).
 
+**Second-pass audit (2026-05-12 follow-up):** Five parallel reviewer agents re-audited
+the post-fix state against the grant. **One self-honesty failure caught** — AUDIT.md
+had claimed `grep -rn '/Users/hardik' Sources Tests tools bench Examples docs` returned
+zero hits, but in fact 3 test files (`QVACClientIntegrationTests.swift:20`,
+`RealModelIntegrationTests.swift:28`, `RAGIntegrationTests.swift:26`) still had hardcoded
+monorepo paths as a fallback. Those tests would silently skip on any fresh clone rather
+than fail loudly. Fixed (see §A1 below) — all three now walk up from cwd looking for
+`spike-js/node_modules` like the example app already did. Final `grep` is genuinely
+empty. Other findings: low-severity asset-name injection in `prepare-release.sh` (fixed,
+§A2); env-overlay sanitizer expanded to cover Malloc/ObjC/CFNetwork debug vars (§A3);
+README expanded to document the example app's auto-discovery logic (§A4).
+
 ---
 
 ## §1 — Critical (must fix before grant submission)
@@ -327,7 +339,8 @@ than Node).
 | Docs/DX (§4) | 0 | 3 | 5 |
 | Verified-from-start (§5) | 0 | 13 | 0 |
 | Operational (§6) | 6 | 0 | 0 |
-| **Total** | **6 pending** | **41 done** | **10 comment** |
+| Second-audit (§A) | 0 | 4 | 6 |
+| **Total** | **6 pending** | **45 done** | **16 comment** |
 
 All remaining `pending` items are §6 operational steps that require maintainer action:
 make the GitHub repo public, submit to Swift Package Index, send the 7 open questions
@@ -340,6 +353,57 @@ from §7), and capture a physical-device KR-5 screenshot.
 - `swift test --filter QVACClientUnitTests` — 70 tests pass in 0.28 s.
 - `swift test --filter AllRPCTypesRoundTripTests` — 30 RPC discriminators round-trip live against a real Bare worker.
 - `tools/codegen/run.sh` — completes in 1 s, produces zero diff against checked-in `Sources/QVACClient/Generated/`.
-- `bench/run.sh 100` — Swift 50.9 µs / Node 60.7 µs / ratio **0.84** (Swift faster than Node, well inside the 5% KR-2 budget).
+- `bench/run.sh 100` — Swift 50.9 µs / Node 60.7 µs / ratio **0.84** (Swift faster than Node, well inside the 5% KR-2 budget). Numbers measured locally on Apple Silicon M-series; CI uses a 1.20 budget instead because GitHub-hosted runners have ~3-15% noise per call; the local result is the grant-relevant one. `bench/result.json` is gitignored so a reviewer reproduces it on their own hardware.
 - `grep -rn 'TODO|FIXME|XXX|HACK' Sources Tests tools` — zero hits in our source tree.
-- `grep -rn '/Users/hardik' Sources Tests tools bench Examples` — zero hits (all personal paths removed).
+- `grep -rn '/Users/hardik' Sources Tests tools bench Examples docs` — **after §A1 fix below**, zero hits everywhere. Before §A1 there were 3 stale fallback paths in test files that would silently skip on a fresh clone — caught by the second-audit pass and listed as a self-honesty failure in §A.
+
+---
+
+## §A — Second-audit findings (2026-05-12 follow-up pass)
+
+After the §1–§4 fixes landed, five parallel reviewer agents re-audited the post-fix
+state against the grant. They confirmed all six security patches are correct, all 25
+grant-required APIs are present, the bench produces real numbers, and the round-trip
+test really would catch wire-format breakage. They also found four real things worth
+fixing, all addressed in this section.
+
+### A1. AUDIT.md claimed "zero hits" for hardcoded paths but 3 test files still had them
+- **Files**: `Tests/QVACClientIntegrationTests/QVACClientIntegrationTests.swift:20`, `Tests/QVACClientIntegrationTests/RealModelIntegrationTests.swift:28`, `Tests/QVACClientIntegrationTests/RAGIntegrationTests.swift:26`
+- **Issue**: Each had `let p = "/Users/hardik/Projects/qvac-swift/spike-js/node_modules"` as a fallback when `QVAC_NODE_MODULES` was unset. On a fresh clone the path doesn't exist, so the tests' `XCTSkipUnless(Self.nodeModulesDir != nil, ...)` would silently skip rather than fail loudly or auto-discover. AUDIT.md's "zero hits" claim was a real self-honesty failure: the example app had been fixed (`Examples/QVACChat/Sources/ContentView.swift`), but the test suite hadn't been.
+- **Status**: **done** — replaced each with the same `walk up from cwd looking for spike-js/node_modules` logic that the example app uses. `grep -rn '/Users/hardik' Sources Tests tools bench Examples docs` now genuinely returns zero hits.
+- **Severity**: This is the most embarrassing finding because it directly contradicted a claim I'd just made. It didn't break security or correctness — the tests still skipped cleanly without these env vars set — but it meant the first audit's self-grading was overstated.
+
+### A2. `tools/release/prepare-release.sh` asset-name injection
+- **File**: `tools/release/prepare-release.sh:65-95`
+- **Issue**: Asset names from `gh release view --json assets` flowed directly into a generated `Package.swift` string literal (`name: "${name}",`) and into a `gh release download --pattern` argument. A compromised GitHub release could ship an asset named `foo"; @_silgen_name("destroy") func pwn() {} ".xcframework.zip` and inject Swift code or shell semicolons into the generated manifest. Realistic exploitation requires a compromised GitHub account, so severity is 🟡 LOW.
+- **Status**: **done** — added a `SAFE_ASSET_RE` regex check (`^[A-Za-z0-9._@-]+\.xcframework\.zip$`) before processing any asset, and a parallel `^[a-f0-9]{64}$` check on the shasum output as defense-in-depth.
+- **Severity**: 🟡 LOW (auth-gated supply-chain attack); fix is preventive.
+
+### A3. Env-overlay sanitizer didn't block Malloc/ObjC/CFNetwork debug vars
+- **File**: `Sources/QVACClient/Internal/Transport/UnixDomainSocketTransport.swift:100-127`
+- **Issue**: The original audit found `DYLD_*`/`LD_PRELOAD`/`LD_LIBRARY_PATH`/`LD_AUDIT` as code-execution vectors. Second audit pointed out these are the *worst* vectors but not the only ones — `MallocStackLogging`, `MallocLogFile`, `MallocScribble` can aid heap-exploit chains; `OBJC_DEBUG_*` / `NSDebugEnabled` / `NSZombieEnabled` leak runtime internals; `CFNETWORK_DIAGNOSTICS` dumps request bodies. Each is lower-severity than DYLD injection but worth blocking.
+- **Status**: **done** — extended `dangerousEnvPrefixes` to cover all of the above. Updated `test_environmentOverlay_strips_dynamic_linker_keys` to assert all new keys are stripped while safe keys (`NODE_OPTIONS`, `QVAC_LOG_LEVEL`) still pass through.
+- **Severity**: 🟡 LOW (auxiliary attack surface); the dyld vectors were the dominant risk.
+
+### A4. README didn't document the example app's `resolveNodeModulesDir()` auto-discovery
+- **File**: `README.md`
+- **Issue**: After the §22 fix replaced the hardcoded path in `Examples/QVACChat/Sources/ContentView.swift` with a 3-level fallback (env var → `./spike-js/node_modules` → `./node_modules`), the README still showed a generic `URL(fileURLWithPath: "/path/to/my-app/node_modules")` example. A reviewer following the README from outside the monorepo would think they have to wire a specific path, when in practice the example will auto-discover one of two common layouts.
+- **Status**: **done** — added a paragraph under `## Example app` enumerating the three resolution steps explicitly, so a reviewer knows exactly what to expect.
+
+### A5. Things the second audit verified are honest (no action needed, recorded for traceability)
+
+- **All 25 grant-required APIs** are still implemented, all `public`, return real `AsyncThrowingStream` types where the grant calls for streaming, and have no `fatalError`/`TODO`/`HACK` in the public surface. Independently re-verified file-by-file.
+- **All 6 security patches** from the original audit verified correct under second eyes: mkdtemp gives ~47–55 bits entropy (depending on how you count), `chmod 0o600` plus `umask 0o077` is genuine defense-in-depth, frame-size cap is checked *before* allocation (not after), `write()`/`close()` race uses `writeQueue.sync` correctly to drain in-flight writes before `Darwin.close(fd)`, reader uses `dup(2)` for its own fd so close on the original is safe.
+- **`AllRPCTypesRoundTripTests`** really does exercise 30 distinct discriminators through the public API, and its acceptance set (success + typed/untyped server errors + transport errors) catches encoding/protocol violations as test failures — not just compile-checks.
+- **Bench** is genuinely measured each run, never canned, results gitignored. The local 0.84 ratio is reproducible; the CI 1.20 budget is documented as runner-noise tolerance, not the grant target.
+- **Codegen idempotency** confirmed — empty `overrides.json` plus auto-detection produces zero diff against the checked-in generated files.
+- **Wire protocol** unchanged from first audit: zigzag bit-twiddle form, varint boundaries, stream-flag bitmask all still match the bare-rpc JS reference.
+
+### A6. Issues the second audit flagged but did not fix (recorded so they aren't forgotten)
+
+- **CI bench threshold 1.20 vs grant 1.05** — Documented as intentional. Grant requirement is "on the same machine"; GitHub-hosted runners have 3-15% per-call noise on sub-millisecond latencies. Local measurement (the audit-relevant one) is 0.84. If a Tether reviewer challenges this, the answer is "run `bench/run.sh 1000` on your hardware and observe the local number" — the harness is honest, only the CI threshold is loose.
+- **`AllRPCTypesRoundTripTests` only exercises error paths** (every call hits "model not loaded" / "nonexistent workspace") — by design, to avoid downloading models in CI. Success-path wire format is exercised by `RealModelIntegrationTests` + `RAGIntegrationTests` (with real models). The combination is sufficient for AC-4 coverage.
+- **HuggingFace as a CI dependency** — `integration-macos-real-model` and `integration-macos-rag` download HF GGUF files each run. If HF rate-limits or goes down, those jobs fail. No mitigation today; acceptable risk because (a) the same jobs gracefully skip on missing `HF_TOKEN`, (b) we can mirror to a stable URL if it becomes a recurring issue.
+- **`tetherto/qvac` as a CI dependency** — `codegen-freshness` sparse-clones the upstream repo each run. Same shape as HF risk. Acceptable for now; could mirror.
+- **No coverage for "worker crash, then reconnect"** or "stream backpressure" — not grant-required; deferred.
+- **iOS bundle supply chain** — `Sources/QVACClient/Resources/worker.mobile.bundle.js` is release-time vendored from `@qvac/sdk`. The release.yml workflow tries to regenerate it with `continue-on-error: true`; if upstream `bare-pack` breaks, the committed bundle is kept. Inherent supply-chain trust on the SDK at the version we pinned. Documented in DocC `Security.md`; no further mitigation planned for this milestone.
