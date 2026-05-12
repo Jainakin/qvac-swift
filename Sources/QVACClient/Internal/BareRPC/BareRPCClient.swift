@@ -160,11 +160,13 @@ public actor BareRPCClient {
         let frame = BareRPCCodec.encodeRequestFrame(id: id, command: command, stream: [], data: data)
         return try await withCheckedThrowingContinuation { (c: CheckedContinuation<Data?, Error>) in
             pendingSends[id] = PendingSend(continuation: c)
-            Task { [transport] in
+            Task { [transport, weak self] in
                 do {
                     try await transport.write(frame)
                 } catch {
-                    Task { await self.resolveSend(id: id, with: .failure(error)) }
+                    if let self {
+                        await self.resolveSend(id: id, with: .failure(error))
+                    }
                 }
             }
         }
@@ -195,7 +197,7 @@ public actor BareRPCClient {
             throw error
         }
         let onCancel: @Sendable () -> Void = { [weak self, id] in
-            Task { await self?.destroyStream(id: id) }
+            Task { [weak self] in await self?.destroyStream(id: id) }
         }
         return BareRPCResponseStream(chunks: asyncStream, onCancel: onCancel)
     }
@@ -230,7 +232,7 @@ public actor BareRPCClient {
             await self?.endDuplexOutbound(id: id)
         }
         let onDestroy: @Sendable () -> Void = { [weak self] in
-            Task { await self?.destroyDuplex(id: id) }
+            Task { [weak self] in await self?.destroyDuplex(id: id) }
         }
         return BareRPCDuplexSession(
             chunks: asyncStream, onWrite: onWrite, onEnd: onEnd, onDestroy: onDestroy

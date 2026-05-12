@@ -103,7 +103,7 @@ public final class BareIPCTransport: BareTransport, @unchecked Sendable {
             readContinuation = continuation
             lock.unlock()
             continuation.onTermination = { [weak self] _ in
-                Task { await self?.close() }
+                Task { [weak self] in await self?.close() }
             }
         }
     }
