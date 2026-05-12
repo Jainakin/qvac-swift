@@ -181,7 +181,11 @@ public final class UnixDomainSocketTransport: BareTransport, @unchecked Sendable
             stateLock.lock(); defer { stateLock.unlock() }
             self.readContinuation = continuation
             continuation.onTermination = { [weak self] _ in
-                Task { await self?.close() }
+                // Hop into a Task with its own weak capture so the Sendable check on the
+                // onTermination closure is satisfied without strongly retaining self.
+                Task { [weak self] in
+                    await self?.close()
+                }
             }
         }
     }

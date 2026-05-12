@@ -19,11 +19,8 @@ jobs:
         run: swift build
       - name: Test (unit only — keeps CI fast)
         run: swift test --filter QVACClientUnitTests
-      - name: Codegen freshness check
-        run: |
-          (cd tools/codegen && npm install --no-fund --no-audit)
-          tools/codegen/run.sh
-          git diff --exit-code Sources/QVACClient/Generated/
+      # Codegen freshness is enforced on every push by .github/workflows/ci.yml; we
+      # don't repeat it here so the release flow doesn't have to install spike-js.
 
   generate-ios-artifacts:
     name: Generate iOS worker bundle + addon xcframeworks
