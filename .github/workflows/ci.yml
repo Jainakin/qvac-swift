@@ -38,15 +38,21 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Install JS deps (cached)
+      - name: Sparse-clone @qvac/sdk schemas (for generate-errors.mjs)
+        # generate-errors.mjs reads the upstream TypeScript files directly. The
+        # qvac-sparse/ dir is gitignored (it's a separate clone of tetherto/qvac).
+        # Recreate it here just deep enough to read packages/sdk/schemas/*.ts.
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/tetherto/qvac.git qvac-sparse
+          cd qvac-sparse
+          git sparse-checkout set packages/sdk/schemas
+      - name: Install JS deps for type generator
         run: |
           (cd tools/codegen && npm install --no-fund --no-audit)
-          # The type generator needs the *built* @qvac/sdk JS. spike-js/ is gitignored
+          # generate-types.mjs needs the *built* @qvac/sdk JS. spike-js/ is gitignored
           # — bootstrap a package.json on the fly and pull only @qvac/sdk into it.
           mkdir -p spike-js
           cd spike-js
