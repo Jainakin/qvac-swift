@@ -37,7 +37,7 @@ public extension QVACClient {
         modelName: String? = nil
     ) async throws -> String {
         var req = LoadModelRequest(modelType: modelType)
-        req.modelSrc = .string(modelSrc)
+        req.modelSrc = modelSrc
         req.modelConfig = modelConfig
         req.modelName = modelName
         let response: QVACResponse = try await sendTyped(.loadModel(req))
@@ -66,10 +66,10 @@ public extension QVACClient {
         modelName: String? = nil
     ) async throws -> (progress: AsyncThrowingStream<ModelLoadProgress, Error>, modelId: Task<String, Error>) {
         var req = LoadModelRequest(modelType: modelType)
-        req.modelSrc = .string(modelSrc)
+        req.modelSrc = modelSrc
         req.modelConfig = modelConfig
         req.modelName = modelName
-        req.withProgress = .bool(true)
+        req.withProgress = true
         let payload = try JSONEncoder.qvac.encode(QVACRequest.loadModel(req))
         let cmd = nextCommand()
         let rawStream = try await sendStreamRaw(payload: payload, command: cmd)

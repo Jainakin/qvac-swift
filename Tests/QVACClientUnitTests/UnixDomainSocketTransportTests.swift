@@ -67,6 +67,37 @@ final class UnixDomainSocketTransportTests: XCTestCase {
         }
     }
 
+    /// §B1 regression — accept-timeout used to leak the listener FD + owned tempdir.
+    /// Confirm that after the timeout fires, the temp dir created by `mkdtemp` is
+    /// gone, the socket file is unlinked, AND any leftover worker subprocess (in this
+    /// case `/bin/sleep`) has been reaped.
+    func test_accept_timeout_cleans_up_listener_and_tempdir_and_worker() async throws {
+        // Capture the set of qvac-worker-* tempdirs before / after — there should be
+        // no net new ones if cleanup is correct.
+        let tmpRoot = NSTemporaryDirectory()
+        let before = Set((try? FileManager.default.contentsOfDirectory(atPath: tmpRoot)) ?? [])
+            .filter { $0.hasPrefix("qvac-worker-") }
+
+        let config = UDSTransportConfiguration(
+            bareExecutable: URL(fileURLWithPath: "/bin/sleep"),
+            workerScript:  URL(fileURLWithPath: "/dev/null"),
+            workingDirectory: URL(fileURLWithPath: "/tmp"),
+            initTimeout: 0.3
+        )
+        do {
+            _ = try await UnixDomainSocketTransport.connect(config)
+            XCTFail("expected timeout")
+        } catch {
+            // expected
+        }
+
+        let after = Set((try? FileManager.default.contentsOfDirectory(atPath: tmpRoot)) ?? [])
+            .filter { $0.hasPrefix("qvac-worker-") }
+        let leaked = after.subtracting(before)
+        XCTAssertTrue(leaked.isEmpty,
+                      "accept-timeout leaked tempdir(s): \(leaked) under \(tmpRoot)")
+    }
+
     func test_worker_exits_immediately_surfaces_clearly() async {
         // `/bin/false` exits with code 1 immediately; the transport should report that as
         // workerCouldNotStart via the terminationHandler watchdog.

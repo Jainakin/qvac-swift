@@ -34,7 +34,19 @@ git push origin v0.1.0
 
 ### Step 2 — rewrite Package.swift for consumers, move the tag
 
-After the release workflow finishes:
+**Wait for the GitHub Actions `release.yml` workflow to finish** before running this
+step — the prep script downloads the release's xcframework zips, so the assets must
+exist first. Check the run status:
+
+```bash
+gh run watch --workflow=release.yml
+# or visit: https://github.com/<owner>/qvac-swift/actions/workflows/release.yml
+```
+
+Confirm `gh release view v0.1.0 --json assets` lists all expected `.xcframework.zip`
+entries (the full kitchen-sink build uploads ~48 of them — see `release.yml`).
+
+Then:
 
 ```bash
 # Rewrites Package.swift in place using checksums computed from the just-uploaded

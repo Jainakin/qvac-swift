@@ -78,7 +78,7 @@ function innermostZodDef(node) {
 /// the JS SDK convention for callbacks (`onProgress`, `onError`, …) or signal/abort/
 /// logger handles. Combined with the type check below, this gives us a reliable filter.
 const CALLBACK_NAME_PATTERNS = [
-  /^on[A-Z]/,        // onProgress, onError, onChunk, …
+  /^on[A-Za-z]/,     // onProgress, onError, onChunk, ondata, onmessage — case-tolerant
   /^logger$/,
   /^signal$/,
   /^abortSignal$/,
@@ -270,6 +270,38 @@ const responseLeaves = collectLeaves(responseSchema, 'response')
 // which produces multiple leaves per discriminator value with merged shapes).
 // ------------------------------------------------------------------------------------
 
+/// Score a JSON-Schema property shape by how specifically it describes the wire
+/// representation. Used by mergeLeavesByDiscriminator to pick the best shape
+/// when discriminator variants disagree on a field's type.
+///
+/// Ranking (high → low):
+///   array > primitive type with items     {type: "array", items: {...}}
+///   3   > primitive type with constraints {type: "object", properties: {...}} | {type: "string", const: "x"}
+///   2   > bare primitive type             {type: "boolean"}
+///   1   > anyOf/oneOf union               {anyOf: [...]}
+///   0   > unrepresentable / opaque        {} | {not: {}} | undefined
+function shapeSpecificity(shape) {
+  if (!shape || typeof shape !== 'object') return 0
+  // {} and {not: ...} are the "absent / forbidden" cases — least specific.
+  if (Object.keys(shape).length === 0) return 0
+  if (shape.not !== undefined && shape.type === undefined && !shape.anyOf && !shape.oneOf) return 0
+  // anyOf/oneOf without a `type` discriminator is a union — less specific than
+  // a single concrete type since the Swift generator falls back to JSONValue.
+  if ((shape.anyOf || shape.oneOf) && shape.type === undefined) return 1
+  // Bare primitive type.
+  if (shape.type !== undefined) {
+    // Arrays with items, objects with properties, and constrained types score higher.
+    if (shape.type === 'array' && shape.items) return 3
+    if (shape.type === 'object' && shape.properties) return 3
+    if (shape.const !== undefined || shape.enum !== undefined) return 3
+    if (shape.additionalProperties) return 3
+    return 2
+  }
+  // additionalProperties without explicit type (map shape).
+  if (shape.additionalProperties) return 2
+  return 0
+}
+
 function mergeLeavesByDiscriminator(leaves) {
   const grouped = new Map()
   for (const leaf of leaves) {
@@ -290,7 +322,19 @@ function mergeLeavesByDiscriminator(leaves) {
     let requiredIntersect = null
     for (const g of group) {
       for (const [k, v] of Object.entries(g.node.properties ?? {})) {
-        properties[k] = v
+        // §B7 — merge field shapes intelligently across discriminator variants.
+        //
+        // Why: a discriminated union like LoadModel has 10 branches; 9 declare
+        // `seed: {type: "boolean"}` and 1 declares `seed: {not: {}}` (the
+        // `z.never()` variant forbids the field on that branch). Naive last-
+        // write-wins would pick `{not: {}}` for some variant orderings,
+        // erasing the type information and forcing the Swift generator to fall
+        // back to `JSONValue?`. We score each shape by specificity and keep
+        // the most specific seen.
+        const existing = properties[k]
+        if (!existing || shapeSpecificity(v) > shapeSpecificity(existing)) {
+          properties[k] = v
+        }
       }
       const r = new Set(g.node.required ?? [])
       if (requiredIntersect === null) {

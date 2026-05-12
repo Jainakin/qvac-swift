@@ -438,10 +438,31 @@ public actor BareRPCClient {
 
 // MARK: - Optional logger hook
 
+/// Plug-in for surfacing per-frame RPC diagnostics from the lowest layer of the
+/// client. The default `BareRPCClient` initializer leaves this `nil` so no logs
+/// are emitted; callers who need to debug worker handshake / multiplexing /
+/// stream lifecycle issues can pass an implementation that forwards to OSLog,
+/// stderr, or any sink they want.
+///
+/// Emitted log lines are intentionally raw — they describe frame events, not
+/// translated application errors. For application-level errors see `QVACError`.
+///
+/// Example:
+/// ```swift
+/// struct StderrRPCLog: BareRPCLogger {
+///     func log(_ level: BareRPCLogLevel, _ message: String) {
+///         FileHandle.standardError.write(Data("[\(level)] \(message)\n".utf8))
+///     }
+/// }
+/// // Then:
+/// // let rpc = BareRPCClient(transport: t, logger: StderrRPCLog())
+/// ```
 public protocol BareRPCLogger: Sendable {
     func log(_ level: BareRPCLogLevel, _ message: String)
 }
 
+/// Severity bands used by ``BareRPCLogger`` — totally ordered so consumers can
+/// drop a filter implementation in front of their sink.
 public enum BareRPCLogLevel: Int, Sendable, Comparable {
     case debug, info, warn, error
     public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }

@@ -323,16 +323,15 @@ public struct LoadModelRequest: Codable, Sendable, Equatable {
 
     public var modelName: String?
 
-    public var modelSrc: JSONValue?
+    public var modelSrc: String?
 
-    /// Whisper model type: "whisper" (alias) or "whispercpp-transcription" (canonical)
     public var modelType: String
 
-    public var seed: JSONValue?
+    public var seed: Bool?
 
-    public var withProgress: JSONValue?
+    public var withProgress: Bool?
 
-    public init(type: String = "loadModel", modelType: String, delegate: JSONValue? = nil, modelConfig: JSONValue? = nil, modelId: String? = nil, modelName: String? = nil, modelSrc: JSONValue? = nil, seed: JSONValue? = nil, withProgress: JSONValue? = nil) {
+    public init(type: String = "loadModel", modelType: String, delegate: JSONValue? = nil, modelConfig: JSONValue? = nil, modelId: String? = nil, modelName: String? = nil, modelSrc: String? = nil, seed: Bool? = nil, withProgress: Bool? = nil) {
         self.type = type
         self.modelType = modelType
         self.delegate = delegate
@@ -676,10 +675,10 @@ public struct TranslateRequest: Codable, Sendable, Equatable {
     /// Source language code. When omitted, the SDK attempts to auto-detect the source language.
     public var from: String?
 
-    /// The identifier of the LLM model used for translation.
+    /// The identifier of the NMT translation model to use.
     public var modelId: String
 
-    /// LLM model-type variant identifier.
+    /// NMT model-type variant identifier.
     public var modelType: String
 
     /// Whether to stream tokens (`true`) or resolve the complete translation once (`false`).

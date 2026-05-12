@@ -172,7 +172,24 @@ public final class UnixDomainSocketTransport: BareTransport, @unchecked Sendable
         }
         transport.workerProc = proc
 
-        let clientFD = try await acceptWithTimeout(listenFD: listenFD, timeout: config.initTimeout, process: proc)
+        // Wrap accept in a do/catch so that if the worker never connects within the
+        // timeout (or accept() itself fails), we still tear down the worker subprocess
+        // and clean up the listener FD + temp dir. Without this, those resources leak
+        // on init failure.
+        let clientFD: Int32
+        do {
+            clientFD = try await acceptWithTimeout(
+                listenFD: listenFD, timeout: config.initTimeout, process: proc
+            )
+        } catch {
+            if proc.isRunning {
+                proc.terminate()
+                proc.waitUntilExit()
+            }
+            transport.cleanupListener()
+            throw error
+        }
+
         // Publish the connected fd under the stateLock so the reader thread (started
         // immediately below) is guaranteed to see it. NSLock acquisition is a memory
         // barrier; without it the reader could otherwise observe the init-time
@@ -195,9 +212,16 @@ public final class UnixDomainSocketTransport: BareTransport, @unchecked Sendable
 
     // MARK: - BareTransport
 
+    /// Single-use — the transport hands out the inbound byte stream exactly once
+    /// (claimed by `BareRPCClient` in its init). Calling this twice would silently
+    /// abandon the first stream's continuation and route subsequent reads to the new
+    /// one. We assert rather than try to support multiplexing, which the bare-rpc
+    /// layer is responsible for instead.
     public func inboundStream() -> AsyncThrowingStream<Data, Error> {
         AsyncThrowingStream<Data, Error> { continuation in
             stateLock.lock(); defer { stateLock.unlock() }
+            precondition(self.readContinuation == nil,
+                         "UnixDomainSocketTransport.inboundStream() may be called only once per transport instance")
             self.readContinuation = continuation
             continuation.onTermination = { [weak self] _ in
                 // Hop into a Task with its own weak capture so the Sendable check on the
@@ -390,6 +414,15 @@ public final class UnixDomainSocketTransport: BareTransport, @unchecked Sendable
         unlink(path)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw SpawnError.socketBindFailed(errno: errno, path: path) }
+        // Set FD_CLOEXEC so the listener fd is NOT inherited by the spawned `bare`
+        // subprocess. Without this, the child process holds a reference to our
+        // listening socket, which (a) keeps the socket from being fully closed when
+        // we close our copy, and (b) is unnecessary file-descriptor exposure to the
+        // worker (it has no business with our listening fd).
+        let flags = fcntl(fd, F_GETFD)
+        if flags >= 0 {
+            _ = fcntl(fd, F_SETFD, flags | FD_CLOEXEC)
+        }
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = Array(path.utf8)

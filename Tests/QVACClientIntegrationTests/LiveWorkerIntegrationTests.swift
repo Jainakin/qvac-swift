@@ -62,9 +62,13 @@ final class LiveWorkerIntegrationTests: XCTestCase {
     override func setUpWithError() throws {
         try XCTSkipUnless(Self.bareBin != nil, "bare runtime not available; install via `npm i -g bare-runtime` or set QVAC_BARE_BIN")
         try XCTSkipUnless(Self.workerScript != nil, "QVAC worker.js not found; set QVAC_WORKER_SCRIPT to <node_modules>/@qvac/sdk/dist/server/worker.js")
-        // Pre-test: ensure no stale worker is holding the global lock.
-        let lockFile = NSHomeDirectory() + "/.qvac/.worker.lock"
-        try? FileManager.default.removeItem(atPath: lockFile)
+        // Pre-test cleanup of `~/.qvac/.worker.lock` — the @qvac/sdk worker writes
+        // this lock file on the JS side to mark itself as the active instance and
+        // detect stale predecessors. A crashed worker from a previous test run can
+        // leave the file behind, which makes the next worker refuse to start. Best-
+        // effort cleanup is safe: a running worker would re-create the lock on
+        // launch, and an absent file is the worker's expected fresh-start state.
+        try? FileManager.default.removeItem(atPath: NSHomeDirectory() + "/.qvac/.worker.lock")
     }
 
     private func newTransport() async throws -> UnixDomainSocketTransport {

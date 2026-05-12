@@ -33,7 +33,8 @@ targets: [
 ```
 
 iOS 17+, macOS 14+, both arm64. The package vendors a pre-built
-`worker.mobile.bundle.js` as an SPM resource — no extra setup on iOS.
+`worker.mobile.bundle.js` as an SPM resource — no extra setup on iOS. The bundle
+is ~10 MB compressed; App Store thinning trims it further per device.
 
 ## Quickstart
 
@@ -66,10 +67,14 @@ macOS spawns the worker as a subprocess. You need (one-time):
 brew install holepunchto/tap/bare-runtime
 bare --version          # sanity check
 
-# 2. @qvac/sdk installed somewhere — anywhere works as long as the path is stable
+# 2. @qvac/sdk installed somewhere — anywhere works as long as the path is stable.
+#    `--legacy-peer-deps` is required because @qvac/sdk's peerDeps overlap with
+#    its own deps (npm 7+ would otherwise reject the install).
 mkdir my-app && cd my-app
 npm init -y
 npm install --legacy-peer-deps @qvac/sdk
+# `node_modules/@qvac/sdk/dist/server/worker.js` is now the path the Swift client
+# resolves to. Capture `$(pwd)/node_modules` and pass that to nodeModulesDir.
 ```
 
 ```swift
@@ -85,6 +90,10 @@ Tips:
 - If `bare` isn't on `/opt/homebrew/bin` or `/usr/local/bin`, pass `bareExecutable:` to
   `Configuration.macOS(...)` explicitly. The package also scans nvm versioned dirs and
   falls back to `which bare`.
+- The `Examples/QVACChat` macOS target uses a `resolveNodeModulesDir()` helper that
+  checks (1) the `QVAC_NODE_MODULES` env var, (2) `./spike-js/node_modules` (monorepo
+  layout), then (3) `./node_modules` relative to cwd. Steal the pattern if your app
+  doesn't want to hard-code the path either — see [Examples/QVACChat/Sources/ContentView.swift](Examples/QVACChat/Sources/ContentView.swift).
 
 ## Architecture
 

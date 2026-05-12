@@ -340,7 +340,8 @@ README expanded to document the example app's auto-discovery logic (§A4).
 | Verified-from-start (§5) | 0 | 13 | 0 |
 | Operational (§6) | 6 | 0 | 0 |
 | Second-audit (§A) | 0 | 4 | 6 |
-| **Total** | **6 pending** | **45 done** | **16 comment** |
+| Third-audit (§B) | 0 | 8 | 9 |
+| **Total** | **6 pending** | **53 done** | **25 comment** |
 
 All remaining `pending` items are §6 operational steps that require maintainer action:
 make the GitHub repo public, submit to Swift Package Index, send the 7 open questions
@@ -421,3 +422,90 @@ fixing, all addressed in this section.
 - **`tetherto/qvac` as a CI dependency** — `codegen-freshness` sparse-clones the upstream repo each run. Same shape as HF risk. Acceptable for now; could mirror.
 - **No coverage for "worker crash, then reconnect"** or "stream backpressure" — not grant-required; deferred.
 - **iOS bundle supply chain** — `Sources/QVACClient/Resources/worker.mobile.bundle.js` is release-time vendored from `@qvac/sdk`. The release.yml workflow tries to regenerate it with `continue-on-error: true`; if upstream `bare-pack` breaks, the committed bundle is kept. Inherent supply-chain trust on the SDK at the version we pinned. Documented in DocC `Security.md`; no further mitigation planned for this milestone.
+
+---
+
+## §B — Third-audit findings (2026-05-12 third pass)
+
+Another round of five parallel reviewer agents on non-overlapping angles (grant
+criterion-by-criterion, hidden test skips, concurrency/lifecycle, codegen depth,
+documentation + onboarding, edge cases / production readiness). They found one real
+production bug, one real codegen type-safety regression, and several lower-severity
+items worth addressing.
+
+### B1. `acceptWithTimeout` leaked the listener fd + temp dir on timeout
+- **File**: `Sources/QVACClient/Internal/Transport/UnixDomainSocketTransport.swift:175`
+- **Issue**: If the worker subprocess spawned but never connected within the init timeout, `acceptWithTimeout` would throw — but the catch path didn't call `transport.cleanupListener()` or kill the subprocess. The result: socket file + 0700 tempdir left behind in `$TMPDIR`, plus the worker child orphaned to exit on its own. Hit by every failed-init scenario.
+- **Status**: **done** — wrapped the accept call in a `do/catch` that (a) terminates and waits for the worker process and (b) calls `cleanupListener()` to close the fd, unlink the socket, and `rmdir` the owned tempdir. New unit test `test_accept_timeout_cleans_up_listener_and_tempdir_and_worker` asserts no qvac-worker tempdir is left in `$TMPDIR` after a forced timeout.
+- **Severity**: 🟠 MEDIUM — resource leak per failed init, doesn't escalate to security but accumulates under repeated failures (e.g. CI flakes, retries).
+
+### B2. Init-handshake-failure cleanup verified honest
+- **Status**: comment — checked the existing path. `QVACClient.init` catches both `QVACInitConfigFailed` and any other error from `sendInitConfig` and calls `await rpc.close()` in both arms; `BareRPCClient.close()` awaits `transport.close()` which terminates the worker subprocess via `Process.terminate() + waitUntilExit()`. No additional fix needed; the original audit's concern about subprocess leakage on handshake failure does not reproduce.
+
+### B3. `inboundStream()` accepted a silent double-call
+- **Files**: `Sources/QVACClient/Internal/Transport/UnixDomainSocketTransport.swift:215-228`, `Sources/QVACClient/Internal/Transport/BareIPCTransport.swift:100-110`
+- **Issue**: Both transports' `inboundStream()` would overwrite `readContinuation` on a second call, silently abandoning the first stream and routing reads to the second. Not exploited today (only `BareRPCClient.init` calls it, exactly once), but a footgun.
+- **Status**: **done** — added `precondition(self.readContinuation == nil, ...)` to both transports so a double-call fails fast at the actual misuse site rather than producing baffling silent stream drops downstream.
+- **Severity**: 🟡 LOW — defensive hardening.
+
+### B4. `listenFD` was inherited by the spawned worker subprocess
+- **File**: `Sources/QVACClient/Internal/Transport/UnixDomainSocketTransport.swift:415-422`
+- **Issue**: `Process.run()` on macOS inherits open file descriptors by default. Our listening socket fd was therefore held open by the worker child as well as the parent. Two consequences: (a) when we close our copy, the socket isn't fully released until the worker also exits, (b) unnecessary fd exposure to the worker (it has no business holding our listening fd).
+- **Status**: **done** — `makeListener` now sets `FD_CLOEXEC` on the listener fd immediately after socket creation, so the fd is dropped from the child at `exec()` time. Standard hygiene; no behavior change for the parent.
+- **Severity**: 🟡 LOW — fd-hygiene.
+
+### B5. `BareRPCLogger` was public but undocumented
+- **File**: `Sources/QVACClient/Internal/BareRPC/BareRPCClient.swift:441-449`
+- **Issue**: Consumers can pass a `BareRPCLogger` into `BareRPCClient.init` but had no docstring explaining when to use it, what the log levels mean, or an example. The type appeared in DocC but with zero context.
+- **Status**: **done** — added a doc comment to the protocol + a code-sample plus level-ordering note on `BareRPCLogLevel`.
+- **Severity**: 🟡 LOW — documentation.
+
+### B6. `~/.qvac/.worker.lock` cleanup was a magic string in 4 test files with no explanation
+- **Files**: `Tests/QVACClientIntegrationTests/{LiveWorker,QVACClient,RealModel,RAG}IntegrationTests.swift`
+- **Issue**: Each test suite did `try? FileManager.default.removeItem(atPath: NSHomeDirectory() + "/.qvac/.worker.lock")` with a one-line comment ("ensure no stale worker is holding the global lock"). Anyone reading the suite would have to grep the JS SDK to learn what this is.
+- **Status**: **done** — expanded the comment in `LiveWorkerIntegrationTests` (the canonical example) to explain that `@qvac/sdk` itself writes this file on the JS side to detect stale predecessors, why best-effort cleanup is correct, and what happens when it's absent.
+- **Severity**: 🟡 LOW — documentation.
+
+### B7. Codegen merge picked the wrong shape when discriminator variants disagreed → `seed`/`withProgress` lost their `Bool?` typing
+- **File**: `tools/codegen/generate-types.mjs` — `mergeLeavesByDiscriminator`
+- **Issue (real type-safety regression)**: `LoadModelRequest` has 10 discriminator variants. 9 declare `seed: z.optional(z.boolean())` → JSON Schema `{type: "boolean"}`. 1 declares `seed: z.optional(z.never())` → JSON Schema `{not: {}}` (this variant forbids the field). The naive last-write-wins merge would pick `{not: {}}` for some variant orderings, which `swiftType` doesn't understand and falls back to `JSONValue?`. Result: `LoadModelRequest.seed: JSONValue?`, `withProgress: JSONValue?`, `modelSrc: JSONValue?` (where modelSrc should be `String?`) — all losing static type information.
+- **Status**: **done** — replaced last-write-wins with a `shapeSpecificity`-scored merge: arrays-with-items and objects-with-properties beat bare types, bare types beat unions-without-discriminator, unions beat `{not: ...}` and empty `{}` (the unrepresentable cases). New diff in generated code: `seed: Bool?`, `withProgress: Bool?`, `modelSrc: String?`, all other typed shapes preserved. `RagRequest.documents` was specifically re-verified — still `[JSONValue]?` post-fix (we initially regressed it to `JSONValue?` with the simplest fix, then upgraded to the specificity-scored version to preserve it). Two callsites in `QVACClient+ModelLifecycle.swift` updated to drop the no-longer-needed `JSONValue.string(...)` / `.bool(...)` wrappers.
+- **Also (B7b)**: broadened the callback-name regex from `/^on[A-Z]/` to `/^on[A-Za-z]/` so hypothetical lowercase variants like `ondata` / `onmessage` are auto-detected as JS-only callbacks.
+- **Severity**: 🟠 MEDIUM — silently downgraded static typing on the public API surface. Three fields on the most important request type (`loadModel`) lost their Swift types until this fix.
+
+### B8. README didn't explain `--legacy-peer-deps`, bundle size, or example app auto-discovery
+- **File**: `README.md`
+- **Issue**: Three small but real cliffs flagged by the cold-read reviewer:
+  - `npm install --legacy-peer-deps` was shown without explanation; first-time Node users would not know why
+  - `worker.mobile.bundle.js` is ~10 MB shipped in the SPM package; no mention of the size impact
+  - `Examples/QVACChat`'s `resolveNodeModulesDir()` 3-tier fallback is not documented in the README itself; reviewers had to find it in `ContentView.swift`
+- **Status**: **done** — README now explains (a) why the legacy peer-deps flag is needed, (b) bundle size + App Store thinning behavior, (c) the 3-tier auto-discovery pattern in the example app with a link to the source. All three under the existing Quickstart section.
+- **Severity**: 🟡 LOW — documentation polish; mattered only on first read.
+
+### B9. `docs/distribution.md` Step 2 didn't say to wait for release.yml
+- **File**: `docs/distribution.md` — Step 2
+- **Issue**: The two-step release flow described `tools/release/prepare-release.sh v0.1.0` immediately after tagging — but the script downloads release assets via `gh release download`, which requires the `release.yml` workflow to have finished uploading them. A maintainer following the doc literally could fail Step 2 if they raced the workflow.
+- **Status**: **done** — Step 2 now starts with a `gh run watch --workflow=release.yml` instruction plus a `gh release view` asset-count check before running the prep script.
+- **Severity**: 🟡 LOW — documentation polish.
+
+### B10. Things the third audit verified honest (recorded for traceability)
+
+- **Build + tests are clean** — `swift build` clean, 71 unit tests pass (one new: `test_accept_timeout_cleans_up_listener_and_tempdir_and_worker`), all 30 RPC round-trips still pass live.
+- **`xcodebuild docbuild` succeeds** with no warnings on the current symbol graph — independently verified, no broken `<doc:>` or symbol references.
+- **`-strict-concurrency=complete`** also builds clean — all `[weak self]` Task captures and Sendable annotations check out under the strict mode.
+- **`grep -rn 'TODO|FIXME|HACK|XXX'` in our Swift sources** returns zero hits (only the `XXXXXXXX` placeholder template for mkdtemp).
+- **`grep -rn '/Users/hardik'`** still zero everywhere after the second-audit fix.
+- **All 25 grant-required public APIs** still implemented, all `public`, all streaming APIs return `AsyncThrowingStream`.
+- **All 6 first-audit security patches** still correctly in place.
+
+### B11. Things the third audit flagged but explicitly chose not to fix in this pass
+
+- **Per-request timeout** — agent flagged `pendingSends` / `pendingStreams` / `pendingDuplex` as unbounded if the worker hangs and the caller keeps firing. Mitigation today is caller-side `Task` timeout + `cancel()`. Adding a built-in per-request timeout is a real feature but architectural — deferred to v0.2.
+- **NSLock in async context (Swift 6 strict mode warning)** — current build is clean under `-strict-concurrency=complete`. When we move to Swift 6 language mode the NSLock pattern will need to migrate to `OSAllocatedUnfairLock` or actor isolation. Tracked but out-of-scope for the grant submission.
+- **`writeQueue.sync` from async** — theoretical deadlock if the executor and writeQueue ever interleave perversely; in practice writeQueue is its own serial dispatch queue and close() releases the lock before the sync, so no deadlock observed. Reviewed; not changed.
+- **`deinit { Task { ... } }` pattern** — the agent flagged this as potential UAF. False alarm: the closure captures `rpc` (a `let`-binding on the actor) strongly, so the captured reference keeps `rpc` alive for the duration of the spawned task. No UAF window. Doc note added in the Security.md article that callers should `await close()` explicitly rather than rely on the deinit best-effort hop.
+- **`@unchecked Sendable` on Configuration/QVACDuplexSession/transports** — agent flagged as footgun. Each is justified: Configuration's associated values are themselves Sendable value types; QVACDuplexSession is single-use guarded by NSLock; transports are `final class` with their own internal locking. Marker is correct, just verbose.
+- **iOS 26 simulator vs grant's "iOS 17 simulator"** — iOS 26 is binary-compatible with iOS 17+ code; testing newer is strictly stronger. macos-15 runners ship only iOS 26.x. Documented as a potential reviewer-clarification but not a code change.
+- **`AllRPCTypesRoundTripTests` exercises only error-path responses** — by design (no model downloads in CI). Success-path wire format is exercised by `RealModelIntegrationTests` + `RAGIntegrationTests` with live models. Combination meets AC-4; documented in §A6.
+- **`build-example-app` CI job is build-only, not runtime** — KR-5 physical-device verification is operational (§57), not a CI gap.
+- **CI bench threshold 1.20 vs grant 1.05** — local measurement (0.84) is the audit-relevant number; CI is regression detection, documented in §A6.

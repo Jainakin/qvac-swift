@@ -97,9 +97,13 @@ public final class BareIPCTransport: BareTransport, @unchecked Sendable {
         }
     }
 
+    /// Single-use — see UnixDomainSocketTransport.inboundStream() for the same
+    /// invariant. Calling twice would silently abandon the first continuation.
     public func inboundStream() -> AsyncThrowingStream<Data, Swift.Error> {
         AsyncThrowingStream<Data, Swift.Error> { continuation in
             lock.lock()
+            precondition(readContinuation == nil,
+                         "BareIPCTransport.inboundStream() may be called only once per transport instance")
             readContinuation = continuation
             lock.unlock()
             continuation.onTermination = { [weak self] _ in
