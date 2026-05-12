@@ -46,8 +46,12 @@ jobs:
       - name: Install JS deps (cached)
         run: |
           (cd tools/codegen && npm install --no-fund --no-audit)
-          # The type generator needs the *built* @qvac/sdk JS; install it under spike-js.
-          (cd spike-js && npm install --legacy-peer-deps --no-fund --no-audit)
+          # The type generator needs the *built* @qvac/sdk JS. spike-js/ is gitignored
+          # — bootstrap a package.json on the fly and pull only @qvac/sdk into it.
+          mkdir -p spike-js
+          cd spike-js
+          if [ ! -f package.json ]; then npm init -y >/dev/null; fi
+          npm install --legacy-peer-deps --no-fund --no-audit @qvac/sdk
       - name: Re-run codegen
         run: tools/codegen/run.sh
       - name: Verify no drift
@@ -188,12 +192,17 @@ jobs:
   # ----------------------------------------------------------------------------
   test-ios-sim:
     name: Test · iOS Simulator
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Show iOS simulator runtimes available
         run: xcrun simctl list runtimes
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Generate BareKitProbeApp xcodeproj
+        # The .xcodeproj is gitignored — regenerate it from spike-swift/Examples/BareKitProbeApp/project.yml.
+        run: cd spike-swift/Examples/BareKitProbeApp && xcodegen generate
       - name: Build QVACClient for iOS Simulator (generic)
         run: |
           xcodebuild \
@@ -215,7 +224,9 @@ jobs:
   # ----------------------------------------------------------------------------
   build-example-app:
     name: Build · Examples/QVACChat
-    runs-on: macos-14
+    # Needs Xcode 16 — xcodegen 2.45 emits project format 77 which the default Xcode
+    # on macos-14 (Xcode 15) refuses to open. macos-15 ships with Xcode 16 by default.
+    runs-on: macos-15
     needs: [unit-macos]
     steps:
       - uses: actions/checkout@v4

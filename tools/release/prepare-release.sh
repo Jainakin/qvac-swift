@@ -49,24 +49,29 @@ trap 'rm -rf "$WORKDIR"' EXIT
 
 echo "[prepare-release] repo=$REPO  tag=$RELEASE_TAG  workdir=$WORKDIR"
 
-# 1. Fetch the artifact list from the release.
-mapfile -t ARTIFACTS < <(gh release view "$RELEASE_TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep '\.xcframework\.zip$')
+# 1. Fetch the artifact list from the release. `mapfile` is bash 4+; macOS ships
+# bash 3.2, so we use a portable read loop instead.
+ARTIFACTS=()
+while IFS= read -r line; do
+    ARTIFACTS+=("$line")
+done < <(gh release view "$RELEASE_TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep '\.xcframework\.zip$')
 if [ "${#ARTIFACTS[@]}" -eq 0 ]; then
     echo "[prepare-release] error: no .xcframework.zip artifacts found at release $RELEASE_TAG" >&2
     exit 3
 fi
 echo "[prepare-release] found ${#ARTIFACTS[@]} xcframework artifacts at release"
 
-# 2. Download each + compute SHA-256.
-declare -a TARGETS
-declare -A CHECKSUMS
+# 2. Download each + compute SHA-256. Use parallel arrays (TARGETS[i] / CHECKSUMS[i])
+# rather than an associative array — bash 3.2 (macOS default) doesn't support `declare -A`.
+TARGETS=()
+CHECKSUMS=()
 for asset in "${ARTIFACTS[@]}"; do
     name="${asset%.xcframework.zip}"
     echo "[prepare-release]   downloading $asset..."
     gh release download "$RELEASE_TAG" --repo "$REPO" --pattern "$asset" --dir "$WORKDIR"
     sha=$(shasum -a 256 "$WORKDIR/$asset" | awk '{print $1}')
-    CHECKSUMS["$name"]="$sha"
     TARGETS+=("$name")
+    CHECKSUMS+=("$sha")
     echo "[prepare-release]   $name -> $sha"
 done
 
@@ -96,12 +101,14 @@ let package = Package(
     ],
     targets: [
 EOF
-    for name in "${TARGETS[@]}"; do
+    for i in "${!TARGETS[@]}"; do
+        name="${TARGETS[$i]}"
+        sha="${CHECKSUMS[$i]}"
         cat <<EOF
         .binaryTarget(
             name: "${name}",
             url: "${URL_BASE}/${name}.xcframework.zip",
-            checksum: "${CHECKSUMS[$name]}"
+            checksum: "${sha}"
         ),
 EOF
     done
