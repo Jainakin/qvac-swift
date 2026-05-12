@@ -217,11 +217,24 @@ jobs:
             -derivedDataPath /tmp/qvac-dd \
             build
       - name: Run hosted XCTest in iOS Simulator
+        # macos-15 ships iPhone 17 family + iPhone Air + iPhone SE. Pick the first
+        # iOS 26.x device available on the runner — the test only cares about ARM
+        # Simulator + a modern iOS, not the specific device model.
         run: |
+          DEVICE=$(xcrun simctl list devices available --json | python3 -c "
+          import json,sys
+          d = json.load(sys.stdin)
+          for runtime, devs in d['devices'].items():
+              if 'iOS' not in runtime: continue
+              for dev in devs:
+                  if 'iPhone' in dev['name'] and dev['isAvailable']:
+                      print(dev['name']); sys.exit(0)
+          ")
+          echo "Selected device: $DEVICE"
           xcodebuild test \
             -project spike-swift/Examples/BareKitProbeApp/BareKitProbeApp.xcodeproj \
             -scheme BareKitProbeApp \
-            -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' \
+            -destination "platform=iOS Simulator,name=$DEVICE,OS=latest" \
             -derivedDataPath /tmp/probe-dd
 
   # ----------------------------------------------------------------------------
@@ -285,9 +298,14 @@ jobs:
             bare-http1 bare-https bare-link bare-runtime bare-subprocess bare-zlib \
             compact-encoding events fast-safe-stringify which-runtime \
             @modelcontextprotocol/sdk
+      - name: Configure env
+        run: |
+          echo "QVAC_BARE_BIN=$(which bare)" >> $GITHUB_ENV
+          echo "QVAC_NODE_MODULES=$(pwd)/spike-js/node_modules" >> $GITHUB_ENV
       - name: Run benchmark (200 iters, 5% overhead budget)
         env:
-          QVAC_NODE_MODULES: ${{ github.workspace }}/spike-js/node_modules
+          QVAC_BARE_BIN: ${{ env.QVAC_BARE_BIN }}
+          QVAC_NODE_MODULES: ${{ env.QVAC_NODE_MODULES }}
         run: bench/run.sh 200
       - name: Upload bench result
         if: always()
