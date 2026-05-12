@@ -116,8 +116,11 @@ jobs:
           fail_on_unmatched_files: true
       - name: Notify Swift Package Index
         # SPI auto-detects new tags within a few minutes; this is a courtesy ping.
+        # `${GITHUB_REPOSITORY,,}` is bash 4+ lowercase substitution and breaks on
+        # macos runners (bash 3.2). Use tr instead.
         run: |
-          curl -sf "https://swiftpackageindex.com/api/packages/${GITHUB_REPOSITORY,,}/refresh" || true
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          curl -sf "https://swiftpackageindex.com/api/packages/${REPO_LOWER}/refresh" || true
 
       - name: Verify Package.swift is consumer-mode for a tagged release
         # Tagged releases must use binaryTarget(url:checksum:) so external SPM
