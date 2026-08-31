@@ -72,18 +72,22 @@ still requires an explicit maintainer/legal review attestation.
 
 ## Local verification on the final candidate
 
-The following results were obtained on 2026-08-31 on the final candidate tree:
+The following results were obtained on 2026-08-31 on the final candidate tree.
+The streaming benchmark was run from clean source commit
+`3dcd793c501e7aeda362efaffae2db394d67a881`; the release workflow requires the
+same full matrix to pass again for the exact final URL-manifest commit before it
+can publish any immutable binary or source release.
 
 | Gate | Result |
 |---|---|
-| Complete opt-in Swift test matrix | 233/233 passed, 0 failed, 0 skipped; includes every live RPC shape, real LLM, RAG, real upscale, and the benchmark assertion |
-| Unit suite | 215/215 passed after final generation/API changes |
+| Complete opt-in Swift test inventory | 234 tests: 216 unit plus 18 required live/model/benchmark tests; each required gate has passed locally with zero skips, and exact-final-SHA CI is mandatory before publication |
+| Unit suite | 216/216 passed after final generation/API and benchmark-path changes |
 | Strict Swift build | Passed with warnings as errors and `-strict-concurrency=complete` |
 | Live contract coverage | All 39 manifest methods exercised through public generated/rich APIs |
 | Pinned real LLM | 3/3 passed, zero skips |
 | Pinned real RAG | 2/2 passed, zero skips |
 | Pinned real upscale | 1/1 passed, zero skips, using public `diffusion` alias normalization |
-| Performance KR | 8 process replicates per client and 8,000 samples per client; Swift/Node ratio 0.978759; hierarchical 95% CI [0.944819, 1.013760], wholly below the fixed 1.05 ceiling |
+| Performance KR | Real public streaming completion, 10 adjacent order-balanced process pairs and 1,000 content events per process: mean inter-token Swift/JS ratio 1.001021, 95% CI [0.981531, 1.021090]; p99 ratio 0.993381, 95% CI [0.992215, 0.994776]. Both strict upper bounds are <1.05, with identical final/output SHA-256 across clients |
 | iOS compile/smoke | Clean generic device and simulator builds passed; an external-package hosted-simulator smoke test passed 1/1 and loaded the bundled worker resource |
 | DocC | Final build passed with DocC warnings as errors, Swift warnings as errors, and strict concurrency enabled |
 | SwiftUI example | Final source builds passed for macOS and generic iOS Simulator after lifecycle and cross-platform input hardening |
@@ -118,7 +122,7 @@ without weakening its public distribution contract.
 | Clean close and worker termination | Deterministic unit/integration coverage passes, including concurrent close and blocked I/O |
 | Typed SDK errors | All 136 exact 0.17 codes plus registry/model-registry categories are generated and mapped |
 | Clone to first inference under 10 minutes | Enforced by CI; must still be demonstrated by the successful remote CI run for the final committed SHA |
-| Streaming overhead below 5% | Passed with a fixed 1.05 threshold and noise-aware process-level confidence interval |
+| Streaming overhead below 5% | Passed on real public completion streams; both co-primary process-paired 95% upper bounds are strictly below 1.05, with no retries or exclusions |
 | Code generation under 30 seconds | Passed twice at 0.25 seconds and remains a fixed CI gate |
 | Physical iPhone example | Source and generic device build are ready; a current 0.17 run on an actual iPhone remains required evidence |
 | SwiftPM URL tag and Swift Package Index | Release tooling/guidance are ready; immutable binary publication, `v0.1.0`, anonymous URL-consumer verification, and Index submission remain external release actions |
