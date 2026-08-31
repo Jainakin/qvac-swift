@@ -104,6 +104,31 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
         }
     }
 
+    /// A missing model can make the worker fail a duplex response immediately after
+    /// opening both half-streams. In that ordering the remote error has already closed
+    /// the request half by the time `end()` runs, so `end()` reports a local closed-stream
+    /// error even though the authoritative application error remains available from the
+    /// response half. Always drain that response before deciding which failure to report.
+    private func finishDuplexProbe(
+        end: () async throws -> Void,
+        drainResponses: () async throws -> Void
+    ) async throws {
+        let endError: Error?
+        do {
+            try await end()
+            endError = nil
+        } catch {
+            endError = error
+        }
+
+        do {
+            try await drainResponses()
+        } catch {
+            throw error
+        }
+        if let endError { throw endError }
+    }
+
     /// Build a fresh client, run the closure, close.
     private func withClient(_ body: (QVACClient) async throws -> Void) async throws {
         let cfg = try QVACClient.Configuration.macOS(
@@ -406,8 +431,10 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
                     modelId: missingModel,
                     rpcOptions: rpc
                 )
-                try await session.end()
-                for try await _ in session.events {}
+                try await self.finishDuplexProbe(
+                    end: { try await session.end() },
+                    drainResponses: { for try await _ in session.events {} }
+                )
             }
 
             exercised.append("completionOrchestrate")
@@ -418,8 +445,10 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
                     tools: [],
                     rpcOptions: rpc
                 )
-                try await session.end()
-                for try await _ in session.events {}
+                try await self.finishDuplexProbe(
+                    end: { try await session.end() },
+                    drainResponses: { for try await _ in session.events {} }
+                )
             }
 
             exercised.append("textToSpeechStream")
@@ -428,8 +457,10 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
                     modelId: missingModel,
                     rpcOptions: rpc
                 )
-                try await session.end()
-                for try await _ in session.chunks {}
+                try await self.finishDuplexProbe(
+                    end: { try await session.end() },
+                    drainResponses: { for try await _ in session.chunks {} }
+                )
             }
 
             exercised.append("transcribeStream")
@@ -438,8 +469,10 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
                     modelId: missingModel,
                     rpcOptions: rpc
                 )
-                try await session.end()
-                for try await _ in session.events {}
+                try await self.finishDuplexProbe(
+                    end: { try await session.end() },
+                    drainResponses: { for try await _ in session.events {} }
+                )
             }
 
             exercised.append("provide")

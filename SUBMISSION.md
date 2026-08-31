@@ -83,8 +83,8 @@ can publish any immutable binary or source release.
 
 | Gate | Result |
 |---|---|
-| Complete opt-in Swift test inventory | 234 tests: 216 unit plus 18 required live/model/benchmark tests; each required gate has passed locally with zero skips, and exact-final-SHA CI is mandatory before publication |
-| Unit suite | 216/216 passed after final generation/API and benchmark-path changes |
+| Complete opt-in Swift test inventory | 235 tests: 217 unit plus 18 required live/model/benchmark tests; each required gate has passed locally with zero skips, and exact-final-SHA CI is mandatory before publication |
+| Unit suite | 217/217 passed after final generation/API, benchmark-path, and deterministic duplex-ordering changes |
 | Strict Swift build | Passed with warnings as errors and `-strict-concurrency=complete` |
 | Live contract coverage | All 39 manifest methods exercised through public generated/rich APIs |
 | Pinned real LLM | 3/3 passed, zero skips |
@@ -179,11 +179,11 @@ without weakening its public distribution contract.
 These are not source-code defects and cannot be completed honestly without
 publishing external state:
 
-1. Commit and push the generated URL `Package.swift` while continuing to exclude
-   the user-owned diagnostic file
+1. Keep the generated URL `Package.swift` committed while pushing the final
+   test-only source fix, continuing to exclude the user-owned diagnostic file
    `Package.swift.release-broken-from-private-repo`.
-2. Obtain a new green full `CI` workflow for the exact URL-manifest commit SHA.
-   The earlier candidate run cannot authorize this different commit.
+2. Obtain a new green full `CI` workflow for that exact final source SHA. The
+   earlier candidate and URL-manifest runs cannot authorize a different commit.
 3. Have the maintainer/legal reviewer inspect `THIRD_PARTY_NOTICES.md`, including
    the three pinned supplemental texts, and explicitly approve the
    `license_reviewed=true` attestation.

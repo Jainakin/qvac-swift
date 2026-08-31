@@ -955,6 +955,48 @@ final class BareRPCClientTests: XCTestCase {
         await rpc.close()
     }
 
+    func test_duplex_remote_error_before_half_close_remains_observable_from_response_stream() async throws {
+        let mock = MockTransport()
+        let rpc = BareRPCClient(transport: mock)
+        let session = try await rpc.duplex(command: 17, initialPayload: Data("metadata".utf8))
+        let initialFrames = try await Self.waitForFrames(3, on: mock)
+        guard case .request(let id, _, _, _) = initialFrames[0] else {
+            return XCTFail("expected request frame")
+        }
+
+        let serverError = BareRPCError(
+            message: "model is not loaded",
+            code: "MODEL_NOT_FOUND",
+            errno: 40002
+        )
+        await mock.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.response, .error],
+            payload: .error(serverError)
+        ))
+        try await Self.waitForNoInFlight(rpc)
+
+        do {
+            try await session.end()
+            XCTFail("expected the already-closed request half to reject end")
+        } catch is BareRPCStreamClosed {
+            // The response half still owns the authoritative remote failure.
+        } catch {
+            XCTFail("unexpected half-close error: \(error)")
+        }
+
+        do {
+            for try await _ in session.chunks {}
+            XCTFail("expected the retained remote response error")
+        } catch let error as BareRPCError {
+            XCTAssertEqual(error, serverError)
+        } catch {
+            XCTFail("unexpected response error: \(error)")
+        }
+
+        await rpc.close()
+    }
+
     func test_duplex_open_timeout_sends_both_half_stream_teardowns_once() async throws {
         let mock = MockTransport()
         let rpc = BareRPCClient(transport: mock)
