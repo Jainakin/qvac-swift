@@ -24,7 +24,7 @@ final class QVACClientIntegrationTests: XCTestCase {
 
     private static let bareBin: URL? = {
         if let p = ProcessInfo.processInfo.environment["QVAC_BARE_BIN"] { return URL(fileURLWithPath: p) }
-        return nodeModulesDir?.appendingPathComponent(".bin/bare")
+        return nodeModulesDir?.appendingPathComponent("bare-runtime/bin/bare")
     }()
 
     private var workerHome: URL!

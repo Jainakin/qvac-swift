@@ -158,7 +158,7 @@ jobs:
           node tools/ci/package-manifest-mode.mjs --activate-development
       - name: Run required live suites with zero skips
         env:
-          QVAC_BARE_BIN: ${{ github.workspace }}/tools/runtime/node_modules/.bin/bare
+          QVAC_BARE_BIN: ${{ github.workspace }}/tools/runtime/node_modules/bare-runtime/bin/bare
           QVAC_NODE_MODULES: ${{ github.workspace }}/tools/runtime/node_modules
           QVAC_WORKER_SCRIPT: ${{ github.workspace }}/tools/runtime/node_modules/@qvac/sdk/dist/server/worker.js
         run: |
@@ -186,7 +186,7 @@ jobs:
           node tools/ci/package-manifest-mode.mjs --activate-development
       - name: Prove clean checkout through first real inference in under 10 minutes
         env:
-          QVAC_BARE_BIN: ${{ github.workspace }}/tools/runtime/node_modules/.bin/bare
+          QVAC_BARE_BIN: ${{ github.workspace }}/tools/runtime/node_modules/bare-runtime/bin/bare
           QVAC_NODE_MODULES: ${{ github.workspace }}/tools/runtime/node_modules
           QVAC_MODEL_FIXTURE_CACHE: ${{ runner.temp }}/qvac-model-fixtures
           QVAC_RUN_REAL_MODEL_TESTS: "1"
@@ -219,7 +219,7 @@ jobs:
           fi
       - name: Run remaining checksum-pinned model suites
         env:
-          QVAC_BARE_BIN: ${{ github.workspace }}/tools/runtime/node_modules/.bin/bare
+          QVAC_BARE_BIN: ${{ github.workspace }}/tools/runtime/node_modules/bare-runtime/bin/bare
           QVAC_NODE_MODULES: ${{ github.workspace }}/tools/runtime/node_modules
           QVAC_MODEL_FIXTURE_CACHE: ${{ runner.temp }}/qvac-model-fixtures
           QVAC_RUN_RAG_TESTS: "1"

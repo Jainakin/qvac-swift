@@ -44,8 +44,9 @@ let client = try await QVACClient(
 
 On macOS, install exact `bare-runtime@1.31.0` and `@qvac/sdk@0.17.0` dependencies,
 retain the npm lockfile, and provide its `node_modules` directory. The configuration
-prefers that directory's `.bin/bare`, so the worker and executable come from the
-same locked graph:
+prefers that directory's package-owned `bare-runtime/bin/bare`, so the worker and
+executable come from the same locked graph without depending on npm's `.bin`
+symlink materialization:
 
 ```swift
 let client = try await QVACClient(

@@ -33,7 +33,7 @@ final class LiveWorkerIntegrationTests: XCTestCase {
 
     private static let bareBin: URL? = ProcessInfo.processInfo.environment["QVAC_BARE_BIN"]
         .map { URL(fileURLWithPath: $0) }
-        ?? nodeModulesDir?.appendingPathComponent(".bin/bare")
+        ?? nodeModulesDir?.appendingPathComponent("bare-runtime/bin/bare")
     private static let workerScript: URL? = ProcessInfo.processInfo.environment["QVAC_WORKER_SCRIPT"]
         .map { URL(fileURLWithPath: $0) }
         ?? nodeModulesDir?.appendingPathComponent("@qvac/sdk/dist/server/worker.js")

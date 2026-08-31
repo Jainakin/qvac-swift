@@ -136,10 +136,11 @@ let configuration = try QVACClient.Configuration.macOS(
 let client = try await QVACClient(configuration: configuration)
 ```
 
-`Configuration.macOS` validates the worker path and first uses
-`node_modules/.bin/bare`, binding the executable to the same application lockfile.
-It falls back to PATH/common install locations only when that local binary is absent;
-pass `bareExecutable:` explicitly for a different controlled deployment.
+`Configuration.macOS` validates the worker path and first uses the package-owned
+`node_modules/bare-runtime/bin/bare`, binding the executable to the same application
+lockfile without relying on npm's `.bin` symlink materialization. It falls back to
+PATH/common install locations only when that local binary is absent; pass
+`bareExecutable:` explicitly for a different controlled deployment.
 
 ## Request deadlines, cancellation, and profiling
 
@@ -294,7 +295,7 @@ Useful local entry points:
 ```bash
 swift test --filter QVACClientUnitTests
 
-QVAC_BARE_BIN="$PWD/tools/runtime/node_modules/.bin/bare" \
+QVAC_BARE_BIN="$PWD/tools/runtime/node_modules/bare-runtime/bin/bare" \
 QVAC_NODE_MODULES="$PWD/tools/runtime/node_modules" \
 QVAC_WORKER_SCRIPT="$PWD/tools/runtime/node_modules/@qvac/sdk/dist/server/worker.js" \
 tools/ci/run-required-suite.sh AllRPCTypesRoundTripTests 1

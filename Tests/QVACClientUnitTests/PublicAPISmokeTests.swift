@@ -24,7 +24,7 @@ final class PublicAPISmokeTests: XCTestCase {
             .appendingPathComponent("qvac-local-bare-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let nodeModules = root.appendingPathComponent("node_modules", isDirectory: true)
-        let bin = nodeModules.appendingPathComponent(".bin", isDirectory: true)
+        let bin = nodeModules.appendingPathComponent("bare-runtime/bin", isDirectory: true)
         try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
         let localBare = bin.appendingPathComponent("bare")
         XCTAssertTrue(FileManager.default.createFile(atPath: localBare.path, contents: Data()))

@@ -95,9 +95,10 @@ public actor QVACClient {
             Self(storage: .testing(transport, shutdownBeforeClose: shutdownBeforeClose))
         }
 
-        /// macOS convenience — prefers the lockfile-local `node_modules/.bin/bare`,
-        /// then falls back to discovering `bare` on `$PATH`, and uses the SDK's
-        /// `worker.js` from the supplied node_modules directory.
+        /// macOS convenience — prefers the lockfile-local
+        /// `node_modules/bare-runtime/bin/bare`, then falls back to discovering
+        /// `bare` on `$PATH`, and uses the SDK's `worker.js` from the supplied
+        /// node_modules directory.
         public static func macOS(
             nodeModulesDir: URL,
             bareExecutable: URL? = nil,
@@ -107,7 +108,8 @@ public actor QVACClient {
             #if os(macOS)
             let workerScript = nodeModulesDir
                 .appendingPathComponent("@qvac/sdk/dist/server/worker.js")
-            let packageBare = nodeModulesDir.appendingPathComponent(".bin/bare")
+            let packageBare = nodeModulesDir
+                .appendingPathComponent("bare-runtime/bin/bare")
             let localBare = FileManager.default.isExecutableFile(atPath: packageBare.path)
                 ? packageBare
                 : nil

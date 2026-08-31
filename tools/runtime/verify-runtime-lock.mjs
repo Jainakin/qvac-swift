@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { accessSync, constants, existsSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -69,6 +69,28 @@ for (const [path, metadata] of Object.entries(packageLock.packages ?? {})) {
   installedCount++
 }
 
+// Invoke the package-owned launcher directly instead of trusting npm's `.bin`
+// symlink farm. Multiple optional bare-runtime platform packages declare the
+// same `bare` bin name, and npm may omit or mispoint that convenience link even
+// when the exact package graph is otherwise complete.
+const bareExecutable = join(runtimeDir, 'node_modules', 'bare-runtime', 'bin', 'bare')
+try {
+  accessSync(bareExecutable, constants.X_OK)
+} catch {
+  fail(`package-owned Bare executable is missing or not executable: ${bareExecutable}`)
+}
+let bareVersion
+try {
+  bareVersion = execFileSync(bareExecutable, ['--version'], { encoding: 'utf8' }).trim()
+} catch (error) {
+  fail(`package-owned Bare executable failed its version probe: ${error.message}`)
+}
+const expectedBareVersion = `v${packageJson.dependencies['bare-runtime']}`
+if (bareVersion !== expectedBareVersion) {
+  fail(`Bare executable reported ${bareVersion}, expected ${expectedBareVersion}`)
+}
+
 console.log(`[runtime-lock] exact SDK ${sdk.version} / ${sdk.integrity}`)
 console.log(`[runtime-lock] verified ${installedCount} installed package versions against package-lock.json`)
+console.log(`[runtime-lock] exact Bare executable ${bareVersion} / ${bareExecutable}`)
 console.log(`[runtime-lock] ${provenance.upstreamDependencyLock.reason}`)
