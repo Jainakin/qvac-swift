@@ -17,6 +17,8 @@ import Foundation
 ///   • `.client(code, message?)`  — error originated in the SDK's client layer (codes 50001–52000)
 ///   • `.server(code, message?)`  — error originated in the registry/worker
 ///                                  (codes 19001–19003 and 52001–54000)
+///   • `.inferenceCancelled(...)` — a completion was cancelled, with correlated
+///                                  partial aggregate state
 ///   • `.transport(_)`            — connection/transport failure
 ///   • `.requestTimedOut(...)`     — a local per-call RPC deadline elapsed
 ///   • `.invalidArgument(_)`       — the caller supplied an invalid local option
@@ -30,6 +32,13 @@ public enum QVACError: Error, CustomStringConvertible, Sendable {
     /// add-on with its own code space or a newer worker contract. The wire format
     /// parsed cleanly; Swift simply has no typed enum case for that code.
     case serverUntyped(code: Int, message: String?)
+    /// A completion ended with `stopReason: "cancelled"`. The live event stream
+    /// finishes normally; aggregate tasks reject with this case so a partial
+    /// completion cannot be mistaken for a successful terminal result.
+    case inferenceCancelled(
+        requestId: String,
+        partial: QVACClient.InferenceCancelledPartial
+    )
     case transport(reason: String, underlying: Error? = nil)
     case requestTimedOut(operation: String, after: Duration)
     case streamBufferOverflow(operation: String, maximumBytes: Int, attemptedBytes: Int)
@@ -45,6 +54,11 @@ public enum QVACError: Error, CustomStringConvertible, Sendable {
             return "QVAC server error \(code.rawValue) (\(code)): \(m ?? "no message")"
         case .serverUntyped(let code, let m):
             return "QVAC server error \(code) (addon-defined): \(m ?? "no message")"
+        case .inferenceCancelled(let requestId, let partial):
+            let textCount = partial.text?.count ?? 0
+            let toolCallCount = partial.toolCalls?.count ?? 0
+            return "QVAC inference \(requestId) was cancelled "
+                + "(partial text: \(textCount) characters, tool calls: \(toolCallCount))"
         case .transport(let reason, _):
             return "QVAC transport error: \(reason)"
         case .requestTimedOut(let operation, let timeout):

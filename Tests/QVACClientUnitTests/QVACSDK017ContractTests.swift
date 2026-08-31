@@ -96,7 +96,12 @@ final class QVACSDK017ContractTests: XCTestCase {
             .textToSpeechStream(.init(modelId: "m")),
             .transcribe(.init(audioChunk: .object(["type": .string("base64"), "value": .string("AA==")]), modelId: "m")),
             .transcribeStream(.init(modelId: "m")),
-            .translate(.init(modelId: "m", modelType: "nmtcpp-translation", stream: true, text: "hello")),
+            .translate(.init(
+                modelId: "m",
+                modelType: "nmtcpp-translation",
+                stream: true,
+                text: .one("hello")
+            )),
             .unloadModel(.init(modelId: "m")),
             .upscaleStream(.init(image: "AA==", modelId: "m")),
             .videoStream(.init(mode: "txt2vid", modelId: "m", prompt: "p")),

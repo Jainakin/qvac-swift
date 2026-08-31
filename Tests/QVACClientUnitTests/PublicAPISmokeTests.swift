@@ -110,7 +110,7 @@ final class PublicAPISmokeTests: XCTestCase {
     func test_translate_request_supports_both_modes() throws {
         let llmReq = TranslateRequest(
             modelId: "m", modelType: "llamacpp-completion",
-            stream: true, text: "hello", to: "fr"
+            stream: true, text: .one("hello"), to: "fr"
         )
         let env = QVACRequest.translate(llmReq)
         guard case .translate(let r) = try roundTrip(env) else { return XCTFail() }
@@ -119,10 +119,11 @@ final class PublicAPISmokeTests: XCTestCase {
 
         let nmtReq = TranslateRequest(
             modelId: "n", modelType: "nmtcpp-translation",
-            stream: true, text: "hello", from: "en", to: "es"
+            stream: true, text: .many(["hello", "world"])
         )
         guard case .translate(let n) = try roundTrip(QVACRequest.translate(nmtReq)) else { return XCTFail() }
         XCTAssertEqual(n.modelType, "nmtcpp-translation")
+        XCTAssertEqual(n.text, .many(["hello", "world"]))
     }
 
     func test_diffusion_request_carries_optional_params() throws {

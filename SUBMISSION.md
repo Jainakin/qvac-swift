@@ -10,9 +10,11 @@ The candidate targets the exact published `@qvac/sdk@0.17.0` contract at npm
 
 ## Executive status
 
-All seven engineering-review comments are implemented in the working tree. The
-source, generated API, worker, native dependency closure, tests, example, and
-guarded release automation form a production candidate.
+All seven source-side engineering-review changes are implemented in the working
+tree. The source, generated API, worker, native dependency closure, tests,
+example, and guarded release automation form a production candidate. Reviewer
+item 6 becomes externally complete only when its immutable binary artifacts and
+source tag are published through the guarded release sequence below.
 
 The repository is not yet a published SwiftPM release. The canonical
 `Package.swift` intentionally remains the local, path-based development manifest
@@ -74,8 +76,8 @@ The following results were obtained on 2026-08-31 on the final candidate tree:
 
 | Gate | Result |
 |---|---|
-| Complete opt-in Swift test matrix | 225/225 passed, 0 failed, 0 skipped; includes every live RPC shape, real LLM, RAG, real upscale, and the benchmark assertion |
-| Unit suite | 207/207 passed after final generation/API changes |
+| Complete opt-in Swift test matrix | 233/233 passed, 0 failed, 0 skipped; includes every live RPC shape, real LLM, RAG, real upscale, and the benchmark assertion |
+| Unit suite | 215/215 passed after final generation/API changes |
 | Strict Swift build | Passed with warnings as errors and `-strict-concurrency=complete` |
 | Live contract coverage | All 39 manifest methods exercised through public generated/rich APIs |
 | Pinned real LLM | 3/3 passed, zero skips |
@@ -88,7 +90,7 @@ The following results were obtained on 2026-08-31 on the final candidate tree:
 | Exact codegen | Two isolated final runs completed in 0.25 seconds each; 39 methods, 43 responses, 136 errors, 12 aliases, and all six generated outputs were byte-identical to the tree |
 | Third-party attribution | 146/146 shipped identities have full text: 143 package-provided and 3 exact-artifact-bound supplements; 0 unresolved. The final generated notice SHA-256 is `e8f71b72dfc9ac532f2a4f27c3c147bb920e202ef8ed323e0e6a4352652abb4c` |
 | Release/tool safety | Bootstrap, path safety, archive reproducibility, source binding, required-suite self-test, bundle provenance, runtime-lock verification, manifest regeneration, deterministic third-party attribution, and all YAML/shell/JavaScript/JSON syntax checks passed |
-| Diff hygiene | Final preflight requires `git diff --check`; no commit or publication was performed |
+| Diff hygiene | Final preflight requires `git diff --check`, an explicit file-boundary review, and a clean committed source candidate before publication |
 
 The CI workflow repeats these checks from a clean checkout. It additionally times
 checkout/setup through first real inference and hard-fails at 600 seconds, proves
@@ -126,8 +128,8 @@ without weakening its public distribution contract.
 These are not source-code defects and cannot be completed honestly without
 publishing external state:
 
-1. Commit every intended generated/source/release file, including the currently
-   new `Package.swift.dev`, while excluding the user-owned diagnostic file
+1. Commit every intended generated/source/release file, including the tracked
+   `Package.swift.dev`, while excluding the user-owned diagnostic file
    `Package.swift.release-broken-from-private-repo`.
 2. Push the development-manifest candidate; an initial green full `CI` run is a
    useful candidate gate.

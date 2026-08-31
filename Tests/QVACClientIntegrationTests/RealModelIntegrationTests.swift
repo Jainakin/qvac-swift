@@ -240,9 +240,12 @@ final class RealModelIntegrationTests: XCTestCase {
                 _ = try await run.final.value
                 XCTFail("cancelled completion final must reject")
             } catch let error as QVACError {
-                guard case .server(let code, _) = error, code == .inferenceCancelled else {
+                guard case .inferenceCancelled(let requestId, let partial) = error else {
                     throw error
                 }
+                XCTAssertEqual(requestId, run.requestId)
+                XCTAssertNotNil(partial.text)
+                XCTAssertNotNil(partial.toolCalls)
             }
             let events = try await eventConsumer.value
             XCTAssertTrue(events.contains { event in

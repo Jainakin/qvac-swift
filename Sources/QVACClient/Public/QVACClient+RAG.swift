@@ -282,6 +282,7 @@ public extension QVACClient {
     /// the workspace has not been initialized.
     func ragDeleteEmbeddings(
         ids: [String],
+        modelId: String? = nil,
         workspace: String? = nil,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws {
@@ -290,6 +291,7 @@ public extension QVACClient {
         }
         var req = RagRequest(operation: "deleteEmbeddings")
         req.ids = ids
+        req.modelId = modelId
         req.workspace = workspace
         _ = try await runRagAndExtract(req, op: "deleteEmbeddings", rpcOptions: rpcOptions) { _ in () }
     }
@@ -340,15 +342,15 @@ public extension QVACClient {
 
     /// Reindex `workspace` to optimize search.
     func ragReindex(
+        modelId: String? = nil,
         workspace: String? = nil,
         withProgress: Bool = false,
-        progressInterval: Double? = nil,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> RagOperationRun<RagReindexResult> {
         var req = RagRequest(operation: "reindex")
+        req.modelId = modelId
         req.workspace = workspace
         req.withProgress = withProgress ? true : nil
-        req.progressInterval = progressInterval
         return try await makeRagRun(req, op: "reindex", rpcOptions: rpcOptions) { response in
             guard let result = response.result else {
                 throw QVACError.protocolViolation("rag reindex response omitted result")
@@ -466,7 +468,7 @@ public extension QVACClient {
             let code: QVACErrorCode
             switch op {
             case "chunk": code = .ragChunkFailed
-            case "ingest", "saveEmbeddings": code = .ragSaveFailed
+            case "ingest", "saveEmbeddings", "reindex": code = .ragSaveFailed
             case "search": code = .ragSearchFailed
             case "deleteEmbeddings", "deleteWorkspace": code = .ragDeleteFailed
             case "closeWorkspace": code = .ragWorkspaceCloseFailed

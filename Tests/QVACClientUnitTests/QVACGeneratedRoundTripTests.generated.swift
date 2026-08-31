@@ -125,7 +125,7 @@ final class QVACGeneratedRoundTripTests: XCTestCase {
         let value34 = TranscribeStreamRequest(modelId: "fixture", emitVadEvents: true, endOfTurnSilenceMs: 1, metadata: true, parakeetStreamingConfig: .string("fixture"), prompt: "fixture", requestId: "fixture", vadRunIntervalMs: 1)
         try assertRoundTrip(value34)
         try assertRoundTrip(QVACRequest.transcribeStream(value34))
-        let value35 = TranslateRequest(modelId: "fixture", modelType: "fixture", stream: true, text: "fixture", context: "fixture", from: "fixture", requestId: "fixture", to: "fixture")
+        let value35 = TranslateRequest(modelId: "fixture", modelType: "fixture", stream: true, text: .one("fixture"), context: "fixture", from: "fixture", requestId: "fixture", to: "fixture")
         try assertRoundTrip(value35)
         try assertRoundTrip(QVACRequest.translate(value35))
         let value36 = UnloadModelRequest(modelId: "fixture", clearStorage: true)
@@ -270,4 +270,12 @@ final class QVACGeneratedRoundTripTests: XCTestCase {
         try assertRoundTrip(value42)
         try assertRoundTrip(QVACResponse.videoStream(value42))
     }
+
+    func test_one_or_many_wire_union_round_trips_scalar_and_array() throws {
+        let scalar: QVACOneOrMany<String> = .one("fixture")
+        let batch: QVACOneOrMany<String> = .many(["first", "second"])
+        try assertRoundTrip(scalar)
+        try assertRoundTrip(batch)
+    }
+
 }

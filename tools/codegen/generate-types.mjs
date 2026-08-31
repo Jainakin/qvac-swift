@@ -203,6 +203,35 @@ function shapeSpecificity(shape) {
   return 0
 }
 
+/// Return a stable description of the JSON representation carried by a schema
+/// shape. Constraints and prose do not affect this key: a `string` with
+/// `minLength` is still represented by the same Swift value as a bare string.
+function wireShapeKey(shape) {
+  shape = resolveRef(shape)
+  if (!shape || typeof shape !== 'object') return 'opaque'
+  if (shape.const !== undefined) return `const:${typeof shape.const}`
+  if (Array.isArray(shape.enum)) return `enum:${shape.type ?? typeof shape.enum[0]}`
+  if (shape.type === 'array') return `array<${wireShapeKey(shape.items)}>`
+  if (shape.type === 'object' && shape.additionalProperties && !shape.properties) {
+    return `map<${wireShapeKey(shape.additionalProperties)}>`
+  }
+  return shape.type ?? 'opaque'
+}
+
+/// Keep a property-level union when another discriminator branch repeats one
+/// of that union's wire representations. Without this, the translate request's
+/// NMT `string | string[]` input is narrowed to the LLM branch's `string` while
+/// the two same-discriminator request leaves are merged.
+function unionContainingShape(first, second) {
+  for (const [candidateUnion, candidateMember] of [[first, second], [second, first]]) {
+    const union = candidateUnion?.anyOf ?? candidateUnion?.oneOf
+    if (!Array.isArray(union)) continue
+    const memberKey = wireShapeKey(candidateMember)
+    if (union.some(arm => wireShapeKey(arm) === memberKey)) return candidateUnion
+  }
+  return undefined
+}
+
 function mergeLeavesByDiscriminator(leaves) {
   const grouped = new Map()
   for (const leaf of leaves) {
@@ -233,7 +262,17 @@ function mergeLeavesByDiscriminator(leaves) {
         // back to `JSONValue?`. We score each shape by specificity and keep
         // the most specific seen.
         const existing = properties[k]
-        if (!existing || shapeSpecificity(v) > shapeSpecificity(existing)) {
+        // The 0.17 translate discriminator has an NMT branch whose `text` is
+        // `string | string[]` and an LLM branch whose `text` is `string`.
+        // Preserve that superset union instead of narrowing it while merging
+        // the two branches. Other same-discriminator fields retain the
+        // established specificity rules until they have an exact Swift type.
+        const containingUnion = discriminator === 'translate' && k === 'text' && existing
+          ? unionContainingShape(existing, v)
+          : undefined
+        if (containingUnion) {
+          properties[k] = containingUnion
+        } else if (!existing || shapeSpecificity(v) > shapeSpecificity(existing)) {
           properties[k] = v
         }
       }
@@ -259,6 +298,7 @@ function mergeLeavesByDiscriminator(leaves) {
 const requests  = mergeLeavesByDiscriminator(requestLeaves)
 const responses = mergeLeavesByDiscriminator(responseLeaves)
 const emittedStructs = []
+const requiredSupportTypes = new Set()
 
 // ------------------------------------------------------------------------------------
 // Swift identifier helpers
@@ -314,8 +354,27 @@ function swiftType(prop, context = {}) {
   prop = resolveRef(prop)
   if (!prop || typeof prop !== 'object') return 'JSONValue'
 
-  // anyOf/oneOf at property level → JSONValue unless it's the optional-nullable pattern.
+  // Preserve the SDK's `T | T[]` wire unions as an exact, strongly typed value.
+  // The pinned 0.17 translate schema uses this for NMT scalar/batch input.
   if (Array.isArray(prop.anyOf) || Array.isArray(prop.oneOf)) {
+    const arms = (prop.anyOf ?? prop.oneOf).map(resolveRef)
+    if (context.side === 'request'
+        && context.discriminator === 'translate'
+        && context.propName === 'text'
+        && arms.length === 2) {
+      const arrayArm = arms.find(arm => arm?.type === 'array')
+      const scalarArm = arms.find(arm => arm?.type !== 'array')
+      if (arrayArm && scalarArm) {
+        const scalar = swiftType(scalarArm, context)
+        const element = swiftType(arrayArm.items, context)
+        if (scalar === element && !scalar.includes('JSONValue') && !scalar.endsWith('?')) {
+          requiredSupportTypes.add('QVACOneOrMany')
+          return `QVACOneOrMany<${scalar}>`
+        }
+      }
+    }
+    // Other property-level unions remain opaque until the generator has a
+    // lossless Swift representation for every arm.
     return 'JSONValue'
   }
   if (prop.const !== undefined) {
@@ -548,13 +607,46 @@ import Foundation
 
 `
 
-const parts = [header]
-for (const { discriminator, node } of [...requests].sort((a,b)=>codePointCompare(a.discriminator, b.discriminator))) {
-  parts.push(emitStruct(discriminator, node, 'request'))
+const requestStructs = [...requests]
+  .sort((a,b)=>codePointCompare(a.discriminator, b.discriminator))
+  .map(({ discriminator, node }) => emitStruct(discriminator, node, 'request'))
+const responseStructs = [...responses]
+  .sort((a,b)=>codePointCompare(a.discriminator, b.discriminator))
+  .map(({ discriminator, node }) => emitStruct(discriminator, node, 'response'))
+
+const supportTypes = []
+if (requiredSupportTypes.has('QVACOneOrMany')) {
+  supportTypes.push(`/// A JSON value that is encoded as either one value or an array of values.
+///
+/// QVAC 0.17 uses this exact union for operations whose wire contract supports
+/// both scalar and batch input. The enum preserves which representation was
+/// received instead of erasing the distinction through an untyped JSON value.
+public enum QVACOneOrMany<Value: Codable & Equatable & Sendable>: Codable, Equatable, Sendable {
+    case one(Value)
+    case many([Value])
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let values = try? container.decode([Value].self) {
+            self = .many(values)
+        } else {
+            self = .one(try container.decode(Value.self))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .one(let value):
+            try container.encode(value)
+        case .many(let values):
+            try container.encode(values)
+        }
+    }
+}`)
 }
-for (const { discriminator, node } of [...responses].sort((a,b)=>codePointCompare(a.discriminator, b.discriminator))) {
-  parts.push(emitStruct(discriminator, node, 'response'))
-}
+
+const parts = [header, ...supportTypes, ...requestStructs, ...responseStructs]
 parts.push(emitUnion('QVACRequest',  requests,  'request'))
 parts.push(emitUnion('QVACResponse', responses, 'response'))
 
@@ -570,6 +662,8 @@ function sampleValue(swiftTypeName) {
   if (type === 'Int') return '1'
   if (type === 'Bool') return 'true'
   if (type === 'JSONValue') return '.string("fixture")'
+  const oneOrMany = type.match(/^QVACOneOrMany<(.+)>$/)
+  if (oneOrMany) return `.one(${sampleValue(oneOrMany[1])})`
   if (type.startsWith('[String:')) return '[:]'
   if (type.startsWith('[')) return '[]'
   throw new Error(`No generated round-trip sample for Swift type ${swiftTypeName}`)
@@ -590,6 +684,16 @@ const requestConstructions = emittedStructs.filter(item => item.side === 'reques
   .map(testConstruction).join('\n')
 const responseConstructions = emittedStructs.filter(item => item.side === 'response')
   .map(testConstruction).join('\n')
+const supportRoundTripTests = requiredSupportTypes.has('QVACOneOrMany')
+  ? `
+    func test_one_or_many_wire_union_round_trips_scalar_and_array() throws {
+        let scalar: QVACOneOrMany<String> = .one("fixture")
+        let batch: QVACOneOrMany<String> = .many(["first", "second"])
+        try assertRoundTrip(scalar)
+        try assertRoundTrip(batch)
+    }
+`
+  : ''
 const roundTripTest = `// QVACGeneratedRoundTripTests.generated.swift
 //
 // AUTO-GENERATED from the exact @qvac/sdk@${PROVENANCE.sdkVersion} contract/schema.json
@@ -618,6 +722,7 @@ ${requestConstructions}
     func test_all_${responses.length}_response_leaves_construct_encode_and_decode() throws {
 ${responseConstructions}
     }
+${supportRoundTripTests}
 }
 `
 mkdirSync(dirname(ROUNDTRIP_TEST_OUTPUT), { recursive: true })

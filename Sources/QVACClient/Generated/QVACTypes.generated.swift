@@ -13,6 +13,35 @@ import Foundation
 
 
 
+/// A JSON value that is encoded as either one value or an array of values.
+///
+/// QVAC 0.17 uses this exact union for operations whose wire contract supports
+/// both scalar and batch input. The enum preserves which representation was
+/// received instead of erasing the distinction through an untyped JSON value.
+public enum QVACOneOrMany<Value: Codable & Equatable & Sendable>: Codable, Equatable, Sendable {
+    case one(Value)
+    case many([Value])
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let values = try? container.decode([Value].self) {
+            self = .many(values)
+        } else {
+            self = .one(try container.decode(Value.self))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .one(let value):
+            try container.encode(value)
+        case .many(let values):
+            try container.encode(values)
+        }
+    }
+}
+
 /// Wire-level shape for the QVAC SDK "audioGenStream" request.
 public struct AudioGenStreamRequest: Codable, Sendable, Equatable {
 
@@ -2417,13 +2446,13 @@ public struct TranslateRequest: Codable, Sendable, Equatable {
     /// Whether to stream tokens (`true`) or resolve the complete translation once (`false`).
     public var stream: Bool
 
-    /// The input text to translate.
-    public var text: String
+    /// The input text(s) to translate. A single string returns a single translation; an array returns one translation per input.
+    public var text: QVACOneOrMany<String>
 
     /// Target language code.
     public var to: String?
 
-    public init(modelId: String, modelType: String, stream: Bool, text: String, context: String? = nil, from: String? = nil, requestId: String? = nil, to: String? = nil) {
+    public init(modelId: String, modelType: String, stream: Bool, text: QVACOneOrMany<String>, context: String? = nil, from: String? = nil, requestId: String? = nil, to: String? = nil) {
         self.type = Self.discriminator
         self.modelId = modelId
         self.modelType = modelType
@@ -2464,7 +2493,7 @@ public struct TranslateRequest: Codable, Sendable, Equatable {
         self.modelType = try container.decode(String.self, forKey: .modelType)
         self.requestId = try container.decodeIfPresent(String.self, forKey: .requestId)
         self.stream = try container.decode(Bool.self, forKey: .stream)
-        self.text = try container.decode(String.self, forKey: .text)
+        self.text = try container.decode(QVACOneOrMany<String>.self, forKey: .text)
         self.to = try container.decodeIfPresent(String.self, forKey: .to)
     }
 

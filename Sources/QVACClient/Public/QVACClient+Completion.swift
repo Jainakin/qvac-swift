@@ -256,12 +256,35 @@ public extension QVACClient {
         public let cacheableAssistantContent: String?
     }
 
+    /// Aggregate state retained when a completion is cancelled before success.
+    ///
+    /// Every field is optional because cancellation may win before the first
+    /// event. A later cancellation normally includes accumulated text and tool
+    /// calls, plus statistics when the worker emitted them before its terminal
+    /// cancelled event.
+    struct InferenceCancelledPartial: Sendable, Equatable {
+        public let text: String?
+        public let toolCalls: [CompletionToolCall]?
+        public let stats: CompletionStats?
+
+        public init(
+            text: String? = nil,
+            toolCalls: [CompletionToolCall]? = nil,
+            stats: CompletionStats? = nil
+        ) {
+            self.text = text
+            self.toolCalls = toolCalls
+            self.stats = stats
+        }
+    }
+
     /// Live and aggregated views of a single completion request.
     ///
     /// `requestId` can be passed to ``cancel(_:rpcOptions:)``. The event stream ends
     /// normally with a cancelled terminal event, while aggregate tasks reject with
-    /// `QVACError.server(.inferenceCancelled, ...)`. Event/token/tool fan-outs are
-    /// bounded observational views; ``final`` remains the authoritative result.
+    /// ``QVACError/inferenceCancelled(requestId:partial:)``, which retains the
+    /// request id and partial aggregate. Event/token/tool fan-outs are bounded
+    /// observational views; ``final`` remains the authoritative result.
     final class CompletionRun: @unchecked Sendable {
         /// Stable client-generated identifier carried on the wire.
         public let requestId: String
@@ -320,9 +343,11 @@ public extension QVACClient {
         responseFormat: JSONValue? = nil,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> CompletionRun {
-        if tools?.isEmpty == false, responseFormat != nil {
-            throw QVACError.invalidArgument("completion tools and responseFormat are mutually exclusive")
-        }
+        try Self.validateCompletionResponseFormat(
+            responseFormat,
+            hasTools: tools?.isEmpty == false,
+            context: "completion"
+        )
         let historyWire: [JSONValue] = history.map {
             .object(["role": .string($0.role), "content": .string($0.content)])
         }
@@ -431,9 +456,13 @@ public extension QVACClient {
                     throw QVACError.server(.completionFailed, message: terminalError)
                 }
                 if stopReason == .cancelled {
-                    throw QVACError.server(
-                        .inferenceCancelled,
-                        message: "completion \(requestId) was cancelled"
+                    throw QVACError.inferenceCancelled(
+                        requestId: requestId,
+                        partial: .init(
+                            text: result.contentText,
+                            toolCalls: result.toolCalls,
+                            stats: result.stats
+                        )
                     )
                 }
                 return result
@@ -471,5 +500,69 @@ public extension QVACClient {
             options: .regularExpression
         )
         return unclosed.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Validate the executable 0.17 response-format schema at the rich API
+    /// boundary. Free-form text may be combined with tools; structured JSON
+    /// formats may not, because tool schemas already constrain model output.
+    internal static func validateCompletionResponseFormat(
+        _ responseFormat: JSONValue?,
+        hasTools: Bool,
+        context: String
+    ) throws {
+        guard let responseFormat else { return }
+        guard case .object(let object) = responseFormat,
+              case .string(let type) = object["type"] ?? .null else {
+            throw QVACError.invalidArgument(
+                "\(context) responseFormat must be an object with a string type"
+            )
+        }
+
+        switch type {
+        case "text", "json_object":
+            guard Set(object.keys) == ["type"] else {
+                throw QVACError.invalidArgument(
+                    "\(context) responseFormat type \(type) does not accept extra fields"
+                )
+            }
+        case "json_schema":
+            guard Set(object.keys) == ["type", "json_schema"],
+                  case .object(let schemaObject) = object["json_schema"] ?? .null,
+                  case .string(let name) = schemaObject["name"] ?? .null,
+                  !name.isEmpty,
+                  case .object = schemaObject["schema"] ?? .null,
+                  Set(schemaObject.keys).isSubset(of: [
+                      "name", "description", "schema", "strict",
+                  ]) else {
+                throw QVACError.invalidArgument(
+                    "\(context) json_schema responseFormat has an invalid shape"
+                )
+            }
+            if let description = schemaObject["description"],
+               case .string = description {
+                // Valid optional description.
+            } else if schemaObject["description"] != nil {
+                throw QVACError.invalidArgument(
+                    "\(context) responseFormat json_schema.description must be a string"
+                )
+            }
+            if let strict = schemaObject["strict"], case .bool = strict {
+                // Valid optional strict marker.
+            } else if schemaObject["strict"] != nil {
+                throw QVACError.invalidArgument(
+                    "\(context) responseFormat json_schema.strict must be a boolean"
+                )
+            }
+        default:
+            throw QVACError.invalidArgument(
+                "\(context) responseFormat.type must be text, json_object, or json_schema"
+            )
+        }
+
+        if hasTools, type != "text" {
+            throw QVACError.invalidArgument(
+                "\(context) structured responseFormat cannot be combined with tools"
+            )
+        }
     }
 }

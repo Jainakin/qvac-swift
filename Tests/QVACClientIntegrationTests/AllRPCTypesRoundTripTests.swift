@@ -77,7 +77,7 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
                 XCTFail("\(name): wire decode failure — \(msg)", file: file, line: line)
             case .protocolViolation(let msg):
                 XCTFail("\(name): protocol violation — \(msg)", file: file, line: line)
-            case .server, .serverUntyped:
+            case .server, .serverUntyped, .inferenceCancelled:
                 // Application-level error; wire format succeeded. AC-4 met.
                 break
             case .client(let code, let message):
@@ -290,8 +290,6 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
                     modelId: missingModel,
                     modelType: "nmtcpp-translation",
                     text: "hello",
-                    from: "en",
-                    to: "fr",
                     stream: false,
                     rpcOptions: rpc
                 )

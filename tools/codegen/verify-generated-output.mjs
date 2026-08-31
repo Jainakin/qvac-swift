@@ -99,6 +99,18 @@ if (/public var type: String/.test(types) || /public init\(type: String/.test(ty
 if (/case unknown\(type: String, payload: JSONValue\)/.test(types)) {
   throw new Error('[generated] pinned request/response unions must reject unknown discriminators')
 }
+for (const required of [
+  'public enum QVACOneOrMany<Value:',
+  'public var text: QVACOneOrMany<String>',
+  'case many([Value])',
+]) {
+  if (!types.includes(required)) {
+    throw new Error(`[generated] translate string|string[] invariant missing: ${required}`)
+  }
+}
+if (!roundTrips.includes('test_one_or_many_wire_union_round_trips_scalar_and_array')) {
+  throw new Error('[generated] translate string|string[] round-trip coverage is missing')
+}
 
 function structBlocks(source) {
   const blocks = []

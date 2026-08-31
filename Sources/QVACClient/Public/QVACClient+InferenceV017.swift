@@ -609,6 +609,20 @@ public extension QVACClient {
         guard !prompts.isEmpty else {
             throw QVACError.invalidArgument("batchCompletion requires at least one prompt")
         }
+        let callerIds = prompts.compactMap(\.id)
+        guard callerIds.allSatisfy({ !$0.isEmpty }) else {
+            throw QVACError.invalidArgument("batchCompletion prompt ids must not be empty")
+        }
+        guard Set(callerIds).count == callerIds.count else {
+            throw QVACError.invalidArgument("batchCompletion prompt ids must be unique")
+        }
+        for (index, prompt) in prompts.enumerated() {
+            try Self.validateCompletionResponseFormat(
+                prompt.responseFormat,
+                hasTools: prompt.tools?.isEmpty == false,
+                context: "batchCompletion prompt \(prompt.id ?? String(index))"
+            )
+        }
         let requestId = UUID().uuidString
         let request = BatchCompletionStreamRequest(
             modelId: modelId,
@@ -791,9 +805,13 @@ private struct BatchCompletionAccumulator: Sendable {
             return .failure(QVACError.server(.completionFailed, message: failureMessage))
         }
         if stopReason == .cancelled {
-            return .failure(QVACError.server(
-                .inferenceCancelled,
-                message: "batch completion \(requestId) was cancelled"
+            return .failure(QVACError.inferenceCancelled(
+                requestId: requestId,
+                partial: .init(
+                    text: contentText,
+                    toolCalls: toolCalls,
+                    stats: stats
+                )
             ))
         }
         let fullText = rawFullText ?? contentText

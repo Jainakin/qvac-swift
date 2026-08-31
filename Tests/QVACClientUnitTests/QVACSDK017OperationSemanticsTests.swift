@@ -306,6 +306,97 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         await client.close()
     }
 
+    func test_completion_cancellation_preserves_request_id_and_partial_aggregate() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let run = try await client.completion(
+            modelId: "llm",
+            history: [.user("continue until cancelled")]
+        )
+        let frames = try await Self.waitForFrames(2, on: transport)
+        let (id, _) = try Self.request(in: frames)
+
+        await Self.feedServerStream(
+            id: id,
+            records: [
+                #"{"type":"completionStream","events":[{"type":"contentDelta","seq":0,"text":"partial"},{"type":"toolCall","seq":1,"call":{"id":"call-1","name":"save","arguments":{"value":"draft"}}},{"type":"completionStats","seq":2,"stats":{"generatedTokens":2}}]}"#,
+                #"{"type":"completionStream","events":[{"type":"completionDone","seq":3,"stopReason":"cancelled","raw":{"fullText":"partial"}}],"done":true}"#,
+            ],
+            to: transport
+        )
+
+        do {
+            _ = try await run.final.value
+            XCTFail("a cancelled completion aggregate must reject")
+        } catch let QVACError.inferenceCancelled(requestId, partial) {
+            XCTAssertEqual(requestId, run.requestId)
+            XCTAssertEqual(partial.text, "partial")
+            XCTAssertEqual(partial.toolCalls?.count, 1)
+            XCTAssertEqual(partial.toolCalls?.first?.name, "save")
+            XCTAssertEqual(partial.stats?.generatedTokens, 2)
+        } catch {
+            XCTFail("expected rich inference cancellation, got \(error)")
+        }
+
+        do {
+            _ = try await run.text.value
+            XCTFail("completion convenience aggregates must share the cancellation error")
+        } catch let QVACError.inferenceCancelled(requestId, partial) {
+            XCTAssertEqual(requestId, run.requestId)
+            XCTAssertEqual(partial.text, "partial")
+        } catch {
+            XCTFail("expected rich inference cancellation, got \(error)")
+        }
+
+        var events: [QVACClient.CompletionEvent] = []
+        for try await event in run.events { events.append(event) }
+        XCTAssertTrue(events.contains { event in
+            guard case .done(_, let reason, _) = event else { return false }
+            return reason == .cancelled
+        })
+        await client.close()
+    }
+
+    func test_completion_text_response_format_allows_tools_but_structured_format_does_not() async throws {
+        let allowedTransport = MockTransport()
+        let allowedClient = QVACClient(testing: allowedTransport)
+        let run = try await allowedClient.completion(
+            modelId: "llm",
+            history: [.user("call a tool")],
+            tools: [.object(["type": .string("function"), "name": .string("save")])],
+            responseFormat: .object(["type": .string("text")])
+        )
+        let frames = try await Self.waitForFrames(2, on: allowedTransport)
+        let (_, request) = try Self.request(in: frames)
+        XCTAssertEqual(
+            request["responseFormat"] as? [String: String],
+            ["type": "text"]
+        )
+        XCTAssertEqual((request["tools"] as? [[String: Any]])?.count, 1)
+        run.final.cancel()
+        _ = try? await run.final.value
+        await allowedClient.close()
+
+        let rejectedTransport = MockTransport()
+        let rejectedClient = QVACClient(testing: rejectedTransport)
+        do {
+            _ = try await rejectedClient.completion(
+                modelId: "llm",
+                history: [.user("return json")],
+                tools: [.object(["type": .string("function"), "name": .string("save")])],
+                responseFormat: .object(["type": .string("json_object")])
+            )
+            XCTFail("structured response formats must reject tool-constrained output")
+        } catch let QVACError.invalidArgument(message) {
+            XCTAssertTrue(message.contains("structured responseFormat"))
+        } catch {
+            XCTFail("expected invalidArgument, got \(error)")
+        }
+        let rejectedFrames = Self.frames(in: await rejectedTransport.outbound())
+        XCTAssertTrue(rejectedFrames.isEmpty)
+        await rejectedClient.close()
+    }
+
     func test_completion_rejects_end_without_done() async throws {
         let transport = MockTransport()
         let client = QVACClient(testing: transport)
@@ -632,6 +723,7 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
             let frames = try await Self.waitForFrames(2, on: transport)
             let (id, request) = try Self.request(in: frames)
             XCTAssertEqual(request["stream"] as? Bool, true)
+            XCTAssertEqual(request["text"] as? String, "hello")
             XCTAssertNil(request["requestId"])
             await Self.feedServerStream(
                 id: id,
@@ -681,6 +773,143 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
             XCTAssertTrue(tokens.isEmpty)
             await client.close()
         }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let run = try await client.translate(
+                modelId: "translator",
+                modelType: "nmtcpp-translation",
+                texts: ["hello", "world"],
+                stream: false
+            )
+            let frames = try await Self.waitForFrames(2, on: transport)
+            let (id, request) = try Self.request(in: frames)
+            XCTAssertEqual(request["stream"] as? Bool, false)
+            XCTAssertEqual(request["text"] as? [String], ["hello", "world"])
+            XCTAssertEqual(request["modelType"] as? String, "nmtcpp-translation")
+            XCTAssertNil(request["from"])
+            XCTAssertNil(request["to"])
+            XCTAssertNil(request["context"])
+            await Self.feedServerStream(
+                id: id,
+                records: [
+                    #"{"type":"translate","token":"bonjour"}"#,
+                    #"{"type":"translate","token":"\n"}"#,
+                    #"{"type":"translate","token":"monde"}"#,
+                    #"{"type":"translate","token":"","done":true,"stats":{"totalTime":9}}"#,
+                ],
+                to: transport
+            )
+            let batchText = try await run.text.value
+            let batchStats = try await run.stats.value
+            XCTAssertEqual(batchText, "bonjour\nmonde")
+            XCTAssertEqual(batchStats?.totalTime, 9)
+            await client.close()
+        }
+    }
+
+    func test_translate_rejects_inputs_outside_the_017_scalar_and_nmt_batch_schema() async {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+
+        do {
+            _ = try await client.translate(
+                modelId: "translator",
+                modelType: "nmtcpp-translation",
+                text: ""
+            )
+            XCTFail("empty scalar text must fail before transport I/O")
+        } catch let QVACError.invalidArgument(message) {
+            XCTAssertTrue(message.contains("text must not be empty"))
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        let invalidLLMTargets: [String?] = [nil, ""]
+        for targetLanguage in invalidLLMTargets {
+            do {
+                _ = try await client.translate(
+                    modelId: "translator",
+                    modelType: "llamacpp-completion",
+                    text: "hello",
+                    to: targetLanguage
+                )
+                XCTFail("LLM translation requires a non-empty target language")
+            } catch let QVACError.invalidArgument(message) {
+                XCTAssertTrue(message.contains("target language"))
+            } catch {
+                XCTFail("unexpected error: \(error)")
+            }
+        }
+
+        let invalidNMTOptions: [(from: String?, to: String?, context: String?)] = [
+            ("en", nil, nil),
+            (nil, "fr", nil),
+            (nil, nil, "formal"),
+        ]
+        for options in invalidNMTOptions {
+            do {
+                _ = try await client.translate(
+                    modelId: "translator",
+                    modelType: "nmtcpp-translation",
+                    text: "hello",
+                    from: options.from,
+                    to: options.to,
+                    context: options.context
+                )
+                XCTFail("NMT translation must reject LLM-only fields")
+            } catch let QVACError.invalidArgument(message) {
+                XCTAssertTrue(message.contains("does not accept"))
+            } catch {
+                XCTFail("unexpected error: \(error)")
+            }
+        }
+
+        do {
+            _ = try await client.translate(
+                modelId: "translator",
+                modelType: "custom-translation",
+                text: "hello"
+            )
+            XCTFail("unsupported translation model type must fail before transport I/O")
+        } catch let QVACError.invalidArgument(message) {
+            XCTAssertTrue(message.contains("modelType"))
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        for invalidTexts in [[], ["hello", ""]] {
+            do {
+                _ = try await client.translate(
+                    modelId: "translator",
+                    modelType: "nmtcpp-translation",
+                    texts: invalidTexts
+                )
+                XCTFail("invalid batch must fail before transport I/O")
+            } catch let QVACError.invalidArgument(message) {
+                XCTAssertTrue(message.contains("translate texts"))
+            } catch {
+                XCTFail("unexpected error: \(error)")
+            }
+        }
+
+        do {
+            _ = try await client.translate(
+                modelId: "translator",
+                modelType: "llamacpp-completion",
+                texts: ["hello"]
+            )
+            XCTFail("LLM translation must reject array input")
+        } catch let QVACError.invalidArgument(message) {
+            XCTAssertTrue(message.contains("batch input requires"))
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        let outbound = await transport.outbound()
+        XCTAssertTrue(outbound.isEmpty)
+        await client.close()
     }
 
     func test_ocr_matches_017_stream_and_nonstream_result_semantics() async throws {
@@ -878,6 +1107,80 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         XCTAssertEqual(streamed.count, 2)
         XCTAssertEqual(perIdEvents, streamed.map(\.event))
         XCTAssertEqual(streamed.first?.id, "prompt-1")
+        await client.close()
+    }
+
+    func test_batch_completion_rejects_duplicate_ids_before_transport() async {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        do {
+            _ = try await client.batchCompletion(
+                modelId: "llm",
+                prompts: [
+                    .init(id: "duplicate", history: [.user("one")]),
+                    .init(id: "duplicate", history: [.user("two")]),
+                ]
+            )
+            XCTFail("duplicate batch prompt ids must be rejected")
+        } catch let QVACError.invalidArgument(message) {
+            XCTAssertTrue(message.contains("must be unique"))
+        } catch {
+            XCTFail("expected invalidArgument, got \(error)")
+        }
+        let outboundFrames = Self.frames(in: await transport.outbound())
+        XCTAssertTrue(outboundFrames.isEmpty)
+        await client.close()
+    }
+
+    func test_batch_completion_cancellation_preserves_partial_prompt_state() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let run = try await client.batchCompletion(
+            modelId: "llm",
+            prompts: [.init(id: "prompt-1", history: [.user("keep going")])]
+        )
+        let byId = run.byId("prompt-1")
+        let frames = try await Self.waitForFrames(2, on: transport)
+        let (id, _) = try Self.request(in: frames)
+
+        await Self.feedServerStream(
+            id: id,
+            records: [
+                #"{"type":"batchCompletionStream","ids":["prompt-1"],"events":[{"id":"prompt-1","event":{"type":"contentDelta","seq":0,"text":"partial batch"}},{"id":"prompt-1","event":{"type":"completionStats","seq":1,"stats":{"emittedTokens":2}}}]}"#,
+                #"{"type":"batchCompletionStream","events":[{"id":"prompt-1","event":{"type":"completionDone","seq":2,"stopReason":"cancelled","raw":{"fullText":"partial batch"}}}],"done":true}"#,
+            ],
+            to: transport
+        )
+
+        do {
+            _ = try await byId.final.value
+            XCTFail("a cancelled per-prompt aggregate must reject")
+        } catch let QVACError.inferenceCancelled(requestId, partial) {
+            XCTAssertEqual(requestId, run.requestId)
+            XCTAssertEqual(partial.text, "partial batch")
+            XCTAssertEqual(partial.toolCalls, [])
+            XCTAssertEqual(partial.stats?.emittedTokens, 2)
+        } catch {
+            XCTFail("expected rich inference cancellation, got \(error)")
+        }
+
+        do {
+            _ = try await run.results.value
+            XCTFail("batch results must reject when any prompt is cancelled")
+        } catch let QVACError.inferenceCancelled(requestId, partial) {
+            XCTAssertEqual(requestId, run.requestId)
+            XCTAssertEqual(partial.text, "partial batch")
+        } catch {
+            XCTFail("expected rich inference cancellation, got \(error)")
+        }
+
+        var events: [QVACClient.BatchCompletionEvent] = []
+        for try await event in run.events { events.append(event) }
+        XCTAssertEqual(events.count, 3)
+        XCTAssertTrue(events.contains { event in
+            guard case .done(_, let reason, _) = event.event else { return false }
+            return reason == .cancelled
+        })
         await client.close()
     }
 
@@ -1511,7 +1814,7 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
                     modelId: "m",
                     modelType: "nmtcpp-translation",
                     stream: true,
-                    text: "hello"
+                    text: .one("hello")
                 ),
                 rpcOptions: invalid
             )
@@ -1638,15 +1941,16 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         let streamTransport = MockTransport()
         let streamClient = QVACClient(testing: streamTransport)
         let reindex = try await streamClient.ragReindex(
+            modelId: "embed-model",
             workspace: "docs",
-            withProgress: true,
-            progressInterval: 25
+            withProgress: true
         )
         frames = try await Self.waitForFrames(2, on: streamTransport)
         (id, request) = try Self.request(in: frames)
         XCTAssertEqual(request["requestId"] as? String, reindex.requestId)
+        XCTAssertEqual(request["modelId"] as? String, "embed-model")
         XCTAssertEqual(request["withProgress"] as? Bool, true)
-        XCTAssertEqual(request["progressInterval"] as? Int, 25)
+        XCTAssertNil(request["progressInterval"])
         await Self.feedServerStream(
             id: id,
             records: [
