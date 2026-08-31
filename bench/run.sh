@@ -219,7 +219,7 @@ const path = process.argv[1]
 const stat = lstatSync(path)
 if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("workload must be a regular non-symlink file")
 const workload = JSON.parse(readFileSync(path, "utf8"))
-if (workload.schema_version !== 2) throw new Error("workload schema_version must be 2")
+if (workload.schema_version !== 3) throw new Error("workload schema_version must be 3")
 if (workload.measurement?.process_pairs !== 10) throw new Error("KR-2 requires exactly ten process pairs")
 if (workload.measurement?.maximum_overhead_ratio !== 1.05) throw new Error("KR-2 overhead ratio must be 1.05")
 if (workload.preconditioning?.predict !== 1000
@@ -232,6 +232,14 @@ if (workload.measurement?.predict !== 1000
 }
 if (workload.measurement?.bootstrap_iterations !== 20000) {
   throw new Error("KR-2 requires exactly 20,000 bootstrap iterations")
+}
+if (workload.measurement?.normalized_mean_factor_formula
+    !== "mean_token_interval_ms / (1000 / stats.tokensPerSecond)") {
+  throw new Error("KR-2 normalized mean factor formula is not the fixed contract")
+}
+if (workload.measurement?.normalized_mean_process_aggregation
+    !== "arithmetic_mean(exactly_3_completion_factors)") {
+  throw new Error("KR-2 normalized mean process aggregation is not the fixed contract")
 }
 if (workload.timeouts?.process_watchdog_seconds !== 240) throw new Error("KR-2 process watchdog must be exactly 240 seconds")
 if (workload.timeouts?.completion_rpc_timeout !== "none") throw new Error("KR-2 completion RPC timeout must be disabled symmetrically")

@@ -47,6 +47,31 @@ function closeEnough(actual, expected, tolerance = 1e-12) {
     `expected ${actual} to be within ${tolerance} of ${expected}`)
 }
 
+function geometricMean(values) {
+  return Math.exp(values.reduce((sum, value) => sum + Math.log(value), 0) / values.length)
+}
+
+function expectedIntactBlockInterval(blockValues) {
+  let state = 0x517a9e31 >>> 0
+  const randomIndex = length => {
+    state ^= state << 13
+    state ^= state >>> 17
+    state ^= state << 5
+    return (state >>> 0) % length
+  }
+  const distribution = []
+  for (let iteration = 0; iteration < 20_000; iteration++) {
+    const selected = Array.from(
+      { length: 5 },
+      () => blockValues[randomIndex(blockValues.length)],
+    )
+    distribution.push(geometricMean(selected))
+  }
+  distribution.sort((a, b) => a - b)
+  return [distribution[Math.ceil(distribution.length * 0.025) - 1],
+    distribution[Math.ceil(distribution.length * 0.975) - 1]]
+}
+
 const contentSHA256 = sha256('canonical measured content')
 const rawOutputSHA256 = sha256('canonical measured raw output')
 
@@ -65,34 +90,63 @@ function preconditioningSample(mean = 10) {
   }
 }
 
-function intervalsFor(client, pair, scenario, measurementIndex) {
+function measurementDefinition(client, pair, scenario, measurementIndex) {
+  let tokensPerSecond = 1000
   if (scenario === 'boundary') {
-    // 21 / 20 is exactly the contractual 1.05 decision boundary after each
-    // per-process arithmetic mean is formed.
-    return Array(999).fill(client === 'swift' ? 21 : 20)
+    // Raw public latency is equal. Only the server-normalized factor reaches
+    // the exact contractual boundary: 1 / (1000 / 1050) == 1.05.
+    tokensPerSecond = client === 'swift' ? 1050 : 1000
+    return { intervals: Array(999).fill(1), tokensPerSecond }
+  }
+  if (scenario === 'normalized-factor-fail') {
+    tokensPerSecond = client === 'swift' ? 1060 : 1000
+    return { intervals: Array(999).fill(1), tokensPerSecond }
   }
   if (scenario === 'inconclusive') {
     const ratio = pair < 5 ? 1.0 : 1.1
-    return Array(999).fill(client === 'swift' ? ratio : 1)
+    return { intervals: Array(999).fill(client === 'swift' ? ratio : 1), tokensPerSecond }
   }
   if (scenario === 'p99-regression') {
-    if (client === 'node') return Array(999).fill(1)
-    return [...Array(979).fill(1), ...Array(20).fill(1.06)]
+    const intervals = client === 'node'
+      ? Array(999).fill(1)
+      : [...Array(979).fill(1), ...Array(20).fill(1.06)]
+    return { intervals, tokensPerSecond }
   }
   if (scenario === 'one-measurement-regression') {
     const ratio = client === 'swift' && measurementIndex === 2 ? 1.12 : 1
-    return Array(999).fill(ratio)
+    return { intervals: Array(999).fill(ratio), tokensPerSecond }
   }
   if (scenario === 'strong-order-effect') {
     const ratio = pair % 2 === 0 ? 0.8 : 1.2
-    return Array(999).fill(client === 'swift' ? ratio : 1)
+    return { intervals: Array(999).fill(client === 'swift' ? ratio : 1), tokensPerSecond }
+  }
+  if (scenario === 'backend-throughput-variation') {
+    tokensPerSecond = client === 'swift' ? 167 : 115
+    const factor = 1.02
+    return { intervals: Array(999).fill(factor * 1000 / tokensPerSecond), tokensPerSecond }
+  }
+  if (scenario === 'raw-mean-diagnostic-regression') {
+    if (client === 'node') return { intervals: Array(999).fill(1), tokensPerSecond }
+    const intervals = [...Array(998).fill(1), 300.7]
+    tokensPerSecond = 1000 / 1.3
+    return { intervals, tokensPerSecond }
+  }
+  if (scenario === 'strong-shared-block-effect') {
+    const blockEffects = [0.70, 0.85, 1.00, 1.15, 1.30]
+    const ratio = blockEffects[Math.floor(pair / 2)]
+    return { intervals: Array(999).fill(client === 'swift' ? ratio : 1), tokensPerSecond }
   }
   const ratio = scenario === 'fail' ? 1.06 : 1.04
-  return Array(999).fill(client === 'swift' ? ratio : 1)
+  return { intervals: Array(999).fill(client === 'swift' ? ratio : 1), tokensPerSecond }
 }
 
 function measurementFor(client, pair, scenario, measurementIndex) {
-  const intervals = intervalsFor(client, pair, scenario, measurementIndex)
+  const { intervals, tokensPerSecond } = measurementDefinition(
+    client,
+    pair,
+    scenario,
+    measurementIndex,
+  )
   // Synthetic process evidence must remain independently identifiable even
   // when a scenario deliberately gives several runs identical interval data.
   const arrivals = [
@@ -113,7 +167,7 @@ function measurementFor(client, pair, scenario, measurementIndex) {
     stop_reason: 'length',
     stats: {
       timeToFirstToken: 50,
-      tokensPerSecond: 100,
+      tokensPerSecond,
       cacheTokens: 0,
       promptTokens: 25,
       generatedTokens: 1000,
@@ -216,7 +270,7 @@ function runAnalyzer(testCase, outputName = 'result.json', paths = testCase.runP
 
 function assertInvalid(result, reasonPattern) {
   assert.equal(result.process.status, 3, result.process.stderr || result.process.stdout)
-  assert.equal(result.report.schema_version, 5)
+  assert.equal(result.report.schema_version, 6)
   assert.equal(result.report.status, 'invalid')
   assert.match(result.report.reason, reasonPattern)
   assert.match(result.process.stderr, /\[bench\] invalid:/)
@@ -248,6 +302,15 @@ try {
     2,
     'Swift and Node benchmark processes must both clear ambient QVAC overrides',
   )
+  assert.match(orchestratorSource,
+    /workload\.schema_version !== 3/,
+    'orchestrator must require workload schema 3')
+  assert.match(orchestratorSource,
+    /normalized_mean_factor_formula[\s\S]*mean_token_interval_ms \/ \(1000 \/ stats\.tokensPerSecond\)/,
+    'orchestrator must pin the server-normalized mean formula')
+  assert.match(orchestratorSource,
+    /normalized_mean_process_aggregation[\s\S]*arithmetic_mean\(exactly_3_completion_factors\)/,
+    'orchestrator must pin the three-completion aggregation')
   const nodeCompletionBody = nodeHarnessSource.slice(
     nodeHarnessSource.indexOf('async function runCompletion('),
     nodeHarnessSource.indexOf('\nconst modelStat =', nodeHarnessSource.indexOf('async function runCompletion(')),
@@ -265,14 +328,30 @@ try {
   assert.ok(swiftCompletionBody.includes('let run = try await client.completion(')
       && !swiftCompletionBody.includes('rpcOptions:'),
   'Swift measured completion must rely solely on the common process watchdog')
+  assert.equal(canonicalWorkload.schema_version, 3)
+  assert.equal(
+    canonicalWorkload.measurement.normalized_mean_factor_formula,
+    'mean_token_interval_ms / (1000 / stats.tokensPerSecond)',
+  )
+  assert.equal(
+    canonicalWorkload.measurement.normalized_mean_process_aggregation,
+    'arithmetic_mean(exactly_3_completion_factors)',
+  )
+  assert.match(nodeCompletionBody,
+    /Number\.isFinite\(final\.stats\?\.tokensPerSecond\)[\s\S]*final\.stats\.tokensPerSecond > 0/,
+  'Node harness must reject missing, non-finite, and non-positive worker throughput')
+  assert.match(swiftCompletionBody,
+    /let tokensPerSecond = stats\.tokensPerSecond,[\s\S]*tokensPerSecond\.isFinite,[\s\S]*tokensPerSecond > 0/,
+  'Swift harness must reject missing, non-finite, and non-positive worker throughput')
 
   const passCase = makeCase('pass')
   const pass = runAnalyzer(passCase)
   assert.equal(pass.process.status, 0, pass.process.stderr || pass.process.stdout)
-  assert.equal(pass.report.schema_version, 5)
+  assert.equal(pass.report.schema_version, 6)
   assert.equal(pass.report.status, 'pass')
   assert.equal(pass.report.maximum_overhead_ratio, 1.05)
   assert.equal(pass.report.source_commit, sourceCommit)
+  assert.equal(pass.report.process_blocks, 5)
   assert.equal(pass.report.process_pairs, 10)
   assert.equal(pass.report.process_order, order.join('/'))
   assert.equal(pass.report.ordered_process_runs.length, 20)
@@ -282,7 +361,9 @@ try {
   assert.equal(pass.report.statistical_method.retries, 0)
   assert.equal(pass.report.statistical_method.measured_completions_per_process, 3)
   assert.equal(pass.report.statistical_method.intervals_per_process, 2997)
-  assert.deepEqual(pass.report.statistical_method.bootstrap_order_strata, {
+  assert.equal(pass.report.statistical_method.bootstrap_block_count, 5)
+  assert.equal(pass.report.statistical_method.pairs_per_bootstrap_block, 2)
+  assert.deepEqual(pass.report.statistical_method.designed_pair_order_counts, {
     'swift/node': 5,
     'node/swift': 5,
   })
@@ -295,31 +376,42 @@ try {
     run.preconditioning.length === 2 && run.measurements.length === 3))
   assert.ok(pass.report.pairs.every(pair =>
     pair.swift.token_interval_count === 2997 && pair.node.token_interval_count === 2997))
-  assert.equal(pass.report.metrics.mean_token_interval.status, 'pass')
+  assert.equal(pass.report.metrics.normalized_mean_overhead_factor.status, 'pass')
   assert.equal(pass.report.metrics.p99_token_interval.status, 'pass')
-  closeEnough(pass.report.metrics.mean_token_interval.ratio, 1.04)
+  closeEnough(pass.report.metrics.normalized_mean_overhead_factor.ratio, 1.04)
+  closeEnough(pass.report.metrics.raw_mean_token_interval_diagnostic.ratio, 1.04)
   closeEnough(pass.report.metrics.p99_token_interval.ratio, 1.04)
 
   const fail = runAnalyzer(makeCase('fail', { scenario: 'fail' }))
   assert.equal(fail.process.status, 1, fail.process.stderr || fail.process.stdout)
   assert.equal(fail.report.status, 'fail')
-  assert.equal(fail.report.metrics.mean_token_interval.status, 'fail')
+  assert.equal(fail.report.metrics.normalized_mean_overhead_factor.status, 'fail')
   assert.equal(fail.report.metrics.p99_token_interval.status, 'fail')
 
   const boundary = runAnalyzer(makeCase('strict-boundary', { scenario: 'boundary' }))
   assert.equal(boundary.process.status, 1, boundary.process.stderr || boundary.process.stdout)
   assert.equal(boundary.report.status, 'fail')
-  assert.equal(boundary.report.metrics.mean_token_interval.status, 'fail')
-  assert.equal(boundary.report.metrics.p99_token_interval.status, 'fail')
-  closeEnough(boundary.report.metrics.mean_token_interval.ratio_ci95[0], 1.05)
-  closeEnough(boundary.report.metrics.mean_token_interval.ratio_ci95[1], 1.05)
+  assert.equal(boundary.report.metrics.normalized_mean_overhead_factor.status, 'fail')
+  assert.equal(boundary.report.metrics.p99_token_interval.status, 'pass')
+  closeEnough(boundary.report.metrics.normalized_mean_overhead_factor.ratio_ci95[0], 1.05)
+  closeEnough(boundary.report.metrics.normalized_mean_overhead_factor.ratio_ci95[1], 1.05)
+
+  const normalizedFailure = runAnalyzer(makeCase('normalized-factor-fail', {
+    scenario: 'normalized-factor-fail',
+  }))
+  assert.equal(normalizedFailure.process.status, 1,
+    normalizedFailure.process.stderr || normalizedFailure.process.stdout)
+  assert.equal(normalizedFailure.report.status, 'fail')
+  closeEnough(normalizedFailure.report.metrics.normalized_mean_overhead_factor.ratio, 1.06)
+  assert.equal(normalizedFailure.report.metrics.normalized_mean_overhead_factor.status, 'fail')
+  assert.equal(normalizedFailure.report.metrics.p99_token_interval.status, 'pass')
 
   const inconclusive = runAnalyzer(makeCase('inconclusive', { scenario: 'inconclusive' }))
   assert.equal(inconclusive.process.status, 2,
     inconclusive.process.stderr || inconclusive.process.stdout)
   assert.equal(inconclusive.report.status, 'inconclusive')
-  assert.ok(inconclusive.report.metrics.mean_token_interval.ratio_ci95[0] <= 1.05)
-  assert.ok(inconclusive.report.metrics.mean_token_interval.ratio_ci95[1] > 1.05)
+  assert.ok(inconclusive.report.metrics.normalized_mean_overhead_factor.ratio_ci95[0] <= 1.05)
+  assert.ok(inconclusive.report.metrics.normalized_mean_overhead_factor.ratio_ci95[1] > 1.05)
 
   const strongOrderEffect = runAnalyzer(makeCase('strong-order-effect', {
     scenario: 'strong-order-effect',
@@ -327,19 +419,20 @@ try {
   assert.equal(strongOrderEffect.process.status, 0,
     strongOrderEffect.process.stderr || strongOrderEffect.process.stdout)
   const balancedOrderRatio = Math.sqrt(0.8 * 1.2)
-  closeEnough(strongOrderEffect.report.metrics.mean_token_interval.ratio, balancedOrderRatio)
-  closeEnough(strongOrderEffect.report.metrics.mean_token_interval.ratio_ci95[0],
+  closeEnough(strongOrderEffect.report.metrics.normalized_mean_overhead_factor.ratio,
     balancedOrderRatio)
-  closeEnough(strongOrderEffect.report.metrics.mean_token_interval.ratio_ci95[1],
+  closeEnough(strongOrderEffect.report.metrics.normalized_mean_overhead_factor.ratio_ci95[0],
+    balancedOrderRatio)
+  closeEnough(strongOrderEffect.report.metrics.normalized_mean_overhead_factor.ratio_ci95[1],
     balancedOrderRatio)
 
   const tailFailure = runAnalyzer(makeCase('p99-regression', { scenario: 'p99-regression' }))
   assert.equal(tailFailure.process.status, 1,
     tailFailure.process.stderr || tailFailure.process.stdout)
   assert.equal(tailFailure.report.status, 'fail')
-  assert.equal(tailFailure.report.metrics.mean_token_interval.status, 'pass')
+  assert.equal(tailFailure.report.metrics.normalized_mean_overhead_factor.status, 'pass')
   assert.equal(tailFailure.report.metrics.p99_token_interval.status, 'fail')
-  assert.ok(tailFailure.report.metrics.mean_token_interval.ratio < 1.01)
+  assert.ok(tailFailure.report.metrics.normalized_mean_overhead_factor.ratio < 1.01)
   closeEnough(tailFailure.report.metrics.p99_token_interval.ratio, 1.06)
 
   const retainedRegression = runAnalyzer(makeCase('one-measurement-regression', {
@@ -348,8 +441,49 @@ try {
   assert.equal(retainedRegression.process.status, 1,
     retainedRegression.process.stderr || retainedRegression.process.stdout)
   assert.equal(retainedRegression.report.status, 'fail')
-  closeEnough(retainedRegression.report.metrics.mean_token_interval.ratio, 1.04)
+  closeEnough(retainedRegression.report.metrics.normalized_mean_overhead_factor.ratio, 1.04)
   closeEnough(retainedRegression.report.metrics.p99_token_interval.ratio, 1.12)
+
+  const backendVariation = runAnalyzer(makeCase('backend-throughput-variation', {
+    scenario: 'backend-throughput-variation',
+  }))
+  assert.equal(backendVariation.process.status, 0,
+    backendVariation.process.stderr || backendVariation.process.stdout)
+  assert.equal(backendVariation.report.status, 'pass')
+  closeEnough(backendVariation.report.metrics.normalized_mean_overhead_factor.ratio, 1)
+  closeEnough(backendVariation.report.metrics.worker_tokens_per_second_diagnostic.ratio,
+    167 / 115)
+  closeEnough(backendVariation.report.metrics.raw_mean_token_interval_diagnostic.ratio,
+    115 / 167)
+  assert.equal(backendVariation.report.metrics.p99_token_interval.status, 'pass')
+  assert.ok(backendVariation.report.ordered_process_runs.some(run =>
+    run.measurements.some(measurement => measurement.stats.tokensPerSecond === 115)))
+  assert.ok(backendVariation.report.ordered_process_runs.some(run =>
+    run.measurements.some(measurement => measurement.stats.tokensPerSecond === 167)))
+
+  const rawMeanDiagnostic = runAnalyzer(makeCase('raw-mean-diagnostic-regression', {
+    scenario: 'raw-mean-diagnostic-regression',
+  }))
+  assert.equal(rawMeanDiagnostic.process.status, 0,
+    rawMeanDiagnostic.process.stderr || rawMeanDiagnostic.process.stdout)
+  assert.equal(rawMeanDiagnostic.report.status, 'pass')
+  closeEnough(rawMeanDiagnostic.report.metrics.normalized_mean_overhead_factor.ratio, 1)
+  closeEnough(rawMeanDiagnostic.report.metrics.raw_mean_token_interval_diagnostic.ratio, 1.3)
+  closeEnough(rawMeanDiagnostic.report.metrics.p99_token_interval.ratio, 1)
+
+  const sharedBlockEffects = [0.70, 0.85, 1.00, 1.15, 1.30]
+  const sharedBlock = runAnalyzer(makeCase('strong-shared-block-effect', {
+    scenario: 'strong-shared-block-effect',
+  }))
+  assert.equal(sharedBlock.process.status, 2,
+    sharedBlock.process.stderr || sharedBlock.process.stdout)
+  const expectedBlockCI = expectedIntactBlockInterval(sharedBlockEffects)
+  closeEnough(sharedBlock.report.metrics.normalized_mean_overhead_factor.ratio_ci95[0],
+    expectedBlockCI[0])
+  closeEnough(sharedBlock.report.metrics.normalized_mean_overhead_factor.ratio_ci95[1],
+    expectedBlockCI[1])
+  closeEnough(sharedBlock.report.metrics.p99_token_interval.ratio_ci95[0], expectedBlockCI[0])
+  closeEnough(sharedBlock.report.metrics.p99_token_interval.ratio_ci95[1], expectedBlockCI[1])
 
   const deterministicA = runAnalyzer(passCase, 'deterministic-a.json')
   const deterministicB = runAnalyzer(passCase, 'deterministic-b.json')
@@ -435,6 +569,14 @@ try {
     mutateSamples: samples => { samples[6].measurements[2].token_intervals_ms[10] = null },
   })), /must be finite/)
 
+  assertInvalid(runAnalyzer(makeCase('missing-worker-tps', {
+    mutateSamples: samples => { delete samples[6].measurements[2].stats.tokensPerSecond },
+  })), /measurement 3\.stats keys must be exactly/)
+
+  assertInvalid(runAnalyzer(makeCase('zero-worker-tps', {
+    mutateSamples: samples => { samples[6].measurements[2].stats.tokensPerSecond = 0 },
+  })), /tokensPerSecond must be positive/)
+
   assertInvalid(runAnalyzer(makeCase('preconditioning-output-mismatch', {
     mutateSamples: samples => {
       samples[7].preconditioning[1].raw_output_sha256 = sha256('different preconditioning')
@@ -469,6 +611,18 @@ try {
     mutateWorkload: workload => { workload.measurement.maximum_overhead_ratio = 1.051 },
   })), /maximum_overhead_ratio/)
 
+  assertInvalid(runAnalyzer(makeCase('normalized-formula-override', {
+    mutateWorkload: workload => {
+      workload.measurement.normalized_mean_factor_formula = 'mean_token_interval_ms'
+    },
+  })), /normalized_mean_factor_formula/)
+
+  assertInvalid(runAnalyzer(makeCase('normalized-aggregation-override', {
+    mutateWorkload: workload => {
+      workload.measurement.normalized_mean_process_aggregation = 'geometric_mean'
+    },
+  })), /normalized_mean_process_aggregation/)
+
   assertInvalid(runAnalyzer(makeCase('preconditioning-count-override', {
     mutateWorkload: workload => { workload.preconditioning.completions = 1 },
   })), /preconditioning\.completions/)
@@ -497,7 +651,7 @@ try {
     mutateSamples: samples => { samples[0].preconditioning[0].token_count = 999 },
   })
   const staleOutput = join(atomicInvalidCase.directory, 'result.json')
-  writeFileSync(staleOutput, '{"schema_version":5,"status":"pass"}\n')
+  writeFileSync(staleOutput, '{"schema_version":6,"status":"pass"}\n')
   const atomicInvalid = runAnalyzer(atomicInvalidCase)
   assertInvalid(atomicInvalid, /token_count/)
   assert.equal(readdirSync(atomicInvalidCase.directory)
@@ -505,7 +659,7 @@ try {
   'atomic evidence write left a temporary file behind')
 
   console.log(
-    '[bench-test] schema-5 fixed preconditioning, three-measurement pooling, pass/fail/inconclusive, strict 5% boundary, co-primary tail gate, deterministic order-stratified paired bootstrap, atomic invalid evidence, and strict provenance guards passed',
+    '[bench-test] schema-6 server-normalized mean factor, raw p99 co-primary gate, fixed 2+3 completions, strict 5% boundary, intact-ABBA-block bootstrap, backend-variance isolation, atomic invalid evidence, and strict provenance guards passed',
   )
 } finally {
   rmSync(root, { recursive: true, force: true })

@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "criterion": "Streaming completion latency overhead (Swift client vs. JS client on same machine) < 5%.",
   "model": {
     "name": "SmolLM2-135M-Instruct-Q4_K_M.gguf",
@@ -41,7 +41,9 @@
     "completions_per_process": 3,
     "process_pairs": 10,
     "bootstrap_iterations": 20000,
-    "maximum_overhead_ratio": 1.05
+    "maximum_overhead_ratio": 1.05,
+    "normalized_mean_factor_formula": "mean_token_interval_ms / (1000 / stats.tokensPerSecond)",
+    "normalized_mean_process_aggregation": "arithmetic_mean(exactly_3_completion_factors)"
   },
   "timeouts": {
     "model_load_ms": 180000,

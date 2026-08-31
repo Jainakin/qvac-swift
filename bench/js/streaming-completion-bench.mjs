@@ -72,7 +72,7 @@ function generationParams(predict) {
 }
 
 function validateWorkload() {
-  requireCondition(workload.schema_version === 2, 'workload schema_version must be 2')
+  requireCondition(workload.schema_version === 3, 'workload schema_version must be 3')
   requireCondition(
     workload.criterion === 'Streaming completion latency overhead (Swift client vs. JS client on same machine) < 5%.',
     'workload criterion does not match grant KR-2',
@@ -93,7 +93,11 @@ function validateWorkload() {
     && workload.measurement.completions_per_process === 3
     && workload.measurement.process_pairs === 10
     && workload.measurement.bootstrap_iterations === 20000
-    && workload.measurement.maximum_overhead_ratio === 1.05,
+    && workload.measurement.maximum_overhead_ratio === 1.05
+    && workload.measurement.normalized_mean_factor_formula
+      === 'mean_token_interval_ms / (1000 / stats.tokensPerSecond)'
+    && workload.measurement.normalized_mean_process_aggregation
+      === 'arithmetic_mean(exactly_3_completion_factors)',
   'workload measurement policy violates the fixed KR-2 protocol')
   requireCondition(workload.timeouts.model_load_ms === 180000
     && workload.timeouts.completion_rpc_timeout === 'none'
@@ -145,6 +149,9 @@ async function runCompletion(modelId, predict) {
     `expected generatedTokens=${predict}, got ${final.stats?.generatedTokens}`)
   requireCondition(final.stats?.emittedTokens === predict,
     `expected emittedTokens=${predict}, got ${final.stats?.emittedTokens}`)
+  requireCondition(Number.isFinite(final.stats?.tokensPerSecond)
+    && final.stats.tokensPerSecond > 0,
+  `completion must report finite positive tokensPerSecond, got ${final.stats?.tokensPerSecond}`)
   requireCondition(typeof final.stats?.backendDevice === 'string',
     'completion did not report a backend device')
   requireCondition(typeof terminalLatency === 'number' && terminalLatency >= arrivals.at(-1),

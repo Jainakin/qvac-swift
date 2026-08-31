@@ -9,11 +9,13 @@ import { fileURLToPath } from 'node:url'
 const [outputPath, workloadPath, ...runPaths] = process.argv.slice(2)
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
-const ORDER_STRATA = ['swift/node', 'node/swift']
-const PAIRS_PER_ORDER_STRATUM = 5
+const PAIR_ORDERS = ['swift/node', 'node/swift']
+const PAIRS_PER_ORDER = 5
+const BLOCK_COUNT = 5
+const PAIRS_PER_BLOCK = 2
 const EXPECTED_PAIR_ORDERS = Array.from(
   { length: 10 },
-  (_, pair) => ORDER_STRATA[pair % ORDER_STRATA.length],
+  (_, pair) => PAIR_ORDERS[pair % PAIR_ORDERS.length],
 )
 const EXPECTED_ORDER = EXPECTED_PAIR_ORDERS.flatMap(order => order.split('/'))
 const FIXED_BUDGET = 1.05
@@ -21,9 +23,9 @@ const BOOTSTRAP_SEED = 0x517a9e31
 const SHA256_PATTERN = /^[0-9a-f]{64}$/
 const SOURCE_COMMIT_PATTERN = /^[0-9a-f]{40}$/
 const RUN_SCHEMA_VERSION = 2
-const REPORT_SCHEMA_VERSION = 5
+const REPORT_SCHEMA_VERSION = 6
 const WORKLOAD_CONTRACT = {
-  schema_version: 2,
+  schema_version: 3,
   criterion: 'Streaming completion latency overhead (Swift client vs. JS client on same machine) < 5%.',
   model: {
     name: 'SmolLM2-135M-Instruct-Q4_K_M.gguf',
@@ -66,6 +68,10 @@ const WORKLOAD_CONTRACT = {
     process_pairs: 10,
     bootstrap_iterations: 20_000,
     maximum_overhead_ratio: FIXED_BUDGET,
+    normalized_mean_factor_formula:
+      'mean_token_interval_ms / (1000 / stats.tokensPerSecond)',
+    normalized_mean_process_aggregation:
+      'arithmetic_mean(exactly_3_completion_factors)',
   },
   timeouts: {
     model_load_ms: 180_000,
@@ -191,23 +197,29 @@ function makeRandomIndex(seed) {
   }
 }
 
-// Resample adjacent process pairs as intact clusters within the two fixed order
-// strata. Every replicate preserves the designed five Swift-first and five
-// Node-first pairs, along with endpoint dependence and temporal matching.
+// Resample five adjacent four-process ABBA blocks as intact clusters. Each
+// block contains one Swift/Node pair followed by one Node/Swift pair, so every
+// replicate preserves both execution orientations, their shared thermal
+// regime, endpoint dependence, and temporal matching.
 function bootstrapPairedMetrics(pairs, iterations, keys) {
   const randomIndex = makeRandomIndex(BOOTSTRAP_SEED)
   const distributions = Object.fromEntries(keys.map(key => [key, []]))
-  const strata = ORDER_STRATA.map(order => {
-    const members = pairs.filter(pair => pair.order === order)
-    requireCondition(members.length === PAIRS_PER_ORDER_STRATUM,
-      `benchmark requires exactly ${PAIRS_PER_ORDER_STRATUM} ${order} pairs`)
+  requireCondition(pairs.length === BLOCK_COUNT * PAIRS_PER_BLOCK,
+    `benchmark requires exactly ${BLOCK_COUNT} four-process ABBA blocks`)
+  const blocks = Array.from({ length: BLOCK_COUNT }, (_, blockIndex) => {
+    const members = pairs.slice(
+      blockIndex * PAIRS_PER_BLOCK,
+      (blockIndex + 1) * PAIRS_PER_BLOCK,
+    )
+    requireCondition(members.map(pair => pair.order).join(',') === PAIR_ORDERS.join(','),
+      `benchmark block ${blockIndex + 1} must be one intact swift/node,node/swift ABBA block`)
     return members
   })
   for (let iteration = 0; iteration < iterations; iteration++) {
-    const selected = strata.flatMap(members => Array.from(
-      { length: PAIRS_PER_ORDER_STRATUM },
-      () => members[randomIndex(members.length)],
-    ))
+    const selected = Array.from(
+      { length: BLOCK_COUNT },
+      () => blocks[randomIndex(blocks.length)],
+    ).flat()
     for (const key of keys) {
       distributions[key].push(geometricMean(selected.map(pair => pair[key])))
     }
@@ -272,7 +284,8 @@ function validateWorkload(workload) {
 
   requireExactKeys(workload.measurement,
     ['predict', 'completions_per_process', 'process_pairs', 'bootstrap_iterations',
-      'maximum_overhead_ratio'],
+      'maximum_overhead_ratio', 'normalized_mean_factor_formula',
+      'normalized_mean_process_aggregation'],
     'workload.measurement')
   requireExactValue(workload.measurement.predict, WORKLOAD_CONTRACT.measurement.predict,
     'workload.measurement.predict')
@@ -286,6 +299,12 @@ function validateWorkload(workload) {
   requireExactValue(workload.measurement.bootstrap_iterations,
     WORKLOAD_CONTRACT.measurement.bootstrap_iterations,
     'workload.measurement.bootstrap_iterations')
+  requireExactValue(workload.measurement.normalized_mean_factor_formula,
+    WORKLOAD_CONTRACT.measurement.normalized_mean_factor_formula,
+    'workload.measurement.normalized_mean_factor_formula')
+  requireExactValue(workload.measurement.normalized_mean_process_aggregation,
+    WORKLOAD_CONTRACT.measurement.normalized_mean_process_aggregation,
+    'workload.measurement.normalized_mean_process_aggregation')
 
   requireExactKeys(workload.timeouts,
     ['model_load_ms', 'completion_rpc_timeout', 'process_watchdog_seconds'], 'workload.timeouts')
@@ -351,12 +370,13 @@ function validateStats(stats, workload, runNumber, measurementNumber) {
     'generatedTokens', 'emittedTokens', 'avgConcurrentSeq',
   ]
   requireExactKeys(stats, [...numericKeys, 'backendDevice'], name)
-  for (const key of numericKeys) {
+  for (const key of numericKeys.filter(key => key !== 'tokensPerSecond')) {
     if (stats[key] !== undefined && stats[key] !== null) {
       validateNumber(stats[key], `${name}.${key}`, { positive: false })
       requireCondition(stats[key] >= 0, `${name}.${key} must be non-negative`)
     }
   }
+  validateNumber(stats.tokensPerSecond, `${name}.tokensPerSecond`)
   requireExactValue(stats.generatedTokens, workload.measurement.predict,
     `${name}.generatedTokens`)
   requireExactValue(stats.emittedTokens, workload.measurement.predict,
@@ -483,19 +503,36 @@ function validateRun(run, workload, workloadSha256, runNumber, expectedClient) {
 
 function runSummary(run, inputSHA256, index) {
   const intervals = run.measurements.flatMap(measurement => measurement.token_intervals_ms)
-  const completionSummaries = run.measurements.map((measurement, measurementIndex) => ({
-    measurement: measurementIndex + 1,
-    mean_token_interval_ms: mean(measurement.token_intervals_ms),
-    p99_token_interval_ms: empiricalQuantile(measurement.token_intervals_ms, 0.99),
-    ttft_ms: measurement.ttft_ms,
-    terminal_ms: measurement.terminal_ms,
-  }))
+  const completionSummaries = run.measurements.map((measurement, measurementIndex) => {
+    const publicMeanInterval = mean(measurement.token_intervals_ms)
+    const workerTokensPerSecond = measurement.stats.tokensPerSecond
+    const workerInterval = 1000 / workerTokensPerSecond
+    return {
+      measurement: measurementIndex + 1,
+      normalized_mean_overhead_factor: publicMeanInterval / workerInterval,
+      mean_token_interval_ms: publicMeanInterval,
+      p99_token_interval_ms: empiricalQuantile(measurement.token_intervals_ms, 0.99),
+      worker_interval_ms: workerInterval,
+      worker_tokens_per_second: workerTokensPerSecond,
+      ttft_ms: measurement.ttft_ms,
+      terminal_ms: measurement.terminal_ms,
+    }
+  })
   return {
     position: index + 1,
     input_sha256: inputSHA256,
     client: run.client,
+    normalized_mean_overhead_factor: mean(completionSummaries.map(
+      completion => completion.normalized_mean_overhead_factor,
+    )),
     mean_token_interval_ms: mean(intervals),
     p99_token_interval_ms: empiricalQuantile(intervals, 0.99),
+    worker_mean_interval_ms: mean(completionSummaries.map(
+      completion => completion.worker_interval_ms,
+    )),
+    worker_mean_tokens_per_second: mean(completionSummaries.map(
+      completion => completion.worker_tokens_per_second,
+    )),
     measurement_completion_count: run.measurements.length,
     token_interval_count: intervals.length,
     ttft_ms: mean(run.measurements.map(measurement => measurement.ttft_ms)),
@@ -531,10 +568,10 @@ function analyze() {
       `pair ${pairIndex + 1} must contain exactly one Swift and one Node process`)
     return clients.join('/')
   })
-  for (const order of ORDER_STRATA) {
+  for (const order of PAIR_ORDERS) {
     requireCondition(
-      observedPairOrders.filter(observed => observed === order).length === PAIRS_PER_ORDER_STRATUM,
-      `benchmark requires exactly ${PAIRS_PER_ORDER_STRATUM} ${order} pairs`,
+      observedPairOrders.filter(observed => observed === order).length === PAIRS_PER_ORDER,
+      `benchmark requires exactly ${PAIRS_PER_ORDER} ${order} pairs`,
     )
   }
   requireCondition(runs.map(run => run?.client).join(',') === EXPECTED_ORDER.join(','),
@@ -573,8 +610,13 @@ function analyze() {
     pairs.push({
       pair: pairIndex + 1,
       order: members.map(run => run.client).join('/'),
-      mean_ratio: swift.mean_token_interval_ms / node.mean_token_interval_ms,
+      normalized_mean_factor_ratio: swift.normalized_mean_overhead_factor
+        / node.normalized_mean_overhead_factor,
+      raw_mean_ratio: swift.mean_token_interval_ms / node.mean_token_interval_ms,
       p99_ratio: swift.p99_token_interval_ms / node.p99_token_interval_ms,
+      worker_interval_ratio: swift.worker_mean_interval_ms / node.worker_mean_interval_ms,
+      worker_tps_ratio: swift.worker_mean_tokens_per_second
+        / node.worker_mean_tokens_per_second,
       ttft_ratio: swift.ttft_ms / node.ttft_ms,
       terminal_ratio: swift.terminal_ms / node.terminal_ms,
       swift,
@@ -582,7 +624,10 @@ function analyze() {
     })
   }
 
-  const metricKeys = ['mean_ratio', 'p99_ratio', 'ttft_ratio', 'terminal_ratio']
+  const metricKeys = [
+    'normalized_mean_factor_ratio', 'p99_ratio', 'raw_mean_ratio',
+    'worker_interval_ratio', 'worker_tps_ratio', 'ttft_ratio', 'terminal_ratio',
+  ]
   const bootstrap = bootstrapPairedMetrics(
     pairs,
     workload.measurement.bootstrap_iterations,
@@ -600,9 +645,9 @@ function analyze() {
     return value
   }
   const metrics = {
-    mean_token_interval: metric(
-      'mean_ratio',
-      'geometric mean of paired per-process pooled arithmetic-mean inter-token latency ratios',
+    normalized_mean_overhead_factor: metric(
+      'normalized_mean_factor_ratio',
+      'geometric mean of paired per-process server-normalized public mean inter-token latency factor ratios',
       true,
     ),
     p99_token_interval: metric(
@@ -610,12 +655,27 @@ function analyze() {
       'geometric mean of paired per-process pooled empirical nearest-rank p99 inter-token latency ratios',
       true,
     ),
+    raw_mean_token_interval_diagnostic: metric(
+      'raw_mean_ratio',
+      'geometric mean of paired per-process pooled arithmetic-mean public inter-token latency ratios',
+      false,
+    ),
+    worker_interval_diagnostic: metric(
+      'worker_interval_ratio',
+      'geometric mean of paired per-process mean worker interval ratios derived as 1000 / stats.tokensPerSecond',
+      false,
+    ),
+    worker_tokens_per_second_diagnostic: metric(
+      'worker_tps_ratio',
+      'geometric mean of paired per-process arithmetic-mean stats.tokensPerSecond ratios',
+      false,
+    ),
     ttft_diagnostic: metric(
       'ttft_ratio', 'per-process mean time to first public content delta', false),
     terminal_diagnostic: metric(
       'terminal_ratio', 'per-process mean request start to public completionDone event', false),
   }
-  const primary = [metrics.mean_token_interval, metrics.p99_token_interval]
+  const primary = [metrics.normalized_mean_overhead_factor, metrics.p99_token_interval]
   const status = primary.every(value => value.status === 'pass')
     ? 'pass'
     : primary.some(value => value.status === 'fail') ? 'fail' : 'inconclusive'
@@ -630,21 +690,27 @@ function analyze() {
     workload,
     runtime_contract: '@qvac/sdk@0.17.0 via tools/runtime/package-lock.json',
     process_order: EXPECTED_ORDER.join('/'),
+    process_blocks: BLOCK_COUNT,
     process_pairs: workload.measurement.process_pairs,
     statistical_method: {
-      experimental_unit: 'adjacent Swift/Node process pair, with allocation stratified by execution order',
+      experimental_unit: 'adjacent four-process swift,node,node,swift ABBA block containing two opposite-orientation Swift/Node pairs',
+      bootstrap_cluster: 'intact adjacent four-process swift,node,node,swift ABBA block containing two opposite-orientation pairs in one shared thermal regime',
+      bootstrap_block_count: BLOCK_COUNT,
+      pairs_per_bootstrap_block: PAIRS_PER_BLOCK,
       measured_completions_per_process: workload.measurement.completions_per_process,
       intervals_per_process: workload.measurement.completions_per_process
         * (workload.measurement.predict - 1),
-      per_process_mean: 'arithmetic mean of every positive inter-contentDelta interval pooled across all three fixed measured completions',
+      normalized_completion_factor: workload.measurement.normalized_mean_factor_formula,
+      per_process_normalized_mean_factor: workload.measurement.normalized_mean_process_aggregation,
+      per_process_raw_mean_diagnostic: 'arithmetic mean of every positive inter-contentDelta interval pooled across all three fixed measured completions',
       per_process_p99: 'empirical nearest-rank p99 of every positive inter-contentDelta interval pooled across all three fixed measured completions',
-      diagnostic_aggregation: 'arithmetic mean of the three completion-level TTFT or terminal latencies within each process',
+      diagnostic_aggregation: 'arithmetic mean of the three completion-level raw mean, worker interval, worker TPS, TTFT, or terminal observations within each process',
       point_estimate: 'geometric mean of ten paired Swift/Node process ratios',
-      confidence_interval: 'deterministic order-stratified paired-cluster percentile bootstrap, preserving five Swift/Node and five Node/Swift pairs in every replicate, 2.5th–97.5th percentiles',
-      bootstrap_order_strata: Object.fromEntries(
-        ORDER_STRATA.map(order => [order, PAIRS_PER_ORDER_STRATUM]),
+      confidence_interval: 'deterministic intact-ABBA-block percentile bootstrap, resampling exactly five four-process blocks with replacement and preserving both opposite-orientation pairs in every selected block, 2.5th–97.5th percentiles',
+      designed_pair_order_counts: Object.fromEntries(
+        PAIR_ORDERS.map(order => [order, PAIRS_PER_ORDER]),
       ),
-      co_primary_decision: 'both 97.5th-percentile upper bounds must be < 1.05',
+      co_primary_decision: 'both the normalized mean overhead-factor ratio and raw p99 inter-token-latency ratio 97.5th-percentile upper bounds must be < 1.05',
       bootstrap_seed: `0x${BOOTSTRAP_SEED.toString(16)}`,
       bootstrap_iterations: workload.measurement.bootstrap_iterations,
       exclusions: 'none',
@@ -673,10 +739,11 @@ function analyze() {
   }
   atomicWriteJSON(outputPath, report)
   console.log(
-    `[bench] mean=${metrics.mean_token_interval.ratio.toFixed(6)} `
-      + `ci95=[${metrics.mean_token_interval.ratio_ci95.map(value => value.toFixed(6)).join(', ')}] `
+    `[bench] normalized-mean-factor=${metrics.normalized_mean_overhead_factor.ratio.toFixed(6)} `
+      + `ci95=[${metrics.normalized_mean_overhead_factor.ratio_ci95.map(value => value.toFixed(6)).join(', ')}] `
       + `p99=${metrics.p99_token_interval.ratio.toFixed(6)} `
       + `ci95=[${metrics.p99_token_interval.ratio_ci95.map(value => value.toFixed(6)).join(', ')}] `
+      + `raw-mean-diagnostic=${metrics.raw_mean_token_interval_diagnostic.ratio.toFixed(6)} `
       + `budget=${FIXED_BUDGET} status=${status}`,
   )
   if (status === 'fail') process.exitCode = 1

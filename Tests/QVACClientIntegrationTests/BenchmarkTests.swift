@@ -97,6 +97,8 @@ final class BenchmarkTests: XCTestCase {
             let processPairs: Int
             let bootstrapIterations: Int
             let maximumOverheadRatio: Double
+            let normalizedMeanFactorFormula: String
+            let normalizedMeanProcessAggregation: String
 
             enum CodingKeys: String, CodingKey {
                 case predict
@@ -104,6 +106,8 @@ final class BenchmarkTests: XCTestCase {
                 case processPairs = "process_pairs"
                 case bootstrapIterations = "bootstrap_iterations"
                 case maximumOverheadRatio = "maximum_overhead_ratio"
+                case normalizedMeanFactorFormula = "normalized_mean_factor_formula"
+                case normalizedMeanProcessAggregation = "normalized_mean_process_aggregation"
             }
         }
 
@@ -471,6 +475,13 @@ final class BenchmarkTests: XCTestCase {
               stats.backendDevice != nil else {
             throw IntegrationPrerequisiteError("completion stats do not match the fixed workload")
         }
+        guard let tokensPerSecond = stats.tokensPerSecond,
+              tokensPerSecond.isFinite,
+              tokensPerSecond > 0 else {
+            throw IntegrationPrerequisiteError(
+                "completion must report finite positive tokensPerSecond"
+            )
+        }
         guard content == final.contentText else {
             throw IntegrationPrerequisiteError("streamed content does not match CompletionFinal")
         }
@@ -499,7 +510,7 @@ final class BenchmarkTests: XCTestCase {
     }
 
     private static func validate(_ workload: Workload) throws {
-        guard workload.schemaVersion == 2,
+        guard workload.schemaVersion == 3,
               workload.criterion == "Streaming completion latency overhead (Swift client vs. JS client on same machine) < 5%.",
               workload.model.byteCount > 0,
               workload.model.sha256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
@@ -517,6 +528,10 @@ final class BenchmarkTests: XCTestCase {
               workload.measurement.processPairs == 10,
               workload.measurement.bootstrapIterations == 20_000,
               workload.measurement.maximumOverheadRatio == 1.05,
+              workload.measurement.normalizedMeanFactorFormula
+                == "mean_token_interval_ms / (1000 / stats.tokensPerSecond)",
+              workload.measurement.normalizedMeanProcessAggregation
+                == "arithmetic_mean(exactly_3_completion_factors)",
               workload.timeouts.modelLoadMS == 180_000,
               workload.timeouts.completionRPCTimeout == "none",
               workload.timeouts.processWatchdogSeconds == 240 else {
