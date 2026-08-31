@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "criterion": "Streaming completion latency overhead (Swift client vs. JS client on same machine) < 5%.",
+  "model": {
+    "name": "SmolLM2-135M-Instruct-Q4_K_M.gguf",
+    "source": "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/d255afaffd3441b95abca9b5cc4c819b93f66936/SmolLM2-135M-Instruct-Q4_K_M.gguf",
+    "revision": "d255afaffd3441b95abca9b5cc4c819b93f66936",
+    "byte_count": 105454432,
+    "sha256": "2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d",
+    "model_type": "llamacpp-completion",
+    "config": {
+      "ctx_size": 2048,
+      "gpu_layers": 99,
+      "device": "gpu",
+      "parallel": 1,
+      "verbosity": 0
+    }
+  },
+  "completion": {
+    "prompt": "Write the integers from 1 through 300, separated by spaces. Do not summarize or stop early.",
+    "stream": true,
+    "emit_raw_deltas": false,
+    "capture_thinking": false,
+    "kv_cache": false,
+    "generation": {
+      "temp": 0,
+      "top_k": 1,
+      "top_p": 1,
+      "seed": 20260831,
+      "frequency_penalty": 0,
+      "presence_penalty": 0,
+      "repeat_penalty": 1
+    }
+  },
+  "warmup": {
+    "predict": 128,
+    "minimum_completions": 3,
+    "maximum_completions": 8,
+    "maximum_recent_mean_ratio": 1.025
+  },
+  "measurement": {
+    "predict": 1000,
+    "process_pairs": 10,
+    "bootstrap_iterations": 20000,
+    "maximum_overhead_ratio": 1.05
+  },
+  "timeouts": {
+    "model_load_ms": 180000,
+    "completion_idle_ms": 30000,
+    "process_watchdog_seconds": 240
+  }
+}

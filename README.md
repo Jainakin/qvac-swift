@@ -300,13 +300,16 @@ QVAC_NODE_MODULES="$PWD/tools/runtime/node_modules" \
 QVAC_WORKER_SCRIPT="$PWD/tools/runtime/node_modules/@qvac/sdk/dist/server/worker.js" \
 tools/ci/run-required-suite.sh AllRPCTypesRoundTripTests 1
 
-bench/run.sh 1000
+QVAC_BENCH_MODEL_PATH=/absolute/path/to/SmolLM2-135M-Instruct-Q4_K_M.gguf \
+bench/run.sh
 ```
 
 Model-bearing suites download artifacts from immutable revisions and verify byte
 size plus SHA-256 before use. Required CI invokes them through
 `run-required-suite.sh`, which fails on any skip or unexpected test count; a broken
-or unavailable fixture is never reported as success.
+or unavailable fixture is never reported as success. The benchmark independently
+checks the same pinned model metadata from `bench/workload.json` before either
+public client is timed.
 
 ## Example application
 

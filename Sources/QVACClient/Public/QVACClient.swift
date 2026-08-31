@@ -98,12 +98,14 @@ public actor QVACClient {
         /// macOS convenience — prefers the lockfile-local
         /// `node_modules/bare-runtime/bin/bare`, then falls back to discovering
         /// `bare` on `$PATH`, and uses the SDK's `worker.js` from the supplied
-        /// node_modules directory.
+        /// node_modules directory. Pass `homeDirectory` to isolate the worker's
+        /// `HOME_DIR`; otherwise it uses the current process home directory.
         public static func macOS(
             nodeModulesDir: URL,
             bareExecutable: URL? = nil,
             initTimeout: TimeInterval = 30.0,
-            environmentOverlay: [String: String] = [:]
+            environmentOverlay: [String: String] = [:],
+            homeDirectory: URL? = nil
         ) throws -> Configuration {
             #if os(macOS)
             let workerScript = nodeModulesDir
@@ -120,7 +122,8 @@ public actor QVACClient {
                 workerScript: workerScript,
                 workingDirectory: nodeModulesDir.deletingLastPathComponent(),
                 initTimeout: initTimeout,
-                environmentOverlay: environmentOverlay
+                environmentOverlay: environmentOverlay,
+                homeDir: homeDirectory?.standardizedFileURL.path
             )))
             #else
             throw QVACError.transport(reason: "macOS configuration unavailable on this platform")
@@ -592,6 +595,38 @@ public actor QVACClient {
             from: data,
             handler: profilingMetadataHandler
         )
+
+        // Generated union-based paths decode the discriminated response once
+        // and surface its error case directly. The former JSONSerialization
+        // discriminator probe parsed every successful response twice, adding
+        // avoidable latency to each streamed response record/frame. Keep the
+        // generic fallback below for concrete response decoders.
+        if type == QVACResponse.self {
+            do {
+                let response = try JSONDecoder().decode(QVACResponse.self, from: data)
+                if case .error(let envelope) = response {
+                    let code = try checkedWireErrorCode(envelope.code)
+                    throw QVACError.fromWire(code: code, message: envelope.message)
+                }
+                guard let typed = response as? R else {
+                    throw QVACError.protocolViolation(
+                        "decoded QVACResponse could not be returned as the requested type"
+                    )
+                }
+                return typed
+            } catch let error as QVACError {
+                throw error
+            } catch {
+                // Preserve the stronger malformed-error diagnostic without
+                // charging successful responses for a second JSON parse.
+                if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   object["type"] as? String == "error" {
+                    throw QVACError.protocolViolation("malformed error response: \(error)")
+                }
+                throw QVACError.encoding("could not decode response: \(error)")
+            }
+        }
+
         // First peek at the discriminator: if it's "error", surface as QVACError directly.
         if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            obj["type"] as? String == "error" {

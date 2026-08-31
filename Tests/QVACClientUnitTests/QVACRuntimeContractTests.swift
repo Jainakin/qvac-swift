@@ -290,6 +290,80 @@ final class QVACRuntimeContractTests: XCTestCase {
         }
     }
 
+    func test_generated_response_union_maps_valid_and_malformed_error_envelopes() {
+        let capture = ProfilingCapture()
+        XCTAssertNoThrow(try {
+            let response = try QVACClient.decodeOrThrowStatic(
+                QVACResponse.self,
+                from: Data(
+                    #"{"type":"heartbeat","number":42,"__profiling":{"id":"union-success"}}"#.utf8
+                ),
+                profilingMetadataHandler: { capture.append($0) }
+            )
+            XCTAssertEqual(response, .heartbeat(HeartbeatResponse(number: 42)))
+        }())
+        XCTAssertEqual(capture.values(), [
+            QVACProfilingMetadata(value: .object(["id": .string("union-success")])),
+        ])
+
+        XCTAssertThrowsError(try QVACClient.decodeOrThrowStatic(
+            QVACResponse.self,
+            from: Data(#"{"type":"error","message":"invalid reply","code":50001}"#.utf8)
+        )) { error in
+            guard case QVACError.client(.invalidResponseType, let message) = error else {
+                return XCTFail("expected typed invalidResponseType, got \(error)")
+            }
+            XCTAssertEqual(message, "invalid reply")
+        }
+
+        XCTAssertThrowsError(try QVACClient.decodeOrThrowStatic(
+            QVACResponse.self,
+            from: Data(#"{"type":"error","message":"addon reply"}"#.utf8)
+        )) { error in
+            guard case QVACError.serverUntyped(0, let message) = error else {
+                return XCTFail("expected absent code to preserve 0 fallback, got \(error)")
+            }
+            XCTAssertEqual(message, "addon reply")
+        }
+
+        for invalidCode in ["50001.5", "1e100", #""50001""#, "true"] {
+            XCTAssertThrowsError(try QVACClient.decodeOrThrowStatic(
+                QVACResponse.self,
+                from: Data(
+                    #"{"type":"error","message":"bad code","code":\#(invalidCode)}"#.utf8
+                )
+            )) { error in
+                guard case QVACError.protocolViolation = error else {
+                    return XCTFail("expected invalid code protocolViolation, got \(error)")
+                }
+            }
+        }
+
+        XCTAssertThrowsError(try QVACClient.decodeOrThrowStatic(
+            QVACResponse.self,
+            from: Data(#"{"type":"error","code":50001}"#.utf8)
+        )) { error in
+            guard case QVACError.protocolViolation = error else {
+                return XCTFail("expected malformed error protocolViolation, got \(error)")
+            }
+        }
+
+        for malformedSuccess in [
+            #"{"type":"heartbeat"}"#,
+            #"{"type":"unknownResponse","number":42}"#,
+            #"{"type":42,"number":42}"#,
+        ] {
+            XCTAssertThrowsError(try QVACClient.decodeOrThrowStatic(
+                QVACResponse.self,
+                from: Data(malformedSuccess.utf8)
+            )) { error in
+                guard case QVACError.encoding = error else {
+                    return XCTFail("expected malformed non-error encoding failure, got \(error)")
+                }
+            }
+        }
+    }
+
     func test_public_error_mapping_distinguishes_arguments_protocol_and_ndjson() {
         guard case QVACError.invalidArgument = QVACClient.publicRPCError(
             BareRPCInvalidArgument("bad option"),

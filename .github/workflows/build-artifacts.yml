@@ -19,6 +19,7 @@ on:
         type: boolean
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
@@ -94,6 +95,28 @@ jobs:
             echo "::error::Binary publication requires maintainer/legal review of THIRD_PARTY_NOTICES.md, including pinned supplements, and license_reviewed=true"
             exit 1
           fi
+      - name: Require successful full CI for the exact publication commit
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CI_RUN_ID="$(gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f head_sha="$GITHUB_SHA" \
+            -f status=completed \
+            -f per_page=100 \
+            --jq '[.workflow_runs[] | select(
+              .conclusion == "success" and
+              .event == "push" and
+              .head_branch == "main" and
+              .head_sha == env.GITHUB_SHA
+            )][0].id // empty')"
+          if [ -z "$CI_RUN_ID" ]; then
+            echo "::error::No successful full CI push run exists for artifact source $GITHUB_SHA"
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID" \
+            --jq '"Artifact publication authorized by CI run \(.html_url): sha=\(.head_sha) conclusion=\(.conclusion)"'
       - name: Require the final URL manifest before artifact publication
         if: inputs.publish
         run: |

@@ -167,10 +167,10 @@ jobs:
           tools/ci/run-required-suite.sh AllRPCTypesRoundTripTests 1
 
   integration-models:
-    name: First inference <10m; pinned LLM, RAG, and upscale · zero skips
+    name: First inference <10m; pinned models; KR-2 streaming benchmark
     runs-on: macos-14
     needs: [unit, runtime-artifact]
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: Start clean-checkout-to-first-inference budget
         run: date +%s > "$RUNNER_TEMP/qvac-first-inference-start"
@@ -227,6 +227,22 @@ jobs:
         run: |
           tools/ci/run-required-suite.sh RAGIntegrationTests 2
           tools/ci/run-required-suite.sh UpscaleIntegrationTests 1
+      - name: Verify the KR-2 statistical analyzer
+        run: node bench/test-analyzer.mjs
+      - name: Compare real streaming completion through the public Swift and JS APIs
+        env:
+          QVAC_BENCH_MODEL_PATH: ${{ runner.temp }}/qvac-model-fixtures/2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d-SmolLM2-135M-Instruct-Q4_K_M.gguf
+        run: bench/run.sh
+      - name: Upload KR-2 benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-evidence
+          path: |
+            bench/workload.json
+            bench/result.json
+            bench/evidence
+          if-no-files-found: error
 
   ios-and-example:
     name: iOS package and example builds
@@ -275,31 +291,3 @@ jobs:
           xcodebuild -project QVACChat.xcodeproj -scheme QVACChat-macOS \
             -destination 'platform=macOS' \
             -derivedDataPath "$RUNNER_TEMP/qvac-chat-macos-dd" build
-
-  benchmark:
-    name: KR-2 public API benchmark · exact 5% gate
-    runs-on: macos-14
-    needs: [unit, runtime-artifact]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: ${{ env.QVAC_NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: tools/runtime/package-lock.json
-      - name: Materialize exact local binary graph
-        run: |
-          tools/runtime/link-ios-artifacts.sh
-          node tools/ci/package-manifest-mode.mjs --activate-development
-      - name: Verify statistical analyzer and equal timeout-policy guard
-        run: node bench/test-analyzer.mjs
-      - name: Run ABBA benchmark with noise-aware 5% decision
-        run: bench/run.sh 1000
-      - name: Upload benchmark evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: benchmark-evidence
-          path: bench/result.json
-          if-no-files-found: error
