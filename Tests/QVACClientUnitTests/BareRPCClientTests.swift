@@ -1267,9 +1267,12 @@ final class BareRPCClientTests: XCTestCase {
         let client = QVACClient(testing: mock)
         let stream = try await client.loggingStream(id: "single-consumer")
         _ = try await Self.waitForFrames(2, on: mock)
-        var firstIterator = stream.makeAsyncIterator()
+        let firstIterator = stream.makeAsyncIterator()
         var secondIterator = stream.makeAsyncIterator()
-        let firstRead = Task { try await firstIterator.next() }
+        let firstRead = Task { [firstIterator] in
+            var ownedIterator = firstIterator
+            return try await ownedIterator.next()
+        }
         try await Task.sleep(for: .milliseconds(10))
 
         do {

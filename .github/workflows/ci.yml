@@ -109,7 +109,10 @@ jobs:
         run: |
           swift package dump-package >/dev/null
           swift build -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
-          swift test --filter QVACClientUnitTests
+          swift test \
+            -Xswiftc -warnings-as-errors \
+            -Xswiftc -strict-concurrency=complete \
+            --filter QVACClientUnitTests
 
   documentation:
     name: DocC · warnings are errors
