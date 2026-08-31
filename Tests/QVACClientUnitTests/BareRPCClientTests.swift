@@ -189,6 +189,29 @@ final class BareRPCClientTests: XCTestCase {
         XCTFail("in-flight RPC state leaked: \(counts)")
     }
 
+    private static func waitForStreamTimeoutGeneration(
+        _ rpc: BareRPCClient,
+        id: UInt64,
+        greaterThan previous: UInt64,
+        timeout: Duration = .seconds(5)
+    ) async throws -> UInt64 {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if let generation = await rpc.__testStreamTimeoutGeneration(id: id),
+               generation > previous {
+                return generation
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let generation = await rpc.__testStreamTimeoutGeneration(id: id)
+        XCTFail(
+            "stream timeout generation did not advance beyond \(previous): "
+                + String(describing: generation)
+        )
+        return generation ?? previous
+    }
+
     /// Keep iterator lifetime out of the caller's scope so this proves that an
     /// ordinary early `break` tears down the live RPC while the sequence remains retained.
     private static func consumeOneAndBreak<Element: Sendable>(
@@ -741,11 +764,14 @@ final class BareRPCClientTests: XCTestCase {
         let stream = try await rpc.stream(
             command: 11,
             data: Data("{}".utf8),
-            timeout: .milliseconds(250)
+            timeout: .seconds(30)
         )
         let frames = try await Self.waitForFrames(2, on: mock)
         guard case .request(let id, _, _, _) = frames[0] else {
             return XCTFail("expected request frame")
+        }
+        guard let initialGeneration = await rpc.__testStreamTimeoutGeneration(id: id) else {
+            return XCTFail("expected an armed stream timeout")
         }
         let payload = Data("chunk".utf8)
         await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
@@ -753,13 +779,37 @@ final class BareRPCClientTests: XCTestCase {
             stream: [.open],
             payload: .success(nil)
         ))
-        try await Task.sleep(for: .milliseconds(140))
+        let openGeneration = try await Self.waitForStreamTimeoutGeneration(
+            rpc,
+            id: id,
+            greaterThan: initialGeneration
+        )
+        let deliveredInitialTimeout = await rpc.__testFireStreamTimeout(
+            id: id,
+            generation: initialGeneration
+        )
+        XCTAssertTrue(deliveredInitialTimeout)
+        let countsAfterStaleOpenTimeout = await rpc.__testInFlightCounts()
+        XCTAssertEqual(countsAfterStaleOpenTimeout.streams, 1)
+
         await mock.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
             id: id,
             flags: [.response, .data],
             payload: .data(payload)
         ))
-        try await Task.sleep(for: .milliseconds(140))
+        _ = try await Self.waitForStreamTimeoutGeneration(
+            rpc,
+            id: id,
+            greaterThan: openGeneration
+        )
+        let deliveredOpenTimeout = await rpc.__testFireStreamTimeout(
+            id: id,
+            generation: openGeneration
+        )
+        XCTAssertTrue(deliveredOpenTimeout)
+        let countsAfterStaleDataTimeout = await rpc.__testInFlightCounts()
+        XCTAssertEqual(countsAfterStaleDataTimeout.streams, 1)
+
         await mock.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
             id: id,
             flags: [.response, .end]

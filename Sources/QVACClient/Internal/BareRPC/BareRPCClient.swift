@@ -1161,6 +1161,23 @@ actor BareRPCClient {
     func __testInFlightCounts() -> (sends: Int, streams: Int, duplexes: Int) {
         (pendingSends.count, pendingStreams.count, pendingDuplex.count)
     }
+
+    /// Test-only visibility for proving that stream activity invalidates an
+    /// already-scheduled idle-timeout generation without relying on wall time.
+    func __testStreamTimeoutGeneration(id: UInt64) -> UInt64? {
+        pendingStreams[id]?.timeoutGeneration
+    }
+
+    /// Test-only hook that delivers a previously scheduled timeout generation.
+    /// Returns whether a pending timed stream existed; production timeout tasks
+    /// use the same generation-checked path.
+    func __testFireStreamTimeout(id: UInt64, generation: UInt64) -> Bool {
+        guard let stream = pendingStreams[id], let timeout = stream.timeout else {
+            return false
+        }
+        timeoutStream(id: id, timeout: timeout, generation: generation)
+        return true
+    }
 }
 
 // MARK: - Optional logger hook
