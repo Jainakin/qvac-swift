@@ -74,7 +74,7 @@ still requires an explicit maintainer/legal review attestation.
 
 The following results were obtained on 2026-08-31 on the final candidate tree.
 The streaming benchmark was run from clean source commit
-`3dcd793c501e7aeda362efaffae2db394d67a881`; the release workflow requires the
+`4da0693e83281c567c0faa0eb7714e05f762282e`; the release workflow requires the
 same full matrix to pass again for the exact final URL-manifest commit before it
 can publish any immutable binary or source release.
 
@@ -87,7 +87,7 @@ can publish any immutable binary or source release.
 | Pinned real LLM | 3/3 passed, zero skips |
 | Pinned real RAG | 2/2 passed, zero skips |
 | Pinned real upscale | 1/1 passed, zero skips, using public `diffusion` alias normalization |
-| Performance KR | Real public streaming completion, 10 adjacent order-balanced process pairs and 1,000 content events per process: mean inter-token Swift/JS ratio 1.001021, 95% CI [0.981531, 1.021090]; p99 ratio 0.993381, 95% CI [0.992215, 0.994776]. Both strict upper bounds are <1.05, with identical final/output SHA-256 across clients |
+| Performance KR | Real public streaming completion, 10 adjacent order-balanced process pairs and 1,000 content events per process: mean inter-token Swift/JS ratio 0.988014, 95% CI [0.972110, 1.004448]; p99 ratio 0.994116, 95% CI [0.993208, 0.995020]. Both strict upper bounds are <1.05, with identical final/output SHA-256 across clients |
 | iOS compile/smoke | Clean generic device and simulator builds passed; an external-package hosted-simulator smoke test passed 1/1 and loaded the bundled worker resource |
 | DocC | Final build passed with DocC warnings as errors, Swift warnings as errors, and strict concurrency enabled |
 | SwiftUI example | Final source builds passed for macOS and generic iOS Simulator after lifecycle and cross-platform input hardening |
