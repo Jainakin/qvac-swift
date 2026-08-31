@@ -1343,7 +1343,14 @@ final class BareRPCClientTests: XCTestCase {
 
     func test_fragmented_ndjson_record_limit_maps_to_public_encoding_error() async throws {
         let mock = MockTransport()
-        let client = QVACClient(testing: mock, maximumWireMessageBytes: 1_024)
+        // Keep the upstream byte queue larger than the fragmented record so
+        // this test isolates the NDJSON ceiling independent of consumer-task
+        // scheduling. Raw queue overflow has its own dedicated regression.
+        let client = QVACClient(
+            testing: mock,
+            maximumWireMessageBytes: 1_024,
+            maximumBufferedStreamBytes: 2_048
+        )
         let stream = try await client.loggingStream(id: "oversize-record")
         let frames = try await Self.waitForFrames(2, on: mock)
         guard case .request(let id, _, _, _) = frames[0] else {
@@ -1367,9 +1374,13 @@ final class BareRPCClientTests: XCTestCase {
             _ = try await iterator.next()
             XCTFail("expected record limit error")
         } catch let error as QVACError {
-            guard case .encoding = error else {
+            guard case .encoding(let reason) = error else {
                 return XCTFail("expected encoding, got \(error)")
             }
+            XCTAssertEqual(
+                reason,
+                QVACNDJSONError.recordTooLarge(limit: 1_024).description
+            )
         }
         await client.close()
     }
