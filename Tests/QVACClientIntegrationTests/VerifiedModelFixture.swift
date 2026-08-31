@@ -1,6 +1,9 @@
 #if canImport(Darwin)
 import CryptoKit
-import Foundation
+// The macOS 14 Foundation overlay leaves URLSession's optional async delegate
+// non-Sendable even when it is nil. Scope that legacy annotation workaround to
+// this checksum-verifying test fixture; production sources remain fully checked.
+@preconcurrency import Foundation
 
 struct IntegrationPrerequisiteError: Error, CustomStringConvertible {
     let description: String
