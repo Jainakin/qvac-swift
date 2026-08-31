@@ -41,6 +41,21 @@ function generationParams(predict) {
   return { ...workload.completion.generation, predict }
 }
 
+function warmupDiagnostic(warmups) {
+  const recent = warmups.slice(-workload.warmup.minimum_completions)
+  const means = recent.map(sample => sample.mean_token_interval_ms)
+  const lastWindowRatio = means.length === workload.warmup.minimum_completions
+    ? Math.max(...means) / Math.min(...means)
+    : null
+  return {
+    observed_completions: warmups.length,
+    required_recent_completions: workload.warmup.minimum_completions,
+    maximum_completions: workload.warmup.maximum_completions,
+    maximum_recent_mean_ratio: workload.warmup.maximum_recent_mean_ratio,
+    last_window_mean_ratio: lastWindowRatio,
+  }
+}
+
 function validateWorkload() {
   requireCondition(workload.schema_version === 1, 'workload schema_version must be 1')
   requireCondition(
@@ -56,9 +71,9 @@ function validateWorkload() {
     && workload.completion.capture_thinking === false
     && workload.completion.kv_cache === false,
   'workload completion flags violate the fixed KR-2 protocol')
-  requireCondition(workload.warmup.predict > 1
-    && workload.warmup.minimum_completions >= 3
-    && workload.warmup.maximum_completions >= workload.warmup.minimum_completions
+  requireCondition(workload.warmup.predict === 128
+    && workload.warmup.minimum_completions === 3
+    && workload.warmup.maximum_completions === 16
     && workload.warmup.maximum_recent_mean_ratio === 1.025,
   'workload warmup policy violates the fixed KR-2 protocol')
   requireCondition(workload.measurement.predict === 1000
@@ -165,7 +180,22 @@ requireCondition(runtimePackage.dependencies?.['@qvac/sdk'] === '0.17.0'
   && sdkPackage.version === '0.17.0',
 'benchmark requires the exact @qvac/sdk 0.17.0 and Bare 1.31.0 runtime graph')
 
+const toolchain = {
+  node: process.env.QVAC_BENCH_NODE_VERSION || process.version,
+  bare: process.env.QVAC_BENCH_BARE_VERSION || 'unknown',
+  swift: process.env.QVAC_BENCH_SWIFT_VERSION || 'unknown',
+  host: process.env.QVAC_BENCH_HOST || `${process.platform}-${process.arch}`,
+  sdk: '0.17.0',
+  configuration: 'release',
+}
+const timeoutPolicy = {
+  model_load_ms: workload.timeouts.model_load_ms,
+  completion_idle_ms: workload.timeouts.completion_idle_ms,
+  process_watchdog_seconds: workload.timeouts.process_watchdog_seconds,
+}
+
 let modelId
+const warmups = []
 try {
   modelId = await loadModel({
     modelSrc: modelPath,
@@ -173,7 +203,6 @@ try {
     modelConfig: workload.model.config,
   }, { timeout: workload.timeouts.model_load_ms })
 
-  const warmups = []
   let converged = false
   for (let index = 0; index < workload.warmup.maximum_completions; index++) {
     const sample = await runCompletion(modelId, workload.warmup.predict)
@@ -214,20 +243,26 @@ try {
     model_sha256: modelSha256,
     warmups,
     measurement,
-    timeout_policy: {
-      model_load_ms: workload.timeouts.model_load_ms,
-      completion_idle_ms: workload.timeouts.completion_idle_ms,
-      process_watchdog_seconds: workload.timeouts.process_watchdog_seconds,
-    },
-    toolchain: {
-      node: process.env.QVAC_BENCH_NODE_VERSION || process.version,
-      bare: process.env.QVAC_BENCH_BARE_VERSION || 'unknown',
-      swift: process.env.QVAC_BENCH_SWIFT_VERSION || 'unknown',
-      host: process.env.QVAC_BENCH_HOST || `${process.platform}-${process.arch}`,
-      sdk: '0.17.0',
-      configuration: 'release',
-    },
+    timeout_policy: timeoutPolicy,
+    toolchain,
   })
+} catch (error) {
+  // Preserve structured partial warmup evidence for a fail-closed run. The
+  // orchestrator accepts only status=sample, so this can never enter analysis.
+  atomicWriteJSON(resultPath, {
+    schema_version: 1,
+    status: 'error',
+    client: 'node',
+    api_surface: '@qvac/sdk completion(...).events',
+    workload_sha256: workloadSha256,
+    model_sha256: modelSha256,
+    reason: error instanceof Error ? error.message : String(error),
+    warmups,
+    warmup_diagnostic: warmupDiagnostic(warmups),
+    timeout_policy: timeoutPolicy,
+    toolchain,
+  })
+  throw error
 } finally {
   if (modelId) await unloadModel({ modelId })
   await close()

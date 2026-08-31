@@ -35,7 +35,7 @@
   "warmup": {
     "predict": 128,
     "minimum_completions": 3,
-    "maximum_completions": 8,
+    "maximum_completions": 16,
     "maximum_recent_mean_ratio": 1.025
   },
   "measurement": {

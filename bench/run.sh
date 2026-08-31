@@ -181,6 +181,12 @@ const workload = JSON.parse(readFileSync(path, "utf8"))
 if (workload.schema_version !== 1) throw new Error("workload schema_version must be 1")
 if (workload.measurement?.process_pairs !== 10) throw new Error("KR-2 requires exactly ten process pairs")
 if (workload.measurement?.maximum_overhead_ratio !== 1.05) throw new Error("KR-2 overhead ratio must be 1.05")
+if (workload.warmup?.predict !== 128
+    || workload.warmup?.minimum_completions !== 3
+    || workload.warmup?.maximum_completions !== 16
+    || workload.warmup?.maximum_recent_mean_ratio !== 1.025) {
+  throw new Error("KR-2 warmup policy does not match the fixed convergence contract")
+}
 if (!Number.isSafeInteger(workload.measurement?.bootstrap_iterations)
     || workload.measurement.bootstrap_iterations < 20000) throw new Error("KR-2 requires at least 20,000 bootstrap iterations")
 if (workload.timeouts?.process_watchdog_seconds !== 240) throw new Error("KR-2 process watchdog must be exactly 240 seconds")

@@ -48,7 +48,7 @@ const WORKLOAD_CONTRACT = {
   warmup: {
     predict: 128,
     minimum_completions: 3,
-    maximum_completions: 8,
+    maximum_completions: 16,
     maximum_recent_mean_ratio: 1.025,
   },
   measurement: {
@@ -592,6 +592,7 @@ function analyze() {
     },
     warmup_policy: {
       convergence_window: workload.warmup.minimum_completions,
+      maximum_completions: workload.warmup.maximum_completions,
       maximum_recent_mean_ratio: workload.warmup.maximum_recent_mean_ratio,
       stop_at_first_convergence: true,
       validated_warmup_output: warmupIdentity,

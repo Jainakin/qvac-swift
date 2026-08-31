@@ -187,6 +187,7 @@ try {
   assert.equal(pass.report.statistical_method.bootstrap_iterations, 20000)
   assert.equal(pass.report.statistical_method.exclusions, 'none')
   assert.equal(pass.report.warmup_policy.stop_at_first_convergence, true)
+  assert.equal(pass.report.warmup_policy.maximum_completions, 16)
   assert.equal(pass.report.metrics.mean_token_interval.status, 'pass')
   assert.equal(pass.report.metrics.p99_token_interval.status, 'pass')
   closeEnough(pass.report.metrics.mean_token_interval.ratio, 1.04)
@@ -231,6 +232,17 @@ try {
     readFileSync(deterministicB.outputPath, 'utf8'),
     'fixed-seed analysis was not byte deterministic',
   )
+
+  const lateConvergence = runAnalyzer(makeCase('late-convergence', {
+    mutateSamples: samples => {
+      const means = [10, 12, 10, 12, 10, 12, 10, 12, 10, 10.1, 10.2]
+      for (const sample of samples) sample.warmups = means.map(warmupSample)
+    },
+  }))
+  assert.equal(lateConvergence.process.status, 0,
+    lateConvergence.process.stderr || lateConvergence.process.stdout)
+  assert.equal(lateConvergence.report.status, 'pass')
+  assert.ok(lateConvergence.report.ordered_process_runs.every(run => run.warmups.length === 11))
 
   const orderCase = makeCase('order')
   const wrongOrder = [...orderCase.runPaths]
@@ -284,9 +296,20 @@ try {
     mutateSamples: samples => { samples[9].warmups.push(warmupSample()) },
   })), /continued after first convergence/)
 
+  assertInvalid(runAnalyzer(makeCase('warmup-cap-exceeded', {
+    mutateSamples: samples => {
+      const means = Array.from({ length: 17 }, (_, index) => index % 2 === 0 ? 10 : 12)
+      for (const sample of samples) sample.warmups = means.map(warmupSample)
+    },
+  })), /must contain 3\.\.\.16 samples/)
+
   assertInvalid(runAnalyzer(makeCase('threshold-override', {
     mutateWorkload: workload => { workload.measurement.maximum_overhead_ratio = 1.051 },
   })), /maximum_overhead_ratio/)
+
+  assertInvalid(runAnalyzer(makeCase('warmup-cap-override', {
+    mutateWorkload: workload => { workload.warmup.maximum_completions = 15 },
+  })), /maximum_completions/)
 
   assertInvalid(runAnalyzer(makeCase('recorded-mean-mismatch', {
     mutateSamples: samples => { samples[10].measurement.mean_token_interval_ms += 0.01 },

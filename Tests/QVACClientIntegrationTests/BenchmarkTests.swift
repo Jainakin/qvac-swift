@@ -261,7 +261,21 @@ final class BenchmarkTests: XCTestCase {
             logger: nil
         )
 
+        let timeoutPolicy: [String: Any] = [
+            "model_load_ms": workload.timeouts.modelLoadMS,
+            "completion_idle_ms": workload.timeouts.completionIdleMS,
+            "process_watchdog_seconds": workload.timeouts.processWatchdogSeconds,
+        ]
+        let toolchain: [String: Any] = [
+            "node": try Self.required("QVAC_BENCH_NODE_VERSION", environment),
+            "bare": try Self.required("QVAC_BENCH_BARE_VERSION", environment),
+            "swift": try Self.required("QVAC_BENCH_SWIFT_VERSION", environment),
+            "host": try Self.required("QVAC_BENCH_HOST", environment),
+            "sdk": "0.17.0",
+            "configuration": "release",
+        ]
         var loadedModelID: String?
+        var warmups: [CompletionSample] = []
         do {
             let modelConfig = workload.model.config
             let load = try await client.loadModel(
@@ -279,7 +293,6 @@ final class BenchmarkTests: XCTestCase {
             let modelID = try await load.result.value
             loadedModelID = modelID
 
-            var warmups: [CompletionSample] = []
             var converged = false
             for _ in 0..<workload.warmup.maximumCompletions {
                 let sample = try await Self.runCompletion(
@@ -329,19 +342,8 @@ final class BenchmarkTests: XCTestCase {
                 "model_sha256": modelSHA256,
                 "warmups": warmups.map(\.warmupJSON),
                 "measurement": measurement.measurementJSON,
-                "timeout_policy": [
-                    "model_load_ms": workload.timeouts.modelLoadMS,
-                    "completion_idle_ms": workload.timeouts.completionIdleMS,
-                    "process_watchdog_seconds": workload.timeouts.processWatchdogSeconds,
-                ],
-                "toolchain": [
-                    "node": try Self.required("QVAC_BENCH_NODE_VERSION", environment),
-                    "bare": try Self.required("QVAC_BENCH_BARE_VERSION", environment),
-                    "swift": try Self.required("QVAC_BENCH_SWIFT_VERSION", environment),
-                    "host": try Self.required("QVAC_BENCH_HOST", environment),
-                    "sdk": "0.17.0",
-                    "configuration": "release",
-                ],
+                "timeout_policy": timeoutPolicy,
+                "toolchain": toolchain,
             ]
             let data = try JSONSerialization.data(
                 withJSONObject: result,
@@ -349,6 +351,43 @@ final class BenchmarkTests: XCTestCase {
             )
             try data.write(to: resultURL, options: .atomic)
         } catch {
+            // Preserve partial convergence evidence while remaining fail-closed:
+            // bench/run.sh accepts only a successful status=sample document.
+            let recentMeans = warmups
+                .suffix(workload.warmup.minimumCompletions)
+                .map(\.meanIntervalMS)
+            let lastWindowRatio: Double?
+            if recentMeans.count == workload.warmup.minimumCompletions,
+               let minimum = recentMeans.min(), let maximum = recentMeans.max(), minimum > 0 {
+                lastWindowRatio = maximum / minimum
+            } else {
+                lastWindowRatio = nil
+            }
+            let errorResult: [String: Any] = [
+                "schema_version": 1,
+                "status": "error",
+                "client": "swift",
+                "api_surface": "QVACClient.completion(...).events",
+                "workload_sha256": workloadSHA256,
+                "model_sha256": modelSHA256,
+                "reason": String(describing: error),
+                "warmups": warmups.map(\.warmupJSON),
+                "warmup_diagnostic": [
+                    "observed_completions": warmups.count,
+                    "required_recent_completions": workload.warmup.minimumCompletions,
+                    "maximum_completions": workload.warmup.maximumCompletions,
+                    "maximum_recent_mean_ratio": workload.warmup.maximumRecentMeanRatio,
+                    "last_window_mean_ratio": Self.jsonValue(lastWindowRatio),
+                ],
+                "timeout_policy": timeoutPolicy,
+                "toolchain": toolchain,
+            ]
+            if let errorData = try? JSONSerialization.data(
+                withJSONObject: errorResult,
+                options: [.prettyPrinted, .sortedKeys]
+            ) {
+                try? errorData.write(to: resultURL, options: .atomic)
+            }
             if let loadedModelID {
                 _ = try? await client.unloadModel(
                     modelId: loadedModelID,
@@ -481,9 +520,9 @@ final class BenchmarkTests: XCTestCase {
               !workload.completion.emitRawDeltas,
               !workload.completion.captureThinking,
               !workload.completion.kvCache,
-              workload.warmup.predict > 1,
-              workload.warmup.minimumCompletions >= 3,
-              workload.warmup.maximumCompletions >= workload.warmup.minimumCompletions,
+              workload.warmup.predict == 128,
+              workload.warmup.minimumCompletions == 3,
+              workload.warmup.maximumCompletions == 16,
               workload.warmup.maximumRecentMeanRatio == 1.025,
               workload.measurement.predict == 1_000,
               workload.measurement.processPairs == 10,
