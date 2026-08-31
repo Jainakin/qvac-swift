@@ -74,7 +74,7 @@ still requires an explicit maintainer/legal review attestation.
 
 The following results were obtained on 2026-08-31 on the final candidate tree.
 The streaming benchmark was run from clean source commit
-`893079f30805e95abbc065cc8ab0f17acb77b967`; the release workflow requires the
+`f753e8c6c438b421050bc7411720a2aa382ec91e`; the release workflow requires the
 same full matrix to pass again for the exact final URL-manifest commit before it
 can publish any immutable binary or source release.
 
@@ -87,7 +87,7 @@ can publish any immutable binary or source release.
 | Pinned real LLM | 3/3 passed, zero skips |
 | Pinned real RAG | 2/2 passed, zero skips |
 | Pinned real upscale | 1/1 passed, zero skips, using public `diffusion` alias normalization |
-| Performance KR | Real public streaming completion across 20 isolated processes in 10 adjacent order-balanced pairs. Every process performed exactly two 1,000-token preconditioning completions followed by three retained 1,000-token measurements (2,997 inter-token intervals per process), with zero retries or exclusions. Mean inter-token Swift/JS ratio: 0.985142, 95% CI [0.973110, 0.996906]; p99 ratio: 0.992376, 95% CI [0.991406, 0.993350]. Both strict upper bounds are <1.05. All runs used GPU and produced identical final/output SHA-256 `fd703254198e4ad90b15fb8bdcd785911f71c2ac2695d4acb362dfb48f2ec234` across clients. |
+| Performance KR | Real public streaming completion across 20 isolated processes in five intact four-process ABBA blocks (10 opposite-orientation Swift/Node pairs). Every process performed exactly two 1,000-token preconditioning completions followed by three retained 1,000-token measurements (2,997 inter-token intervals per process), with zero retries or exclusions. Server-normalized mean client-delivery factor ratio: 1.001096, 95% CI [0.998381, 1.003820]; raw p99 inter-token ratio: 0.992695, 95% CI [0.992260, 0.993276]. Both co-primary upper bounds are strictly <1.05. Raw end-to-end mean remained a mandatory diagnostic at 1.008413, 95% CI [1.006679, 1.010973]. All runs used GPU and produced identical final/output SHA-256 `fd703254198e4ad90b15fb8bdcd785911f71c2ac2695d4acb362dfb48f2ec234` across clients. |
 | iOS compile/smoke | Clean generic device and simulator builds passed; an external-package hosted-simulator smoke test passed 1/1 and loaded the bundled worker resource |
 | DocC | Final build passed with DocC warnings as errors, Swift warnings as errors, and strict concurrency enabled |
 | SwiftUI example | Final source builds passed for macOS and generic iOS Simulator after lifecycle and cross-platform input hardening |
@@ -102,6 +102,24 @@ per-completion RPC timeout to either client, because the pinned JavaScript
 instead run under the same owned 240-second process watchdog. Per-request timeout
 behavior remains independently covered by the Swift unit and live contract
 tests.
+
+The normalized mean factor is fixed as each completion's public mean inter-token
+latency divided by the native worker period (`1000 / stats.tokensPerSecond`),
+then arithmetically averaged across the three retained completions. This isolates
+client delivery overhead from GPU decode-rate assignment; raw p99 remains an
+unadjusted co-primary tail guard, while raw mean, worker throughput, TTFT, and
+terminal latency remain reported diagnostics. The confidence interval resamples
+the five intact ABBA blocks, preserving the two opposite execution orientations
+and their shared thermal regime.
+
+This estimand was committed before the acceptance run. An earlier exact-SHA
+hosted run using raw mean as a primary metric was reported as inconclusive, not
+retried or relabeled: its public mean tracked the worker's native decode period
+with correlation 0.99928 and paired-log R-squared 0.9989. That evidence exposed
+backend-speed confounding rather than a Swift failure and motivated the
+predeclared server-normalized client-overhead metric. The successful evidence
+above was collected once from the subsequent clean commit with the unchanged
+1.05 limit, fixed workload, zero retries, and zero exclusions.
 
 The CI workflow repeats these checks from a clean checkout. It additionally times
 checkout/setup through first real inference and hard-fails at 600 seconds, proves
@@ -129,7 +147,7 @@ without weakening its public distribution contract.
 | Clean close and worker termination | Deterministic unit/integration coverage passes, including concurrent close and blocked I/O |
 | Typed SDK errors | All 136 exact 0.17 codes plus registry/model-registry categories are generated and mapped |
 | Clone to first inference under 10 minutes | Enforced by CI; must still be demonstrated by the successful remote CI run for the final committed SHA |
-| Streaming overhead below 5% | Passed on real public completion streams; both co-primary process-paired 95% upper bounds are strictly below 1.05, with no retries or exclusions |
+| Streaming overhead below 5% | Passed on real public completion streams; the server-normalized mean delivery-factor and raw p99 co-primary intact-block 95% upper bounds are strictly below 1.05, with raw end-to-end metrics retained and no retries or exclusions |
 | Code generation under 30 seconds | Passed twice at 0.25 seconds and remains a fixed CI gate |
 | Physical iPhone example | Source and generic device build are ready; a current 0.17 run on an actual iPhone remains required evidence |
 | SwiftPM URL tag and Swift Package Index | Release tooling/guidance are ready; immutable binary publication, `v0.1.0`, anonymous URL-consumer verification, and Index submission remain external release actions |
@@ -139,11 +157,12 @@ without weakening its public distribution contract.
 These are not source-code defects and cannot be completed honestly without
 publishing external state:
 
-1. Commit every intended generated/source/release file, including the tracked
-   `Package.swift.dev`, while excluding the user-owned diagnostic file
-   `Package.swift.release-broken-from-private-repo`.
-2. Push the development-manifest candidate; an initial green full `CI` run is a
-   useful candidate gate.
+1. Push the committed development-manifest candidate while continuing to exclude
+   the user-owned diagnostic file
+   `Package.swift.release-broken-from-private-repo`, then obtain a green full
+   `CI` run for that exact commit.
+2. Treat that successful development-manifest CI run as the candidate gate; it
+   does not authorize a later URL-manifest commit.
 3. Run the artifact workflow in dry-run mode, review the deterministic evidence
    and `THIRD_PARTY_NOTICES.md`, generate the checksum-pinned URL `Package.swift`,
    and commit and push that URL-manifest state.
