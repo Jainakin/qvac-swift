@@ -20,7 +20,11 @@ import OSLog
 /// ``QVACClient/init(configuration:runtimeContext:config:initHandshakeTimeout:maximumWireMessageBytes:maximumBufferedStreamBytes:profilingMetadataHandler:logger:)``
 /// so users get init / handshake / frame visibility out of the box without
 /// having to plumb anything. Pass `nil` to opt out.
-public struct QVACOSLogger: BareRPCLogger {
+// `OSLog.Logger` is safe to share across concurrency domains, but the macOS 14
+// SDK overlay used by GitHub's arm64 runner predates its `Sendable` annotation.
+// Keep the unchecked boundary confined to this immutable adapter instead of
+// weakening concurrency checking for the entire OSLog module.
+public struct QVACOSLogger: BareRPCLogger, @unchecked Sendable {
     public static let `default` = QVACOSLogger()
     private let logger = Logger(subsystem: "io.qvac.client", category: "rpc")
     public init() {}
