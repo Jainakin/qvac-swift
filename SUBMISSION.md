@@ -16,11 +16,14 @@ example, and guarded release automation form a production candidate. Reviewer
 item 6 becomes externally complete only when its immutable binary artifacts and
 source tag are published through the guarded release sequence below.
 
-The repository is not yet a published SwiftPM release. The canonical
-`Package.swift` intentionally remains the local, path-based development manifest
-until a maintainer publishes the immutable binary artifacts. Claiming URL
-installability before that publication would be incorrect. See
-`docs/distribution.md` for the artifact-first release sequence.
+The repository is not yet a published SwiftPM release. An unpublished r1
+artifact candidate has reproduced and verified the final 38-archive byte set,
+and canonical `Package.swift` is now the checksum-pinned URL release-candidate
+manifest generated from it. Those URLs intentionally remain unavailable until
+the same bytes are published; public URL installation becomes complete only
+after the exact URL-manifest commit passes CI and the guarded artifact and source
+release workflows succeed. `Package.swift.dev` retains the exact local graph.
+See `docs/distribution.md` for the artifact-first release sequence.
 
 `THIRD_PARTY_NOTICES.md` is deterministically generated from the exact worker
 payload plus the BareKit native closure root. It inventories 146 package
@@ -39,7 +42,7 @@ still requires an explicit maintainer/legal review attestation.
 | 3 | Handle profiling trailers | `QVACNDJSONDecoder` incrementally handles fragmented/coalesced records, CRLF, EOF residuals, size limits, and top-level `__profilingTrailer: true` records. A profiling trailer is separated from typed responses; malformed non-trailers still fail decoding. |
 | 4 | Pin code generation | `tools/provenance/qvac-sdk.lock.json` binds the npm tarball, integrity, shasum, release commit, and every contract input hash. Generation consumes the committed language-neutral 0.17 contract. Bootstrap independently exports the published npm contract and rejects semantic drift. Node, npm dependencies, generated output, and provenance are all locked and CI-verified. |
 | 5 | Fix real-model tests | The missing/floating fixture was replaced with checksum-, size-, filename-, and revision-pinned LLM and RAG fixtures. Required-suite wrappers reject missing configuration, skips, zero executed tests, or wrong suite names. The final local runs completed LLM 3/3 and RAG 2/2 with zero skips. |
-| 6 | Add upscale and URL installation | The exact 0.17 upscale API, rich `Data` result surface, alias normalization, progress/terminal behavior, large-frame support, unit tests, and a checksum-pinned real Real-ESRGAN test are implemented. URL distribution is release-automation complete but externally pending: produce an unpublished 38-archive candidate, commit its checksum/URL manifest, obtain exact-SHA CI, then publish the immutable artifacts and guarded source release. |
+| 6 | Add upscale and URL installation | The exact 0.17 upscale API, rich `Data` result surface, alias normalization, progress/terminal behavior, large-frame support, unit tests, and a checksum-pinned real Real-ESRGAN test are implemented. The unpublished 38-archive r1 candidate is verified and its checksum/URL manifest is generated. External completion now requires exact-SHA CI for that URL-manifest commit, legal attestation, immutable artifact publication, and the guarded source release. |
 | 7 | Bring the client to the current SDK | Generated request/response unions, exact wire entry points, and live coverage now match all 39 SDK 0.17 methods, 43 response leaves, 136 error codes, and 12 public model-type aliases. New 0.17 operations include audio/video/upscale, BCI, VLA, orchestration, classification, finetune, system/model-registry, lifecycle, logging, and provider APIs. |
 
 ## Architecture and production hardening
@@ -121,6 +124,25 @@ predeclared server-normalized client-overhead metric. The successful evidence
 above was collected once from the subsequent clean commit with the unchanged
 1.05 limit, fixed workload, zero retries, and zero exclusions.
 
+The complete development-manifest CI run for commit
+`1a5293e060bfb688c9e9d6e389368a7343b50b50` passed every job on GitHub. Its
+hosted benchmark independently passed with normalized mean factor ratio
+1.001227, 95% CI [0.999377, 1.003080], and raw p99 ratio 0.999750, 95% CI
+[0.997800, 1.001603]. The raw mean diagnostic was 1.016105 while native worker
+throughput varied from 100.87 to 169.83 tokens/second, demonstrating why worker
+decode-rate assignment is retained as a diagnostic rather than attributed to
+either client. The complete evidence artifact contains all 20 process samples,
+10 pairs, five intact ABBA blocks, exact output hashes, and zero retries or
+exclusions. The successful CI run is
+<https://github.com/Jainakin/qvac-swift/actions/runs/33418309632>.
+
+The non-publishing r1 artifact-candidate workflow also passed from that exact
+commit and uploaded its evidence without creating a tag or GitHub Release:
+<https://github.com/Jainakin/qvac-swift/actions/runs/33420629448>. Independent
+local verification recomputed all 38 archive checksums, matched the worker and
+third-party notice byte-for-byte, regenerated canonical `Package.swift`, and
+parsed it with SwiftPM.
+
 The CI workflow repeats these checks from a clean checkout. It additionally times
 checkout/setup through first real inference and hard-fails at 600 seconds, proves
 generated output freshness, reproduces the worker twice, exercises a hosted iOS
@@ -157,26 +179,23 @@ without weakening its public distribution contract.
 These are not source-code defects and cannot be completed honestly without
 publishing external state:
 
-1. Push the committed development-manifest candidate while continuing to exclude
+1. Commit and push the generated URL `Package.swift` while continuing to exclude
    the user-owned diagnostic file
-   `Package.swift.release-broken-from-private-repo`, then obtain a green full
-   `CI` run for that exact commit.
-2. Treat that successful development-manifest CI run as the candidate gate; it
-   does not authorize a later URL-manifest commit.
-3. Run the artifact workflow in dry-run mode, review the deterministic evidence
-   and `THIRD_PARTY_NOTICES.md`, generate the checksum-pinned URL `Package.swift`,
-   and commit and push that URL-manifest state.
-4. Obtain a new green full `CI` workflow for the exact URL-manifest commit SHA.
+   `Package.swift.release-broken-from-private-repo`.
+2. Obtain a new green full `CI` workflow for the exact URL-manifest commit SHA.
    The earlier candidate run cannot authorize this different commit.
-5. Publish a new immutable artifact revision from that exact final commit with
+3. Have the maintainer/legal reviewer inspect `THIRD_PARTY_NOTICES.md`, including
+   the three pinned supplemental texts, and explicitly approve the
+   `license_reviewed=true` attestation.
+4. Publish the immutable r1 artifact revision from that exact final commit with
    the third-party-review attestation enabled. Never replace an existing artifact
    tag or release.
-6. Run the source-release workflow. It rechecks the exact successful CI run,
+5. Run the source-release workflow. It rechecks the exact successful CI run,
    remote artifact bytes, source binding, and an anonymous Git-URL consumer before
    it creates `v0.1.0`.
-7. Run the SwiftUI example on a physical iPhone with SDK 0.17.0 and retain the
+6. Run the SwiftUI example on a physical iPhone with SDK 0.17.0 and retain the
    device/build/log evidence for the grant reviewer.
-8. Submit the published package to Swift Package Index and verify the indexed
+7. Submit the published package to Swift Package Index and verify the indexed
    platforms, product, version, and hosted documentation.
 
 No tag, GitHub Release, artifact publication, or Swift Package Index submission
