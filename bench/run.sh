@@ -13,7 +13,7 @@ if [[ "$#" -ne 0 ]]; then
     fail "usage: QVAC_BENCH_MODEL_PATH=/absolute/model.gguf bench/run.sh"
 fi
 
-# The checked-in workload is the sole source of sampling, warmup, threshold,
+# The checked-in workload is the sole source of sampling, preconditioning, threshold,
 # and timeout policy. Reject legacy tuning knobs instead of silently accepting
 # evidence produced under a different protocol.
 if [[ -n "${QVAC_BENCH_ITERS+x}" \
@@ -24,7 +24,7 @@ if [[ -n "${QVAC_BENCH_ITERS+x}" \
     || -n "${QVAC_BENCH_BOOTSTRAP_ITERATIONS+x}" \
     || -n "${QVAC_BENCH_MAX_OVERHEAD+x}" \
     || -n "${QVAC_BENCH_PROCESS_TIMEOUT_SECONDS+x}" ]]; then
-    fail "sampling, warmup, threshold, and timeout overrides are forbidden; edit no benchmark policy at runtime"
+    fail "sampling, preconditioning, threshold, and timeout overrides are forbidden; edit no benchmark policy at runtime"
 fi
 if [[ "${QVAC_ALLOW_NODE_VERSION_MISMATCH:-0}" != "0" ]]; then
     fail "QVAC_ALLOW_NODE_VERSION_MISMATCH is diagnostic-only and forbidden for benchmark evidence"
@@ -49,32 +49,41 @@ LOCK_DIR="$SCRIPT_DIR/.streaming-benchmark.lock"
 # untracked build inputs so that `source_commit` cannot describe different
 # bytes from those actually compiled and executed. Repository-local diagnostic
 # files outside the build/release surfaces do not affect the experiment.
-if ! git -C "$REPO_ROOT" diff --cached --quiet; then
-    fail "benchmark evidence requires a clean Git index"
-fi
-TRACKED_CHANGES="$(git -C "$REPO_ROOT" diff --name-only)"
-if [[ -n "$TRACKED_CHANGES" ]]; then
-    # URL-manifest CI validates the committed release manifest, then activates
-    # the byte-exact development manifest as an ephemeral local binary overlay.
-    # That single verified rewrite is the only dirty tracked state accepted.
-    ALLOW_CI_MANIFEST_OVERLAY=0
-    if [[ "${CI:-false}" == "true" \
-        && "$TRACKED_CHANGES" == "Package.swift" \
-        && -f "$REPO_ROOT/Package.swift.dev" ]] \
-        && cmp -s "$REPO_ROOT/Package.swift" "$REPO_ROOT/Package.swift.dev"; then
-        ALLOW_CI_MANIFEST_OVERLAY=1
+verify_source_tree() {
+    local tracked_changes=""
+    local untracked_inputs=""
+    local allow_ci_manifest_overlay=0
+    if ! git -C "$REPO_ROOT" diff --cached --quiet; then
+        fail "benchmark evidence requires a clean Git index"
     fi
-    if [[ "$ALLOW_CI_MANIFEST_OVERLAY" -ne 1 ]]; then
-        echo "$TRACKED_CHANGES" >&2
-        fail "benchmark evidence requires a clean tracked Git tree"
+    tracked_changes="$(git -C "$REPO_ROOT" diff --name-only)"
+    if [[ -n "$tracked_changes" ]]; then
+        # URL-manifest CI validates the committed release manifest, then activates
+        # the byte-exact development manifest as an ephemeral local binary overlay.
+        # That single verified rewrite is the only dirty tracked state accepted.
+        if [[ "${CI:-false}" == "true" \
+            && "$tracked_changes" == "Package.swift" \
+            && -f "$REPO_ROOT/Package.swift.dev" ]] \
+            && cmp -s "$REPO_ROOT/Package.swift" "$REPO_ROOT/Package.swift.dev"; then
+            allow_ci_manifest_overlay=1
+        fi
+        if [[ "$allow_ci_manifest_overlay" -ne 1 ]]; then
+            echo "$tracked_changes" >&2
+            fail "benchmark evidence requires a clean tracked Git tree"
+        fi
     fi
-fi
-UNTRACKED_INPUTS="$(git -C "$REPO_ROOT" ls-files --others --exclude-standard -- \
-    .github Sources Tests bench tools Package.swift Package.swift.dev)"
-if [[ -n "$UNTRACKED_INPUTS" ]]; then
-    echo "$UNTRACKED_INPUTS" >&2
-    fail "benchmark evidence refuses untracked build, harness, or workflow inputs"
-fi
+    untracked_inputs="$(git -C "$REPO_ROOT" ls-files --others --exclude-standard -- \
+        .github Sources Tests bench tools Package.swift Package.swift.dev)"
+    if [[ -n "$untracked_inputs" ]]; then
+        echo "$untracked_inputs" >&2
+        fail "benchmark evidence refuses untracked build, harness, or workflow inputs"
+    fi
+}
+
+verify_source_tree
+SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+    || fail "benchmark evidence requires an exact 40-hex source commit"
 
 MODEL_PARENT=""
 if ! MODEL_PARENT="$(cd "$(dirname "$QVAC_BENCH_MODEL_PATH")" 2>/dev/null && pwd -P)"; then
@@ -178,22 +187,28 @@ const path = process.argv[1]
 const stat = lstatSync(path)
 if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("workload must be a regular non-symlink file")
 const workload = JSON.parse(readFileSync(path, "utf8"))
-if (workload.schema_version !== 1) throw new Error("workload schema_version must be 1")
+if (workload.schema_version !== 2) throw new Error("workload schema_version must be 2")
 if (workload.measurement?.process_pairs !== 10) throw new Error("KR-2 requires exactly ten process pairs")
 if (workload.measurement?.maximum_overhead_ratio !== 1.05) throw new Error("KR-2 overhead ratio must be 1.05")
-if (workload.warmup?.predict !== 128
-    || workload.warmup?.minimum_completions !== 3
-    || workload.warmup?.maximum_completions !== 16
-    || workload.warmup?.maximum_recent_mean_ratio !== 1.025) {
-  throw new Error("KR-2 warmup policy does not match the fixed convergence contract")
+if (workload.preconditioning?.predict !== 1000
+    || workload.preconditioning?.completions !== 2) {
+  throw new Error("KR-2 preconditioning must be exactly two 1,000-token completions")
 }
-if (!Number.isSafeInteger(workload.measurement?.bootstrap_iterations)
-    || workload.measurement.bootstrap_iterations < 20000) throw new Error("KR-2 requires at least 20,000 bootstrap iterations")
+if (workload.measurement?.predict !== 1000
+    || workload.measurement?.completions_per_process !== 3) {
+  throw new Error("KR-2 measurement must be exactly three 1,000-token completions per process")
+}
+if (workload.measurement?.bootstrap_iterations !== 20000) {
+  throw new Error("KR-2 requires exactly 20,000 bootstrap iterations")
+}
 if (workload.timeouts?.process_watchdog_seconds !== 240) throw new Error("KR-2 process watchdog must be exactly 240 seconds")
-process.stdout.write(`${workload.measurement.process_pairs}\t${workload.timeouts.process_watchdog_seconds}`)
+process.stdout.write(`${workload.measurement.process_pairs}\t${workload.timeouts.process_watchdog_seconds}`
+  + `\t${workload.preconditioning.completions}\t${workload.measurement.completions_per_process}`)
 ' "$WORKLOAD")"
-IFS=$'\t' read -r PROCESS_PAIR_COUNT PROCESS_TIMEOUT_SECONDS <<<"$WORKLOAD_CONTRACT"
-[[ "$PROCESS_PAIR_COUNT" == "10" && "$PROCESS_TIMEOUT_SECONDS" == "240" ]] \
+IFS=$'\t' read -r PROCESS_PAIR_COUNT PROCESS_TIMEOUT_SECONDS \
+    PRECONDITIONING_COUNT MEASUREMENT_COUNT <<<"$WORKLOAD_CONTRACT"
+[[ "$PROCESS_PAIR_COUNT" == "10" && "$PROCESS_TIMEOUT_SECONDS" == "240" \
+    && "$PRECONDITIONING_COUNT" == "2" && "$MEASUREMENT_COUNT" == "3" ]] \
     || fail "could not read the fixed workload orchestration contract"
 
 NODE_VERSION="$("$NODE_BIN" --version)"
@@ -211,6 +226,7 @@ cp "$STAGED_SOURCE" "$STAGED"
 STAGED_CREATED=1
 
 echo "[bench] real streaming completion; SDK=$SDK_VERSION pairs=$PROCESS_PAIR_COUNT threshold=1.05"
+echo "[bench] fixed preconditioning=${PRECONDITIONING_COUNT}x1000; measurements=${MEASUREMENT_COUNT}x1000 per process"
 echo "[bench] workload=$WORKLOAD"
 echo "[bench] model=$MODEL_PATH"
 echo "[bench] owned-process watchdog=${PROCESS_TIMEOUT_SECONDS}s; retries=0; exclusions=0"
@@ -239,6 +255,7 @@ run_one() {
     local client_kind="$1"
     local position="$2"
     local pair="$3"
+    local pair_order="$4"
     local run_dir="$EVIDENCE_DIR/position-$position-$client_kind"
     local result="$run_dir/result.json"
     local log="$run_dir/run.log"
@@ -263,9 +280,13 @@ run_one() {
         "QVAC_BENCH_BARE_VERSION=$BARE_VERSION"
         "QVAC_BENCH_SWIFT_VERSION=$SWIFT_VERSION"
         "QVAC_BENCH_HOST=$HOST_DESCRIPTION"
+        "QVAC_BENCH_SOURCE_COMMIT=$SOURCE_COMMIT"
+        "QVAC_BENCH_POSITION=$position"
+        "QVAC_BENCH_PAIR=$pair"
+        "QVAC_BENCH_PAIR_ORDER=$pair_order"
     )
 
-    echo "[bench] position=$position pair=$pair client=$client_kind"
+    echo "[bench] position=$position pair=$pair order=$pair_order client=$client_kind"
     if [[ "$client_kind" == "swift" ]]; then
         (
             cd "$REPO_ROOT"
@@ -312,8 +333,13 @@ run_one() {
         if "$NODE_BIN" -e '
 const { readFileSync } = require("node:fs")
 const sample = JSON.parse(readFileSync(process.argv[1], "utf8"))
-if (sample.schema_version !== 1 || sample.status !== "sample" || sample.client !== process.argv[2]) process.exit(2)
-' "$result" "$client_kind" >>"$log" 2>&1; then
+if (sample.schema_version !== 2 || sample.status !== "sample" || sample.client !== process.argv[2]) process.exit(2)
+if (sample.orchestration?.position !== process.argv[3]
+    || sample.orchestration?.pair !== process.argv[4]
+    || sample.orchestration?.pair_order !== process.argv[5]
+    || sample.source_commit !== process.argv[6]) process.exit(2)
+' "$result" "$client_kind" "$position" "$pair" "$pair_order" "$SOURCE_COMMIT" \
+                >>"$log" 2>&1; then
             result_valid=1
         fi
     fi
@@ -343,16 +369,24 @@ while [[ "$PAIR" -le "$PROCESS_PAIR_COUNT" ]]; do
     else
         PAIR_ORDER=(node swift)
     fi
+    PAIR_ORDER_LABEL="${PAIR_ORDER[0]}/${PAIR_ORDER[1]}"
     for CLIENT_KIND in "${PAIR_ORDER[@]}"; do
         POSITION=$((POSITION + 1))
         printf -v POSITION_LABEL '%02d' "$POSITION"
         printf -v PAIR_LABEL '%02d' "$PAIR"
-        run_one "$CLIENT_KIND" "$POSITION_LABEL" "$PAIR_LABEL"
+        run_one "$CLIENT_KIND" "$POSITION_LABEL" "$PAIR_LABEL" "$PAIR_ORDER_LABEL"
     done
     PAIR=$((PAIR + 1))
 done
 
 [[ "${#RESULTS[@]}" -eq 20 ]] || fail "internal error: expected exactly twenty process results"
+
+# Bind the aggregate to the same clean commit captured before compilation and
+# sampling. A concurrent checkout or source edit invalidates all evidence.
+verify_source_tree
+FINAL_SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+[[ "$FINAL_SOURCE_COMMIT" == "$SOURCE_COMMIT" ]] \
+    || fail "source commit changed while benchmark evidence was being recorded"
 
 ANALYSIS_LOG="$EVIDENCE_DIR/analysis.log"
 ANALYSIS_STATUS=0
@@ -364,6 +398,12 @@ if (
 else
     ANALYSIS_STATUS=$?
 fi
+# The analyzer itself is a benchmark input. Close the pre-analysis check/use
+# race before accepting its report or publishing it as grant evidence.
+verify_source_tree
+POST_ANALYSIS_SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+[[ "$POST_ANALYSIS_SOURCE_COMMIT" == "$SOURCE_COMMIT" ]] \
+    || fail "source commit changed while benchmark evidence was being analyzed"
 cat "$ANALYSIS_LOG"
 [[ -f "$RESULT_FILE" && ! -L "$RESULT_FILE" && -s "$RESULT_FILE" ]] \
     || fail "analyzer did not atomically publish a result"

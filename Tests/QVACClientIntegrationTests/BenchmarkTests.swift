@@ -1,8 +1,11 @@
 // Grant KR-2 — real streaming-completion latency, Swift versus JavaScript.
 //
-// `bench/run.sh` executes this release-built test in ten paired, order-balanced
-// processes alongside the exact @qvac/sdk 0.17 JavaScript client. The benchmark
-// is opt-in and requires the checksum-pinned model in `bench/workload.json`.
+// `bench/run.sh` executes this release-built test in ten adjacent process pairs
+// with execution-order allocation balanced against the exact @qvac/sdk 0.17
+// JavaScript client. It is opt-in and requires the checksum-pinned model in
+// `bench/workload.json`.
+// Every process performs two fixed workload-representative preconditioning
+// completions and then records all three fixed measurement completions.
 
 import CryptoKit
 import QVACClient
@@ -79,28 +82,25 @@ final class BenchmarkTests: XCTestCase {
             }
         }
 
-        struct Warmup: Decodable {
+        struct Preconditioning: Decodable {
             let predict: Int
-            let minimumCompletions: Int
-            let maximumCompletions: Int
-            let maximumRecentMeanRatio: Double
+            let completions: Int
 
             enum CodingKeys: String, CodingKey {
-                case predict
-                case minimumCompletions = "minimum_completions"
-                case maximumCompletions = "maximum_completions"
-                case maximumRecentMeanRatio = "maximum_recent_mean_ratio"
+                case predict, completions
             }
         }
 
         struct Measurement: Decodable {
             let predict: Int
+            let completionsPerProcess: Int
             let processPairs: Int
             let bootstrapIterations: Int
             let maximumOverheadRatio: Double
 
             enum CodingKeys: String, CodingKey {
                 case predict
+                case completionsPerProcess = "completions_per_process"
                 case processPairs = "process_pairs"
                 case bootstrapIterations = "bootstrap_iterations"
                 case maximumOverheadRatio = "maximum_overhead_ratio"
@@ -123,13 +123,13 @@ final class BenchmarkTests: XCTestCase {
         let criterion: String
         let model: Model
         let completion: Completion
-        let warmup: Warmup
+        let preconditioning: Preconditioning
         let measurement: Measurement
         let timeouts: Timeouts
 
         enum CodingKeys: String, CodingKey {
             case schemaVersion = "schema_version"
-            case criterion, model, completion, warmup, measurement, timeouts
+            case criterion, model, completion, preconditioning, measurement, timeouts
         }
     }
 
@@ -162,7 +162,7 @@ final class BenchmarkTests: XCTestCase {
             ]
         }
 
-        var warmupJSON: [String: Any] {
+        var preconditioningJSON: [String: Any] {
             [
                 "predict": predict,
                 "token_count": arrivalsMS.count,
@@ -201,6 +201,8 @@ final class BenchmarkTests: XCTestCase {
             "QVAC_BENCH_MODEL_PATH", "QVAC_BENCH_RESULT", "QVAC_BENCH_HOME",
             "QVAC_BENCH_NODE_VERSION", "QVAC_BENCH_BARE_VERSION",
             "QVAC_BENCH_SWIFT_VERSION", "QVAC_BENCH_HOST",
+            "QVAC_BENCH_SOURCE_COMMIT", "QVAC_BENCH_POSITION",
+            "QVAC_BENCH_PAIR", "QVAC_BENCH_PAIR_ORDER",
         ] {
             guard ProcessInfo.processInfo.environment[key]?.isEmpty == false else {
                 throw IntegrationPrerequisiteError("benchmark requires \(key)")
@@ -210,6 +212,10 @@ final class BenchmarkTests: XCTestCase {
 
     func test_streaming_completion_latency() async throws {
         let environment = ProcessInfo.processInfo.environment
+        let (sourceCommit, orchestration) = try Self.benchmarkIdentity(
+            client: "swift",
+            environment: environment
+        )
         let workloadURL = try Self.requiredFileURL("QVAC_BENCH_WORKLOAD", environment: environment)
         let modelURL = try Self.requiredFileURL("QVAC_BENCH_MODEL_PATH", environment: environment)
         let resultURL = try Self.requiredOutputURL("QVAC_BENCH_RESULT", environment: environment)
@@ -275,7 +281,9 @@ final class BenchmarkTests: XCTestCase {
             "configuration": "release",
         ]
         var loadedModelID: String?
-        var warmups: [CompletionSample] = []
+        var preconditioning: [CompletionSample] = []
+        var measurements: [CompletionSample] = []
+        var phase = "model_load"
         do {
             let modelConfig = workload.model.config
             let load = try await client.loadModel(
@@ -293,55 +301,45 @@ final class BenchmarkTests: XCTestCase {
             let modelID = try await load.result.value
             loadedModelID = modelID
 
-            var converged = false
-            for _ in 0..<workload.warmup.maximumCompletions {
-                let sample = try await Self.runCompletion(
+            phase = "preconditioning"
+            for _ in 0..<workload.preconditioning.completions {
+                preconditioning.append(try await Self.runCompletion(
                     client: client,
                     modelID: modelID,
-                    predict: workload.warmup.predict,
+                    predict: workload.preconditioning.predict,
                     workload: workload
-                )
-                warmups.append(sample)
-                if warmups.count >= workload.warmup.minimumCompletions {
-                    let recent = Array(warmups.suffix(workload.warmup.minimumCompletions))
-                    let means = recent.map(\.meanIntervalMS)
-                    guard let minimum = means.min(), let maximum = means.max(), minimum > 0 else {
-                        throw IntegrationPrerequisiteError("warmup did not produce positive intervals")
-                    }
-                    let output = (recent[0].contentSHA256, recent[0].rawOutputSHA256)
-                    if maximum / minimum <= workload.warmup.maximumRecentMeanRatio,
-                       recent.allSatisfy({ ($0.contentSHA256, $0.rawOutputSHA256) == output }) {
-                        converged = true
-                        break
-                    }
-                }
-            }
-            guard converged else {
-                throw IntegrationPrerequisiteError("streaming completion warmup did not converge")
+                ))
             }
 
-            let measurement = try await Self.runCompletion(
-                client: client,
-                modelID: modelID,
-                predict: workload.measurement.predict,
-                workload: workload
-            )
+            phase = "measurement"
+            for _ in 0..<workload.measurement.completionsPerProcess {
+                measurements.append(try await Self.runCompletion(
+                    client: client,
+                    modelID: modelID,
+                    predict: workload.measurement.predict,
+                    workload: workload
+                ))
+            }
+            phase = "unload_model"
             try await client.unloadModel(
                 modelId: modelID,
                 rpcOptions: .init(timeout: .milliseconds(workload.timeouts.modelLoadMS))
             )
             loadedModelID = nil
             await client.close()
+            phase = "complete"
 
             let result: [String: Any] = [
-                "schema_version": 1,
+                "schema_version": 2,
                 "status": "sample",
                 "client": "swift",
                 "api_surface": "QVACClient.completion(...).events",
+                "source_commit": sourceCommit,
+                "orchestration": orchestration,
                 "workload_sha256": workloadSHA256,
                 "model_sha256": modelSHA256,
-                "warmups": warmups.map(\.warmupJSON),
-                "measurement": measurement.measurementJSON,
+                "preconditioning": preconditioning.map(\.preconditioningJSON),
+                "measurements": measurements.map(\.measurementJSON),
                 "timeout_policy": timeoutPolicy,
                 "toolchain": toolchain,
             ]
@@ -351,33 +349,26 @@ final class BenchmarkTests: XCTestCase {
             )
             try data.write(to: resultURL, options: .atomic)
         } catch {
-            // Preserve partial convergence evidence while remaining fail-closed:
-            // bench/run.sh accepts only a successful status=sample document.
-            let recentMeans = warmups
-                .suffix(workload.warmup.minimumCompletions)
-                .map(\.meanIntervalMS)
-            let lastWindowRatio: Double?
-            if recentMeans.count == workload.warmup.minimumCompletions,
-               let minimum = recentMeans.min(), let maximum = recentMeans.max(), minimum > 0 {
-                lastWindowRatio = maximum / minimum
-            } else {
-                lastWindowRatio = nil
-            }
+            // Preserve every completed request for diagnosis while remaining
+            // fail-closed: bench/run.sh accepts only status=sample evidence.
             let errorResult: [String: Any] = [
-                "schema_version": 1,
+                "schema_version": 2,
                 "status": "error",
                 "client": "swift",
                 "api_surface": "QVACClient.completion(...).events",
+                "source_commit": sourceCommit,
+                "orchestration": orchestration,
                 "workload_sha256": workloadSHA256,
                 "model_sha256": modelSHA256,
                 "reason": String(describing: error),
-                "warmups": warmups.map(\.warmupJSON),
-                "warmup_diagnostic": [
-                    "observed_completions": warmups.count,
-                    "required_recent_completions": workload.warmup.minimumCompletions,
-                    "maximum_completions": workload.warmup.maximumCompletions,
-                    "maximum_recent_mean_ratio": workload.warmup.maximumRecentMeanRatio,
-                    "last_window_mean_ratio": Self.jsonValue(lastWindowRatio),
+                "preconditioning": preconditioning.map(\.preconditioningJSON),
+                "measurements": measurements.map(\.measurementJSON),
+                "progress": [
+                    "phase": phase,
+                    "expected_preconditioning_completions": workload.preconditioning.completions,
+                    "completed_preconditioning_completions": preconditioning.count,
+                    "expected_measurement_completions": workload.measurement.completionsPerProcess,
+                    "completed_measurement_completions": measurements.count,
                 ],
                 "timeout_policy": timeoutPolicy,
                 "toolchain": toolchain,
@@ -509,7 +500,7 @@ final class BenchmarkTests: XCTestCase {
     }
 
     private static func validate(_ workload: Workload) throws {
-        guard workload.schemaVersion == 1,
+        guard workload.schemaVersion == 2,
               workload.criterion == "Streaming completion latency overhead (Swift client vs. JS client on same machine) < 5%.",
               workload.model.byteCount > 0,
               workload.model.sha256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
@@ -520,19 +511,60 @@ final class BenchmarkTests: XCTestCase {
               !workload.completion.emitRawDeltas,
               !workload.completion.captureThinking,
               !workload.completion.kvCache,
-              workload.warmup.predict == 128,
-              workload.warmup.minimumCompletions == 3,
-              workload.warmup.maximumCompletions == 16,
-              workload.warmup.maximumRecentMeanRatio == 1.025,
+              workload.preconditioning.predict == 1_000,
+              workload.preconditioning.completions == 2,
               workload.measurement.predict == 1_000,
+              workload.measurement.completionsPerProcess == 3,
               workload.measurement.processPairs == 10,
-              workload.measurement.bootstrapIterations >= 20_000,
+              workload.measurement.bootstrapIterations == 20_000,
               workload.measurement.maximumOverheadRatio == 1.05,
               workload.timeouts.modelLoadMS == 180_000,
               workload.timeouts.completionIdleMS == 30_000,
               workload.timeouts.processWatchdogSeconds == 240 else {
             throw IntegrationPrerequisiteError("bench/workload.json violates the fixed KR-2 protocol")
         }
+    }
+
+    private static func benchmarkIdentity(
+        client: String,
+        environment: [String: String]
+    ) throws -> (sourceCommit: String, orchestration: [String: Any]) {
+        let sourceCommit = try required("QVAC_BENCH_SOURCE_COMMIT", environment)
+        let position = try required("QVAC_BENCH_POSITION", environment)
+        let pair = try required("QVAC_BENCH_PAIR", environment)
+        let pairOrder = try required("QVAC_BENCH_PAIR_ORDER", environment)
+        guard sourceCommit.range(
+            of: "^[0-9a-f]{40}$",
+            options: .regularExpression
+        ) != nil else {
+            throw IntegrationPrerequisiteError(
+                "QVAC_BENCH_SOURCE_COMMIT must be an exact 40-hex commit"
+            )
+        }
+        guard position.range(
+            of: "^(0[1-9]|1[0-9]|20)$",
+            options: .regularExpression
+        ) != nil,
+        pair.range(of: "^(0[1-9]|10)$", options: .regularExpression) != nil,
+        let positionNumber = Int(position),
+        let pairNumber = Int(pair) else {
+            throw IntegrationPrerequisiteError("benchmark position/pair identity is invalid")
+        }
+        let expectedPair = (positionNumber + 1) / 2
+        let expectedOrder = pairNumber.isMultiple(of: 2) ? "node/swift" : "swift/node"
+        let pairMembers = pairOrder.split(separator: "/").map(String.init)
+        guard pairNumber == expectedPair,
+              pairOrder == expectedOrder,
+              pairMembers.count == 2,
+              pairMembers[(positionNumber - 1) % 2] == client else {
+            throw IntegrationPrerequisiteError(
+                "benchmark client, position, pair, and execution order are inconsistent"
+            )
+        }
+        return (
+            sourceCommit,
+            ["position": position, "pair": pair, "pair_order": pairOrder]
+        )
     }
 
     private static func required(

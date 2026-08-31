@@ -230,6 +230,7 @@ jobs:
       - name: Verify the KR-2 statistical analyzer
         run: node bench/test-analyzer.mjs
       - name: Compare real streaming completion through the public Swift and JS APIs
+        timeout-minutes: 35
         env:
           QVAC_BENCH_MODEL_PATH: ${{ runner.temp }}/qvac-model-fixtures/2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d-SmolLM2-135M-Instruct-Q4_K_M.gguf
         run: bench/run.sh

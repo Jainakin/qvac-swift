@@ -3,16 +3,27 @@
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const [outputPath, workloadPath, ...runPaths] = process.argv.slice(2)
+const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
-const EXPECTED_ORDER = Array.from({ length: 10 }, (_, pair) =>
-  pair % 2 === 0 ? ['swift', 'node'] : ['node', 'swift']).flat()
+const ORDER_STRATA = ['swift/node', 'node/swift']
+const PAIRS_PER_ORDER_STRATUM = 5
+const EXPECTED_PAIR_ORDERS = Array.from(
+  { length: 10 },
+  (_, pair) => ORDER_STRATA[pair % ORDER_STRATA.length],
+)
+const EXPECTED_ORDER = EXPECTED_PAIR_ORDERS.flatMap(order => order.split('/'))
 const FIXED_BUDGET = 1.05
 const BOOTSTRAP_SEED = 0x517a9e31
 const SHA256_PATTERN = /^[0-9a-f]{64}$/
+const SOURCE_COMMIT_PATTERN = /^[0-9a-f]{40}$/
+const RUN_SCHEMA_VERSION = 2
+const REPORT_SCHEMA_VERSION = 5
 const WORKLOAD_CONTRACT = {
-  schema_version: 1,
+  schema_version: 2,
   criterion: 'Streaming completion latency overhead (Swift client vs. JS client on same machine) < 5%.',
   model: {
     name: 'SmolLM2-135M-Instruct-Q4_K_M.gguf',
@@ -45,15 +56,15 @@ const WORKLOAD_CONTRACT = {
       repeat_penalty: 1,
     },
   },
-  warmup: {
-    predict: 128,
-    minimum_completions: 3,
-    maximum_completions: 16,
-    maximum_recent_mean_ratio: 1.025,
+  preconditioning: {
+    predict: 1000,
+    completions: 2,
   },
   measurement: {
     predict: 1000,
+    completions_per_process: 3,
     process_pairs: 10,
+    bootstrap_iterations: 20_000,
     maximum_overhead_ratio: FIXED_BUDGET,
   },
   timeouts: {
@@ -74,7 +85,7 @@ function sourceCommit() {
   try {
     const value = execFileSync('git', ['rev-parse', 'HEAD'], {
       encoding: 'utf8',
-      cwd: process.cwd(),
+      cwd: REPOSITORY_ROOT,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim()
     return /^[0-9a-f]{40}$/.test(value) ? value : 'unknown'
@@ -180,17 +191,23 @@ function makeRandomIndex(seed) {
   }
 }
 
-// Resample adjacent process pairs as intact clusters. The same selected pairs
-// feed every metric in an iteration, preserving both temporal matching and the
-// dependence between the two co-primary endpoints.
+// Resample adjacent process pairs as intact clusters within the two fixed order
+// strata. Every replicate preserves the designed five Swift-first and five
+// Node-first pairs, along with endpoint dependence and temporal matching.
 function bootstrapPairedMetrics(pairs, iterations, keys) {
   const randomIndex = makeRandomIndex(BOOTSTRAP_SEED)
   const distributions = Object.fromEntries(keys.map(key => [key, []]))
+  const strata = ORDER_STRATA.map(order => {
+    const members = pairs.filter(pair => pair.order === order)
+    requireCondition(members.length === PAIRS_PER_ORDER_STRATUM,
+      `benchmark requires exactly ${PAIRS_PER_ORDER_STRATUM} ${order} pairs`)
+    return members
+  })
   for (let iteration = 0; iteration < iterations; iteration++) {
-    const selected = Array.from(
-      { length: pairs.length },
-      () => pairs[randomIndex(pairs.length)],
-    )
+    const selected = strata.flatMap(members => Array.from(
+      { length: PAIRS_PER_ORDER_STRATUM },
+      () => members[randomIndex(members.length)],
+    ))
     for (const key of keys) {
       distributions[key].push(geometricMean(selected.map(pair => pair[key])))
     }
@@ -214,7 +231,7 @@ function metricStatus([lower95, upper95], budget) {
 
 function validateWorkload(workload) {
   requireExactKeys(workload,
-    ['schema_version', 'criterion', 'model', 'completion', 'warmup', 'measurement', 'timeouts'],
+    ['schema_version', 'criterion', 'model', 'completion', 'preconditioning', 'measurement', 'timeouts'],
     'workload')
   requireExactValue(workload.schema_version, WORKLOAD_CONTRACT.schema_version,
     'workload.schema_version')
@@ -247,27 +264,28 @@ function validateWorkload(workload) {
       `workload.completion.generation.${key}`)
   }
 
-  requireExactKeys(workload.warmup,
-    ['predict', 'minimum_completions', 'maximum_completions', 'maximum_recent_mean_ratio'],
-    'workload.warmup')
-  for (const [key, value] of Object.entries(WORKLOAD_CONTRACT.warmup)) {
-    requireExactValue(workload.warmup[key], value, `workload.warmup.${key}`)
+  requireExactKeys(workload.preconditioning, ['predict', 'completions'],
+    'workload.preconditioning')
+  for (const [key, value] of Object.entries(WORKLOAD_CONTRACT.preconditioning)) {
+    requireExactValue(workload.preconditioning[key], value, `workload.preconditioning.${key}`)
   }
 
   requireExactKeys(workload.measurement,
-    ['predict', 'process_pairs', 'bootstrap_iterations', 'maximum_overhead_ratio'],
+    ['predict', 'completions_per_process', 'process_pairs', 'bootstrap_iterations',
+      'maximum_overhead_ratio'],
     'workload.measurement')
   requireExactValue(workload.measurement.predict, WORKLOAD_CONTRACT.measurement.predict,
     'workload.measurement.predict')
+  requireExactValue(workload.measurement.completions_per_process,
+    WORKLOAD_CONTRACT.measurement.completions_per_process,
+    'workload.measurement.completions_per_process')
   requireExactValue(workload.measurement.process_pairs,
     WORKLOAD_CONTRACT.measurement.process_pairs, 'workload.measurement.process_pairs')
   requireExactValue(workload.measurement.maximum_overhead_ratio, FIXED_BUDGET,
     'workload.measurement.maximum_overhead_ratio')
-  validateNumber(workload.measurement.bootstrap_iterations,
-    'workload.measurement.bootstrap_iterations', { integer: true })
-  requireCondition(workload.measurement.bootstrap_iterations >= 20_000
-      && workload.measurement.bootstrap_iterations <= 200_000,
-  'workload.measurement.bootstrap_iterations must be in 20000...200000')
+  requireExactValue(workload.measurement.bootstrap_iterations,
+    WORKLOAD_CONTRACT.measurement.bootstrap_iterations,
+    'workload.measurement.bootstrap_iterations')
 
   requireExactKeys(workload.timeouts,
     ['model_load_ms', 'completion_idle_ms', 'process_watchdog_seconds'], 'workload.timeouts')
@@ -301,41 +319,35 @@ function validateTimeoutPolicy(policy, workload, runNumber) {
   }
 }
 
-function validateWarmup(warmup, workload, runNumber, warmupNumber, expectedBackend) {
-  const name = `run ${runNumber} warmup ${warmupNumber}`
-  requireExactKeys(warmup, [
+function validatePreconditioning(sample, workload, runNumber, sampleNumber, expectedBackend) {
+  const name = `run ${runNumber} preconditioning ${sampleNumber}`
+  requireExactKeys(sample, [
     'predict', 'token_count', 'stop_reason', 'generated_tokens', 'emitted_tokens',
     'mean_token_interval_ms', 'content_sha256', 'raw_output_sha256',
     'content_matches_final', 'backend_device',
   ], name)
-  requireExactValue(warmup.predict, workload.warmup.predict, `${name}.predict`)
-  requireExactValue(warmup.token_count, workload.warmup.predict, `${name}.token_count`)
-  requireExactValue(warmup.stop_reason, 'length', `${name}.stop_reason`)
-  requireExactValue(warmup.generated_tokens, workload.warmup.predict, `${name}.generated_tokens`)
-  requireExactValue(warmup.emitted_tokens, workload.warmup.predict, `${name}.emitted_tokens`)
-  validateNumber(warmup.mean_token_interval_ms, `${name}.mean_token_interval_ms`)
-  validateSHA256(warmup.content_sha256, `${name}.content_sha256`)
-  validateSHA256(warmup.raw_output_sha256, `${name}.raw_output_sha256`)
-  requireExactValue(warmup.content_matches_final, true, `${name}.content_matches_final`)
-  requireExactValue(warmup.backend_device, expectedBackend, `${name}.backend_device`)
+  requireExactValue(sample.predict, workload.preconditioning.predict, `${name}.predict`)
+  requireExactValue(sample.token_count, workload.preconditioning.predict, `${name}.token_count`)
+  requireExactValue(sample.stop_reason, 'length', `${name}.stop_reason`)
+  requireExactValue(sample.generated_tokens, workload.preconditioning.predict,
+    `${name}.generated_tokens`)
+  requireExactValue(sample.emitted_tokens, workload.preconditioning.predict,
+    `${name}.emitted_tokens`)
+  validateNumber(sample.mean_token_interval_ms, `${name}.mean_token_interval_ms`)
+  validateSHA256(sample.content_sha256, `${name}.content_sha256`)
+  validateSHA256(sample.raw_output_sha256, `${name}.raw_output_sha256`)
+  requireExactValue(sample.content_matches_final, true, `${name}.content_matches_final`)
+  requireExactValue(sample.backend_device, expectedBackend, `${name}.backend_device`)
 }
 
-function warmupWindowConverged(warmups, size, threshold) {
-  const recent = warmups.slice(-size)
-  const means = recent.map(sample => sample.mean_token_interval_ms)
-  const sameOutput = recent.every(sample =>
-    sample.content_sha256 === recent[0].content_sha256
-      && sample.raw_output_sha256 === recent[0].raw_output_sha256)
-  return sameOutput && Math.max(...means) / Math.min(...means) <= threshold
-}
-
-function validateStats(stats, workload, runNumber) {
-  const name = `run ${runNumber} measurement.stats`
-  requireObject(stats, name)
-  for (const key of [
+function validateStats(stats, workload, runNumber, measurementNumber) {
+  const name = `run ${runNumber} measurement ${measurementNumber}.stats`
+  const numericKeys = [
     'timeToFirstToken', 'tokensPerSecond', 'cacheTokens', 'promptTokens',
     'generatedTokens', 'emittedTokens', 'avgConcurrentSeq',
-  ]) {
+  ]
+  requireExactKeys(stats, [...numericKeys, 'backendDevice'], name)
+  for (const key of numericKeys) {
     if (stats[key] !== undefined && stats[key] !== null) {
       validateNumber(stats[key], `${name}.${key}`, { positive: false })
       requireCondition(stats[key] >= 0, `${name}.${key} must be non-negative`)
@@ -348,8 +360,22 @@ function validateStats(stats, workload, runNumber) {
   requireExactValue(stats.backendDevice, workload.model.config.device, `${name}.backendDevice`)
 }
 
-function validateMeasurement(measurement, workload, runNumber) {
-  const name = `run ${runNumber} measurement`
+function validateOrchestration(orchestration, runNumber, expectedClient) {
+  const name = `run ${runNumber} orchestration`
+  requireExactKeys(orchestration, ['position', 'pair', 'pair_order'], name)
+  const pairNumber = Math.ceil(runNumber / 2)
+  const expectedPosition = String(runNumber).padStart(2, '0')
+  const expectedPair = String(pairNumber).padStart(2, '0')
+  const expectedPairOrder = EXPECTED_PAIR_ORDERS[pairNumber - 1]
+  requireExactValue(orchestration.position, expectedPosition, `${name}.position`)
+  requireExactValue(orchestration.pair, expectedPair, `${name}.pair`)
+  requireExactValue(orchestration.pair_order, expectedPairOrder, `${name}.pair_order`)
+  requireExactValue(expectedPairOrder.split('/')[(runNumber - 1) % 2], expectedClient,
+    `${name} client at position`)
+}
+
+function validateMeasurement(measurement, workload, runNumber, measurementNumber) {
+  const name = `run ${runNumber} measurement ${measurementNumber}`
   requireExactKeys(measurement, [
     'predict', 'ttft_ms', 'terminal_ms', 'token_arrival_offsets_ms',
     'token_intervals_ms', 'mean_token_interval_ms', 'content_sha256',
@@ -392,16 +418,17 @@ function validateMeasurement(measurement, workload, runNumber) {
   requireExactValue(measurement.content_matches_final, true, `${name}.content_matches_final`)
   validateSHA256(measurement.content_sha256, `${name}.content_sha256`)
   validateSHA256(measurement.raw_output_sha256, `${name}.raw_output_sha256`)
-  validateStats(measurement.stats, workload, runNumber)
+  validateStats(measurement.stats, workload, runNumber, measurementNumber)
 }
 
 function validateRun(run, workload, workloadSha256, runNumber, expectedClient) {
   const name = `run ${runNumber}`
   requireExactKeys(run, [
     'schema_version', 'status', 'client', 'api_surface', 'workload_sha256',
-    'model_sha256', 'warmups', 'measurement', 'timeout_policy', 'toolchain',
+    'model_sha256', 'source_commit', 'orchestration', 'preconditioning', 'measurements',
+    'timeout_policy', 'toolchain',
   ], name)
-  requireExactValue(run.schema_version, 1, `${name}.schema_version`)
+  requireExactValue(run.schema_version, RUN_SCHEMA_VERSION, `${name}.schema_version`)
   requireExactValue(run.status, 'sample', `${name}.status`)
   requireExactValue(run.client, expectedClient, `${name}.client`)
   const expectedSurface = expectedClient === 'swift'
@@ -410,68 +437,77 @@ function validateRun(run, workload, workloadSha256, runNumber, expectedClient) {
   requireExactValue(run.api_surface, expectedSurface, `${name}.api_surface`)
   requireExactValue(run.workload_sha256, workloadSha256, `${name}.workload_sha256`)
   requireExactValue(run.model_sha256, workload.model.sha256, `${name}.model_sha256`)
+  requireCondition(typeof run.source_commit === 'string'
+      && SOURCE_COMMIT_PATTERN.test(run.source_commit),
+  `${name}.source_commit must be an exact 40-hex commit`)
+  requireExactValue(run.source_commit, invalidContext.source_commit, `${name}.source_commit`)
+  validateOrchestration(run.orchestration, runNumber, expectedClient)
   validateTimeoutPolicy(run.timeout_policy, workload, runNumber)
   validateToolchain(run.toolchain, runNumber)
 
-  requireCondition(Array.isArray(run.warmups)
-      && run.warmups.length >= workload.warmup.minimum_completions
-      && run.warmups.length <= workload.warmup.maximum_completions,
-  `${name}.warmups must contain ${workload.warmup.minimum_completions}...${workload.warmup.maximum_completions} samples`)
-  run.warmups.forEach((warmup, index) => validateWarmup(
-    warmup,
+  requireCondition(Array.isArray(run.preconditioning)
+      && run.preconditioning.length === workload.preconditioning.completions,
+  `${name}.preconditioning must contain exactly ${workload.preconditioning.completions} samples`)
+  run.preconditioning.forEach((sample, index) => validatePreconditioning(
+    sample,
     workload,
     runNumber,
     index + 1,
     workload.model.config.device,
   ))
-  const warmupIdentity = `${run.warmups[0].content_sha256}/${run.warmups[0].raw_output_sha256}`
-  requireCondition(run.warmups.every(sample =>
-    `${sample.content_sha256}/${sample.raw_output_sha256}` === warmupIdentity),
-  `${name}.warmups produced different deterministic output`)
+  const preconditioningIdentity = `${run.preconditioning[0].content_sha256}/${run.preconditioning[0].raw_output_sha256}`
+  requireCondition(run.preconditioning.every(sample =>
+    `${sample.content_sha256}/${sample.raw_output_sha256}` === preconditioningIdentity),
+  `${name}.preconditioning produced different deterministic output`)
 
-  let firstConvergenceCount
-  for (let count = workload.warmup.minimum_completions; count <= run.warmups.length; count++) {
-    if (warmupWindowConverged(
-      run.warmups.slice(0, count),
-      workload.warmup.minimum_completions,
-      workload.warmup.maximum_recent_mean_ratio,
-    )) {
-      firstConvergenceCount = count
-      break
-    }
-  }
-  requireCondition(firstConvergenceCount !== undefined,
-    `${name}.warmups did not converge within the recorded samples`)
-  requireCondition(firstConvergenceCount === run.warmups.length,
-    `${name}.warmups continued after first convergence`)
-
-  validateMeasurement(run.measurement, workload, runNumber)
+  requireCondition(Array.isArray(run.measurements)
+      && run.measurements.length === workload.measurement.completions_per_process,
+  `${name}.measurements must contain exactly ${workload.measurement.completions_per_process} samples`)
+  run.measurements.forEach((measurement, index) =>
+    validateMeasurement(measurement, workload, runNumber, index + 1))
+  const outputIdentity = `${run.measurements[0].content_sha256}/${run.measurements[0].raw_output_sha256}`
+  requireCondition(run.measurements.every(sample =>
+    `${sample.content_sha256}/${sample.raw_output_sha256}` === outputIdentity),
+  `${name}.measurements produced different deterministic output`)
+  requireCondition(outputIdentity === preconditioningIdentity,
+    `${name}.preconditioning and measurement output differ`)
   return {
-    warmupIdentity,
-    outputIdentity: `${run.measurement.content_sha256}/${run.measurement.raw_output_sha256}`,
+    preconditioningIdentity,
+    outputIdentity,
   }
 }
 
 function runSummary(run, inputSHA256, index) {
-  const intervals = run.measurement.token_intervals_ms
+  const intervals = run.measurements.flatMap(measurement => measurement.token_intervals_ms)
+  const completionSummaries = run.measurements.map((measurement, measurementIndex) => ({
+    measurement: measurementIndex + 1,
+    mean_token_interval_ms: mean(measurement.token_intervals_ms),
+    p99_token_interval_ms: empiricalQuantile(measurement.token_intervals_ms, 0.99),
+    ttft_ms: measurement.ttft_ms,
+    terminal_ms: measurement.terminal_ms,
+  }))
   return {
     position: index + 1,
     input_sha256: inputSHA256,
     client: run.client,
     mean_token_interval_ms: mean(intervals),
     p99_token_interval_ms: empiricalQuantile(intervals, 0.99),
+    measurement_completion_count: run.measurements.length,
     token_interval_count: intervals.length,
-    ttft_ms: run.measurement.ttft_ms,
-    terminal_ms: run.measurement.terminal_ms,
-    backend_device: run.measurement.stats.backendDevice,
-    content_sha256: run.measurement.content_sha256,
-    raw_output_sha256: run.measurement.raw_output_sha256,
+    ttft_ms: mean(run.measurements.map(measurement => measurement.ttft_ms)),
+    terminal_ms: mean(run.measurements.map(measurement => measurement.terminal_ms)),
+    per_completion: completionSummaries,
+    backend_device: run.measurements[0].stats.backendDevice,
+    content_sha256: run.measurements[0].content_sha256,
+    raw_output_sha256: run.measurements[0].raw_output_sha256,
   }
 }
 
 function analyze() {
   requireCondition(outputPath && workloadPath,
-    'usage: analyze.mjs <result.json> <workload.json> <twenty schema-1 run.json paths>')
+    'usage: analyze.mjs <result.json> <workload.json> <twenty schema-2 run.json paths>')
+  requireCondition(SOURCE_COMMIT_PATTERN.test(invalidContext.source_commit),
+    'analyzer requires an exact 40-hex Git source commit at HEAD')
   requireCondition(runPaths.length === EXPECTED_ORDER.length,
     'KR-2 requires exactly ten adjacent alternating Swift/Node process pairs')
 
@@ -485,11 +521,23 @@ function analyze() {
   requireCondition(new Set(invalidContext.input_sample_sha256).size === runInputs.length,
     'every process sample must have unique independently recorded bytes')
   const runs = runInputs.map(input => input.value)
+  const observedPairOrders = Array.from({ length: runs.length / 2 }, (_, pairIndex) => {
+    const clients = runs.slice(pairIndex * 2, pairIndex * 2 + 2).map(run => run?.client)
+    requireCondition([...clients].sort().join('/') === 'node/swift',
+      `pair ${pairIndex + 1} must contain exactly one Swift and one Node process`)
+    return clients.join('/')
+  })
+  for (const order of ORDER_STRATA) {
+    requireCondition(
+      observedPairOrders.filter(observed => observed === order).length === PAIRS_PER_ORDER_STRATUM,
+      `benchmark requires exactly ${PAIRS_PER_ORDER_STRATUM} ${order} pairs`,
+    )
+  }
   requireCondition(runs.map(run => run?.client).join(',') === EXPECTED_ORDER.join(','),
     `benchmark process order must be ${EXPECTED_ORDER.join('/')}`)
 
   let expectedToolchain
-  let warmupIdentity
+  let preconditioningIdentity
   let outputIdentity
   for (const [index, run] of runs.entries()) {
     const identities = validateRun(
@@ -503,9 +551,9 @@ function analyze() {
     expectedToolchain ??= toolchain
     requireCondition(toolchain === expectedToolchain,
       `run ${index + 1} used a different toolchain`)
-    warmupIdentity ??= identities.warmupIdentity
-    requireCondition(identities.warmupIdentity === warmupIdentity,
-      `run ${index + 1} produced different deterministic warmup output`)
+    preconditioningIdentity ??= identities.preconditioningIdentity
+    requireCondition(identities.preconditioningIdentity === preconditioningIdentity,
+      `run ${index + 1} produced different deterministic preconditioning output`)
     outputIdentity ??= identities.outputIdentity
     requireCondition(identities.outputIdentity === outputIdentity,
       `run ${index + 1} produced different deterministic measured output`)
@@ -550,17 +598,18 @@ function analyze() {
   const metrics = {
     mean_token_interval: metric(
       'mean_ratio',
-      'geometric mean of paired per-process arithmetic-mean inter-token latency ratios',
+      'geometric mean of paired per-process pooled arithmetic-mean inter-token latency ratios',
       true,
     ),
     p99_token_interval: metric(
       'p99_ratio',
-      'geometric mean of paired per-process empirical nearest-rank p99 inter-token latency ratios',
+      'geometric mean of paired per-process pooled empirical nearest-rank p99 inter-token latency ratios',
       true,
     ),
-    ttft_diagnostic: metric('ttft_ratio', 'time to first public content delta', false),
+    ttft_diagnostic: metric(
+      'ttft_ratio', 'per-process mean time to first public content delta', false),
     terminal_diagnostic: metric(
-      'terminal_ratio', 'request start to public completionDone event', false),
+      'terminal_ratio', 'per-process mean request start to public completionDone event', false),
   }
   const primary = [metrics.mean_token_interval, metrics.p99_token_interval]
   const status = primary.every(value => value.status === 'pass')
@@ -568,7 +617,7 @@ function analyze() {
     : primary.some(value => value.status === 'fail') ? 'fail' : 'inconclusive'
 
   const report = {
-    schema_version: 4,
+    schema_version: REPORT_SCHEMA_VERSION,
     status,
     criterion: workload.criterion,
     source_commit: invalidContext.source_commit,
@@ -579,23 +628,35 @@ function analyze() {
     process_order: EXPECTED_ORDER.join('/'),
     process_pairs: workload.measurement.process_pairs,
     statistical_method: {
-      experimental_unit: 'adjacent order-balanced Swift/Node process pair',
-      per_process_mean: 'arithmetic mean of every positive inter-contentDelta interval',
-      per_process_p99: 'empirical nearest-rank p99 of every positive inter-contentDelta interval',
+      experimental_unit: 'adjacent Swift/Node process pair, with allocation stratified by execution order',
+      measured_completions_per_process: workload.measurement.completions_per_process,
+      intervals_per_process: workload.measurement.completions_per_process
+        * (workload.measurement.predict - 1),
+      per_process_mean: 'arithmetic mean of every positive inter-contentDelta interval pooled across all three fixed measured completions',
+      per_process_p99: 'empirical nearest-rank p99 of every positive inter-contentDelta interval pooled across all three fixed measured completions',
+      diagnostic_aggregation: 'arithmetic mean of the three completion-level TTFT or terminal latencies within each process',
       point_estimate: 'geometric mean of ten paired Swift/Node process ratios',
-      confidence_interval: 'deterministic paired-cluster percentile bootstrap, 2.5th–97.5th percentiles',
+      confidence_interval: 'deterministic order-stratified paired-cluster percentile bootstrap, preserving five Swift/Node and five Node/Swift pairs in every replicate, 2.5th–97.5th percentiles',
+      bootstrap_order_strata: Object.fromEntries(
+        ORDER_STRATA.map(order => [order, PAIRS_PER_ORDER_STRATUM]),
+      ),
       co_primary_decision: 'both 97.5th-percentile upper bounds must be < 1.05',
       bootstrap_seed: `0x${BOOTSTRAP_SEED.toString(16)}`,
       bootstrap_iterations: workload.measurement.bootstrap_iterations,
       exclusions: 'none',
+      retries: 0,
       token_interval_definition: 'monotonic-clock time between successive non-empty public contentDelta events; TTFT excluded and reported separately',
     },
-    warmup_policy: {
-      convergence_window: workload.warmup.minimum_completions,
-      maximum_completions: workload.warmup.maximum_completions,
-      maximum_recent_mean_ratio: workload.warmup.maximum_recent_mean_ratio,
-      stop_at_first_convergence: true,
-      validated_warmup_output: warmupIdentity,
+    preconditioning_policy: {
+      fixed_count: workload.preconditioning.completions,
+      tokens_per_completion: workload.preconditioning.predict,
+      timing_used_for_selection: false,
+      validated_output: preconditioningIdentity,
+    },
+    measurement_policy: {
+      fixed_completions_per_process: workload.measurement.completions_per_process,
+      tokens_per_completion: workload.measurement.predict,
+      all_completed_measurements_included: true,
     },
     maximum_overhead_ratio: FIXED_BUDGET,
     metrics,
@@ -623,7 +684,7 @@ try {
 } catch (error) {
   const reason = error instanceof Error ? error.message : String(error)
   const invalidReport = {
-    schema_version: 4,
+    schema_version: REPORT_SCHEMA_VERSION,
     status: 'invalid',
     reason,
     ...invalidContext,

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "criterion": "Streaming completion latency overhead (Swift client vs. JS client on same machine) < 5%.",
   "model": {
     "name": "SmolLM2-135M-Instruct-Q4_K_M.gguf",
@@ -32,14 +32,13 @@
       "repeat_penalty": 1
     }
   },
-  "warmup": {
-    "predict": 128,
-    "minimum_completions": 3,
-    "maximum_completions": 16,
-    "maximum_recent_mean_ratio": 1.025
+  "preconditioning": {
+    "predict": 1000,
+    "completions": 2
   },
   "measurement": {
     "predict": 1000,
+    "completions_per_process": 3,
     "process_pairs": 10,
     "bootstrap_iterations": 20000,
     "maximum_overhead_ratio": 1.05

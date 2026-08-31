@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { spawnSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import {
   mkdirSync,
   mkdtempSync,
@@ -20,9 +20,15 @@ const repositoryRoot = resolve(scriptDir, '..')
 const analyzerPath = join(scriptDir, 'analyze.mjs')
 const canonicalWorkloadPath = join(scriptDir, 'workload.json')
 const canonicalWorkload = JSON.parse(readFileSync(canonicalWorkloadPath, 'utf8'))
+const orchestratorSource = readFileSync(join(scriptDir, 'run.sh'), 'utf8')
 const order = Array.from({ length: 10 }, (_, pair) =>
   pair % 2 === 0 ? ['swift', 'node'] : ['node', 'swift']).flat()
 const root = mkdtempSync(join(tmpdir(), 'qvac-bench-analyzer-'))
+const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+  cwd: repositoryRoot,
+  encoding: 'utf8',
+}).trim()
+assert.match(sourceCommit, /^[0-9a-f]{40}$/)
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value))
@@ -37,22 +43,25 @@ function closeEnough(actual, expected, tolerance = 1e-12) {
     `expected ${actual} to be within ${tolerance} of ${expected}`)
 }
 
-function warmupSample(mean = 10) {
+const contentSHA256 = sha256('canonical measured content')
+const rawOutputSHA256 = sha256('canonical measured raw output')
+
+function preconditioningSample(mean = 10) {
   return {
-    predict: 128,
-    token_count: 128,
+    predict: 1000,
+    token_count: 1000,
     stop_reason: 'length',
-    generated_tokens: 128,
-    emitted_tokens: 128,
+    generated_tokens: 1000,
+    emitted_tokens: 1000,
     mean_token_interval_ms: mean,
-    content_sha256: sha256('canonical warmup content'),
-    raw_output_sha256: sha256('canonical warmup raw output'),
+    content_sha256: contentSHA256,
+    raw_output_sha256: rawOutputSHA256,
     content_matches_final: true,
     backend_device: 'gpu',
   }
 }
 
-function intervalsFor(client, pair, scenario) {
+function intervalsFor(client, pair, scenario, measurementIndex) {
   if (scenario === 'boundary') {
     // 21 / 20 is exactly the contractual 1.05 decision boundary after each
     // per-process arithmetic mean is formed.
@@ -66,19 +75,55 @@ function intervalsFor(client, pair, scenario) {
     if (client === 'node') return Array(999).fill(1)
     return [...Array(979).fill(1), ...Array(20).fill(1.06)]
   }
+  if (scenario === 'one-measurement-regression') {
+    const ratio = client === 'swift' && measurementIndex === 2 ? 1.12 : 1
+    return Array(999).fill(ratio)
+  }
+  if (scenario === 'strong-order-effect') {
+    const ratio = pair % 2 === 0 ? 0.8 : 1.2
+    return Array(999).fill(client === 'swift' ? ratio : 1)
+  }
   const ratio = scenario === 'fail' ? 1.06 : 1.04
   return Array(999).fill(client === 'swift' ? ratio : 1)
 }
 
-function sampleFor(client, pair, workloadSha256, scenario) {
-  const intervals = intervalsFor(client, pair, scenario)
+function measurementFor(client, pair, scenario, measurementIndex) {
+  const intervals = intervalsFor(client, pair, scenario, measurementIndex)
   // Synthetic process evidence must remain independently identifiable even
   // when a scenario deliberately gives several runs identical interval data.
-  const arrivals = [50 + (pair * 0.01) + (client === 'swift' ? 0.001 : 0)]
+  const arrivals = [
+    50 + (pair * 0.01) + (client === 'swift' ? 0.001 : 0) + (measurementIndex * 0.0001),
+  ]
   for (const interval of intervals) arrivals.push(arrivals.at(-1) + interval)
   const mean = intervals.reduce((sum, value) => sum + value, 0) / intervals.length
   return {
-    schema_version: 1,
+    predict: 1000,
+    ttft_ms: arrivals[0],
+    terminal_ms: arrivals.at(-1) + 1,
+    token_arrival_offsets_ms: arrivals,
+    token_intervals_ms: intervals,
+    mean_token_interval_ms: mean,
+    content_sha256: contentSHA256,
+    raw_output_sha256: rawOutputSHA256,
+    content_matches_final: true,
+    stop_reason: 'length',
+    stats: {
+      timeToFirstToken: 50,
+      tokensPerSecond: 100,
+      cacheTokens: 0,
+      promptTokens: 25,
+      generatedTokens: 1000,
+      emittedTokens: 1000,
+      avgConcurrentSeq: 1,
+      backendDevice: 'gpu',
+    },
+  }
+}
+
+function sampleFor(client, positionIndex, workloadSha256, scenario) {
+  const pair = Math.floor(positionIndex / 2)
+  return {
+    schema_version: 2,
     status: 'sample',
     client,
     api_surface: client === 'swift'
@@ -86,29 +131,19 @@ function sampleFor(client, pair, workloadSha256, scenario) {
       : '@qvac/sdk completion(...).events',
     workload_sha256: workloadSha256,
     model_sha256: canonicalWorkload.model.sha256,
-    warmups: [warmupSample(), warmupSample(10.1), warmupSample(10.2)],
-    measurement: {
-      predict: 1000,
-      ttft_ms: arrivals[0],
-      terminal_ms: arrivals.at(-1) + 1,
-      token_arrival_offsets_ms: arrivals,
-      token_intervals_ms: intervals,
-      mean_token_interval_ms: mean,
-      content_sha256: sha256('canonical measured content'),
-      raw_output_sha256: sha256('canonical measured raw output'),
-      content_matches_final: true,
-      stop_reason: 'length',
-      stats: {
-        timeToFirstToken: 50,
-        tokensPerSecond: 100,
-        cacheTokens: 0,
-        promptTokens: 25,
-        generatedTokens: 1000,
-        emittedTokens: 1000,
-        avgConcurrentSeq: 1,
-        backendDevice: 'gpu',
-      },
+    source_commit: sourceCommit,
+    orchestration: {
+      position: String(positionIndex + 1).padStart(2, '0'),
+      pair: String(pair + 1).padStart(2, '0'),
+      pair_order: pair % 2 === 0 ? 'swift/node' : 'node/swift',
     },
+    // These intentionally differ by far more than 2.5%. Fixed work is valid;
+    // no timing observation is allowed to select or discard later evidence.
+    preconditioning: [preconditioningSample(10.425), preconditioningSample(8.862)],
+    measurements: Array.from(
+      { length: 3 },
+      (_, measurementIndex) => measurementFor(client, pair, scenario, measurementIndex),
+    ),
     timeout_policy: {
       model_load_ms: 180000,
       completion_idle_ms: 30000,
@@ -139,7 +174,7 @@ function makeCase(name, {
   writeFileSync(workloadPath, workloadBytes)
   const workloadSha256 = sha256(workloadBytes)
   const samples = order.map((client, index) =>
-    sampleFor(client, Math.floor(index / 2), workloadSha256, scenario))
+    sampleFor(client, index, workloadSha256, scenario))
   mutateSamples?.(samples)
   const runPaths = samples.map((sample, index) => {
     const path = join(directory, `run-${String(index + 1).padStart(2, '0')}.json`)
@@ -147,6 +182,16 @@ function makeCase(name, {
     return path
   })
   return { directory, workloadPath, runPaths }
+}
+
+function pathsInPairOrder(testCase, pairOrders) {
+  const swift = testCase.runPaths.filter((_, index) => order[index] === 'swift')
+  const node = testCase.runPaths.filter((_, index) => order[index] === 'node')
+  let swiftIndex = 0
+  let nodeIndex = 0
+  return pairOrders.flatMap(pairOrder => pairOrder === 'swift/node'
+    ? [swift[swiftIndex++], node[nodeIndex++]]
+    : [node[nodeIndex++], swift[swiftIndex++]])
 }
 
 function runAnalyzer(testCase, outputName = 'result.json', paths = testCase.runPaths) {
@@ -167,27 +212,48 @@ function runAnalyzer(testCase, outputName = 'result.json', paths = testCase.runP
 
 function assertInvalid(result, reasonPattern) {
   assert.equal(result.process.status, 3, result.process.stderr || result.process.stdout)
-  assert.equal(result.report.schema_version, 4)
+  assert.equal(result.report.schema_version, 5)
   assert.equal(result.report.status, 'invalid')
   assert.match(result.report.reason, reasonPattern)
   assert.match(result.process.stderr, /\[bench\] invalid:/)
 }
 
 try {
+  const sourceTreeChecks = [...orchestratorSource.matchAll(/^verify_source_tree$/gm)]
+  assert.equal(sourceTreeChecks.length, 3,
+    'orchestrator must verify source provenance before setup, before analysis, and after analysis')
+  assert.ok(sourceTreeChecks[2].index > orchestratorSource.indexOf('ANALYSIS_STATUS=$?'),
+    'orchestrator post-analysis provenance check is not after analyzer execution')
+
   const passCase = makeCase('pass')
   const pass = runAnalyzer(passCase)
   assert.equal(pass.process.status, 0, pass.process.stderr || pass.process.stdout)
-  assert.equal(pass.report.schema_version, 4)
+  assert.equal(pass.report.schema_version, 5)
   assert.equal(pass.report.status, 'pass')
   assert.equal(pass.report.maximum_overhead_ratio, 1.05)
+  assert.equal(pass.report.source_commit, sourceCommit)
   assert.equal(pass.report.process_pairs, 10)
   assert.equal(pass.report.process_order, order.join('/'))
   assert.equal(pass.report.ordered_process_runs.length, 20)
   assert.equal(pass.report.ordered_input_sha256.length, 20)
   assert.equal(pass.report.statistical_method.bootstrap_iterations, 20000)
   assert.equal(pass.report.statistical_method.exclusions, 'none')
-  assert.equal(pass.report.warmup_policy.stop_at_first_convergence, true)
-  assert.equal(pass.report.warmup_policy.maximum_completions, 16)
+  assert.equal(pass.report.statistical_method.retries, 0)
+  assert.equal(pass.report.statistical_method.measured_completions_per_process, 3)
+  assert.equal(pass.report.statistical_method.intervals_per_process, 2997)
+  assert.deepEqual(pass.report.statistical_method.bootstrap_order_strata, {
+    'swift/node': 5,
+    'node/swift': 5,
+  })
+  assert.equal(pass.report.preconditioning_policy.fixed_count, 2)
+  assert.equal(pass.report.preconditioning_policy.tokens_per_completion, 1000)
+  assert.equal(pass.report.preconditioning_policy.timing_used_for_selection, false)
+  assert.equal(pass.report.measurement_policy.fixed_completions_per_process, 3)
+  assert.equal(pass.report.measurement_policy.all_completed_measurements_included, true)
+  assert.ok(pass.report.ordered_process_runs.every(run =>
+    run.preconditioning.length === 2 && run.measurements.length === 3))
+  assert.ok(pass.report.pairs.every(pair =>
+    pair.swift.token_interval_count === 2997 && pair.node.token_interval_count === 2997))
   assert.equal(pass.report.metrics.mean_token_interval.status, 'pass')
   assert.equal(pass.report.metrics.p99_token_interval.status, 'pass')
   closeEnough(pass.report.metrics.mean_token_interval.ratio, 1.04)
@@ -214,6 +280,18 @@ try {
   assert.ok(inconclusive.report.metrics.mean_token_interval.ratio_ci95[0] <= 1.05)
   assert.ok(inconclusive.report.metrics.mean_token_interval.ratio_ci95[1] > 1.05)
 
+  const strongOrderEffect = runAnalyzer(makeCase('strong-order-effect', {
+    scenario: 'strong-order-effect',
+  }))
+  assert.equal(strongOrderEffect.process.status, 0,
+    strongOrderEffect.process.stderr || strongOrderEffect.process.stdout)
+  const balancedOrderRatio = Math.sqrt(0.8 * 1.2)
+  closeEnough(strongOrderEffect.report.metrics.mean_token_interval.ratio, balancedOrderRatio)
+  closeEnough(strongOrderEffect.report.metrics.mean_token_interval.ratio_ci95[0],
+    balancedOrderRatio)
+  closeEnough(strongOrderEffect.report.metrics.mean_token_interval.ratio_ci95[1],
+    balancedOrderRatio)
+
   const tailFailure = runAnalyzer(makeCase('p99-regression', { scenario: 'p99-regression' }))
   assert.equal(tailFailure.process.status, 1,
     tailFailure.process.stderr || tailFailure.process.stdout)
@@ -222,6 +300,15 @@ try {
   assert.equal(tailFailure.report.metrics.p99_token_interval.status, 'fail')
   assert.ok(tailFailure.report.metrics.mean_token_interval.ratio < 1.01)
   closeEnough(tailFailure.report.metrics.p99_token_interval.ratio, 1.06)
+
+  const retainedRegression = runAnalyzer(makeCase('one-measurement-regression', {
+    scenario: 'one-measurement-regression',
+  }))
+  assert.equal(retainedRegression.process.status, 1,
+    retainedRegression.process.stderr || retainedRegression.process.stdout)
+  assert.equal(retainedRegression.report.status, 'fail')
+  closeEnough(retainedRegression.report.metrics.mean_token_interval.ratio, 1.04)
+  closeEnough(retainedRegression.report.metrics.p99_token_interval.ratio, 1.12)
 
   const deterministicA = runAnalyzer(passCase, 'deterministic-a.json')
   const deterministicB = runAnalyzer(passCase, 'deterministic-b.json')
@@ -233,21 +320,46 @@ try {
     'fixed-seed analysis was not byte deterministic',
   )
 
-  const lateConvergence = runAnalyzer(makeCase('late-convergence', {
+  const noisyPreconditioning = runAnalyzer(makeCase('fixed-noisy-preconditioning', {
     mutateSamples: samples => {
-      const means = [10, 12, 10, 12, 10, 12, 10, 12, 10, 10.1, 10.2]
-      for (const sample of samples) sample.warmups = means.map(warmupSample)
+      for (const sample of samples) {
+        sample.preconditioning = [
+          preconditioningSample(5.576),
+          preconditioningSample(10.557),
+        ]
+      }
     },
   }))
-  assert.equal(lateConvergence.process.status, 0,
-    lateConvergence.process.stderr || lateConvergence.process.stdout)
-  assert.equal(lateConvergence.report.status, 'pass')
-  assert.ok(lateConvergence.report.ordered_process_runs.every(run => run.warmups.length === 11))
+  assert.equal(noisyPreconditioning.process.status, 0,
+    noisyPreconditioning.process.stderr || noisyPreconditioning.process.stdout)
+  assert.equal(noisyPreconditioning.report.status, 'pass')
 
-  const orderCase = makeCase('order')
-  const wrongOrder = [...orderCase.runPaths]
-  ;[wrongOrder[0], wrongOrder[1]] = [wrongOrder[1], wrongOrder[0]]
+  const allocationCase = makeCase('order-allocation')
+  const wrongAllocation = [...allocationCase.runPaths]
+  ;[wrongAllocation[0], wrongAllocation[1]] = [wrongAllocation[1], wrongAllocation[0]]
+  assertInvalid(runAnalyzer(allocationCase, 'result.json', wrongAllocation),
+    /requires exactly 5 swift\/node pairs/)
+
+  const orderCase = makeCase('order-sequence')
+  const wrongOrder = pathsInPairOrder(orderCase, [
+    ...Array(5).fill('swift/node'),
+    ...Array(5).fill('node/swift'),
+  ])
   assertInvalid(runAnalyzer(orderCase, 'result.json', wrongOrder), /process order/)
+
+  const replayCase = makeCase('same-client-position-replay')
+  const replayedPaths = [...replayCase.runPaths]
+  ;[replayedPaths[0], replayedPaths[3]] = [replayedPaths[3], replayedPaths[0]]
+  assertInvalid(runAnalyzer(replayCase, 'result.json', replayedPaths),
+    /orchestration\.position/)
+
+  assertInvalid(runAnalyzer(makeCase('source-commit-tampering', {
+    mutateSamples: samples => { samples[0].source_commit = '0'.repeat(40) },
+  })), /source_commit/)
+
+  assertInvalid(runAnalyzer(makeCase('orchestration-tampering', {
+    mutateSamples: samples => { samples[4].orchestration.pair = '10' },
+  })), /orchestration\.pair/)
 
   assertInvalid(runAnalyzer(makeCase('provenance', {
     mutateSamples: samples => { samples[0].model_sha256 = '0'.repeat(64) },
@@ -255,9 +367,9 @@ try {
 
   assertInvalid(runAnalyzer(makeCase('output-mismatch', {
     mutateSamples: samples => {
-      samples[19].measurement.raw_output_sha256 = sha256('different measured output')
+      samples[19].measurements[2].raw_output_sha256 = sha256('different measured output')
     },
-  })), /different deterministic measured output/)
+  })), /measurements produced different deterministic output/)
 
   const duplicateInputCase = makeCase('duplicate-input')
   const duplicateInputPaths = [...duplicateInputCase.runPaths]
@@ -275,51 +387,76 @@ try {
   })), /timeout_policy\.completion_idle_ms/)
 
   assertInvalid(runAnalyzer(makeCase('count', {
-    mutateSamples: samples => { samples[5].measurement.token_intervals_ms.pop() },
+    mutateSamples: samples => { samples[5].measurements[1].token_intervals_ms.pop() },
   })), /must contain exactly 999 values/)
 
   assertInvalid(runAnalyzer(makeCase('nonfinite', {
-    mutateSamples: samples => { samples[6].measurement.token_intervals_ms[10] = null },
+    mutateSamples: samples => { samples[6].measurements[2].token_intervals_ms[10] = null },
   })), /must be finite/)
 
-  assertInvalid(runAnalyzer(makeCase('warmup-convergence', {
+  assertInvalid(runAnalyzer(makeCase('preconditioning-output-mismatch', {
     mutateSamples: samples => {
-      samples[7].warmups[2].mean_token_interval_ms = 10.3
+      samples[7].preconditioning[1].raw_output_sha256 = sha256('different preconditioning')
     },
-  })), /warmups did not converge/)
+  })), /preconditioning produced different deterministic output/)
 
-  assertInvalid(runAnalyzer(makeCase('warmup-count-proof', {
-    mutateSamples: samples => { samples[8].warmups[0].generated_tokens = 127 },
+  assertInvalid(runAnalyzer(makeCase('preconditioning-count-proof', {
+    mutateSamples: samples => { samples[8].preconditioning[0].generated_tokens = 999 },
   })), /generated_tokens/)
 
-  assertInvalid(runAnalyzer(makeCase('post-convergence-warmup', {
-    mutateSamples: samples => { samples[9].warmups.push(warmupSample()) },
-  })), /continued after first convergence/)
-
-  assertInvalid(runAnalyzer(makeCase('warmup-cap-exceeded', {
+  assertInvalid(runAnalyzer(makeCase('extra-preconditioning', {
     mutateSamples: samples => {
-      const means = Array.from({ length: 17 }, (_, index) => index % 2 === 0 ? 10 : 12)
-      for (const sample of samples) sample.warmups = means.map(warmupSample)
+      samples[9].preconditioning.push(preconditioningSample())
     },
-  })), /must contain 3\.\.\.16 samples/)
+  })), /preconditioning must contain exactly 2 samples/)
+
+  assertInvalid(runAnalyzer(makeCase('missing-preconditioning', {
+    mutateSamples: samples => { samples[9].preconditioning.pop() },
+  })), /preconditioning must contain exactly 2 samples/)
+
+  assertInvalid(runAnalyzer(makeCase('missing-measurement', {
+    mutateSamples: samples => { samples[10].measurements.pop() },
+  })), /measurements must contain exactly 3 samples/)
+
+  assertInvalid(runAnalyzer(makeCase('extra-measurement', {
+    mutateSamples: samples => {
+      samples[10].measurements.push(clone(samples[10].measurements[0]))
+    },
+  })), /measurements must contain exactly 3 samples/)
 
   assertInvalid(runAnalyzer(makeCase('threshold-override', {
     mutateWorkload: workload => { workload.measurement.maximum_overhead_ratio = 1.051 },
   })), /maximum_overhead_ratio/)
 
-  assertInvalid(runAnalyzer(makeCase('warmup-cap-override', {
-    mutateWorkload: workload => { workload.warmup.maximum_completions = 15 },
-  })), /maximum_completions/)
+  assertInvalid(runAnalyzer(makeCase('preconditioning-count-override', {
+    mutateWorkload: workload => { workload.preconditioning.completions = 1 },
+  })), /preconditioning\.completions/)
+
+  assertInvalid(runAnalyzer(makeCase('measurement-count-override', {
+    mutateWorkload: workload => { workload.measurement.completions_per_process = 2 },
+  })), /measurement\.completions_per_process/)
+
+  assertInvalid(runAnalyzer(makeCase('bootstrap-count-lower-override', {
+    mutateWorkload: workload => { workload.measurement.bootstrap_iterations = 19_999 },
+  })), /measurement\.bootstrap_iterations/)
+
+  assertInvalid(runAnalyzer(makeCase('bootstrap-count-upper-override', {
+    mutateWorkload: workload => { workload.measurement.bootstrap_iterations = 20_001 },
+  })), /measurement\.bootstrap_iterations/)
+
+  assertInvalid(runAnalyzer(makeCase('extra-stats-key', {
+    mutateSamples: samples => { samples[11].measurements[2].stats.unexpected = 1 },
+  })), /measurement 3\.stats keys must be exactly/)
 
   assertInvalid(runAnalyzer(makeCase('recorded-mean-mismatch', {
-    mutateSamples: samples => { samples[10].measurement.mean_token_interval_ms += 0.01 },
+    mutateSamples: samples => { samples[10].measurements[1].mean_token_interval_ms += 0.01 },
   })), /does not match the complete interval sample/)
 
   const atomicInvalidCase = makeCase('atomic-invalid', {
-    mutateSamples: samples => { samples[0].warmups[0].token_count = 127 },
+    mutateSamples: samples => { samples[0].preconditioning[0].token_count = 999 },
   })
   const staleOutput = join(atomicInvalidCase.directory, 'result.json')
-  writeFileSync(staleOutput, '{"schema_version":4,"status":"pass"}\n')
+  writeFileSync(staleOutput, '{"schema_version":5,"status":"pass"}\n')
   const atomicInvalid = runAnalyzer(atomicInvalidCase)
   assertInvalid(atomicInvalid, /token_count/)
   assert.equal(readdirSync(atomicInvalidCase.directory)
@@ -327,7 +464,7 @@ try {
   'atomic evidence write left a temporary file behind')
 
   console.log(
-    '[bench-test] schema-4 pass/fail/inconclusive, strict 5% boundary, co-primary tail gate, deterministic paired bootstrap, atomic invalid evidence, and strict provenance guards passed',
+    '[bench-test] schema-5 fixed preconditioning, three-measurement pooling, pass/fail/inconclusive, strict 5% boundary, co-primary tail gate, deterministic order-stratified paired bootstrap, atomic invalid evidence, and strict provenance guards passed',
   )
 } finally {
   rmSync(root, { recursive: true, force: true })

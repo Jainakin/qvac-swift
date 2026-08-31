@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from 'node:crypto'
-import { createReadStream, lstatSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { createReadStream, lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { completion, loadModel, unloadModel, close } from '@qvac/sdk'
@@ -20,6 +20,31 @@ function requireCondition(condition, message) {
   if (!condition) throw new Error(message)
 }
 
+function benchmarkIdentity(client) {
+  const sourceCommit = process.env.QVAC_BENCH_SOURCE_COMMIT
+  const position = process.env.QVAC_BENCH_POSITION
+  const pair = process.env.QVAC_BENCH_PAIR
+  const pairOrder = process.env.QVAC_BENCH_PAIR_ORDER
+  requireCondition(typeof sourceCommit === 'string' && /^[0-9a-f]{40}$/.test(sourceCommit),
+    'QVAC_BENCH_SOURCE_COMMIT must be an exact 40-hex commit')
+  requireCondition(typeof position === 'string' && /^(?:0[1-9]|1[0-9]|20)$/.test(position),
+    'QVAC_BENCH_POSITION must be 01...20')
+  requireCondition(typeof pair === 'string' && /^(?:0[1-9]|10)$/.test(pair),
+    'QVAC_BENCH_PAIR must be 01...10')
+  const positionNumber = Number(position)
+  const pairNumber = Number(pair)
+  const expectedPair = Math.ceil(positionNumber / 2)
+  const expectedOrder = pairNumber % 2 === 1 ? 'swift/node' : 'node/swift'
+  requireCondition(pairNumber === expectedPair, 'benchmark position does not belong to its pair')
+  requireCondition(pairOrder === expectedOrder, 'benchmark pair order violates fixed alternation')
+  requireCondition(pairOrder.split('/')[(positionNumber - 1) % 2] === client,
+    'benchmark client does not match its position within the pair')
+  return {
+    sourceCommit,
+    orchestration: { position, pair, pair_order: pairOrder },
+  }
+}
+
 async function sha256File(path) {
   const hash = createHash('sha256')
   for await (const chunk of createReadStream(path)) hash.update(chunk)
@@ -28,8 +53,13 @@ async function sha256File(path) {
 
 function atomicWriteJSON(path, value) {
   const temporary = `${path}.tmp-${process.pid}`
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { flag: 'wx' })
-  renameSync(temporary, path)
+  try {
+    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { flag: 'wx' })
+    renameSync(temporary, path)
+  } catch (error) {
+    rmSync(temporary, { force: true })
+    throw error
+  }
 }
 
 function numberField(value, name) {
@@ -41,23 +71,8 @@ function generationParams(predict) {
   return { ...workload.completion.generation, predict }
 }
 
-function warmupDiagnostic(warmups) {
-  const recent = warmups.slice(-workload.warmup.minimum_completions)
-  const means = recent.map(sample => sample.mean_token_interval_ms)
-  const lastWindowRatio = means.length === workload.warmup.minimum_completions
-    ? Math.max(...means) / Math.min(...means)
-    : null
-  return {
-    observed_completions: warmups.length,
-    required_recent_completions: workload.warmup.minimum_completions,
-    maximum_completions: workload.warmup.maximum_completions,
-    maximum_recent_mean_ratio: workload.warmup.maximum_recent_mean_ratio,
-    last_window_mean_ratio: lastWindowRatio,
-  }
-}
-
 function validateWorkload() {
-  requireCondition(workload.schema_version === 1, 'workload schema_version must be 1')
+  requireCondition(workload.schema_version === 2, 'workload schema_version must be 2')
   requireCondition(
     workload.criterion === 'Streaming completion latency overhead (Swift client vs. JS client on same machine) < 5%.',
     'workload criterion does not match grant KR-2',
@@ -71,14 +86,13 @@ function validateWorkload() {
     && workload.completion.capture_thinking === false
     && workload.completion.kv_cache === false,
   'workload completion flags violate the fixed KR-2 protocol')
-  requireCondition(workload.warmup.predict === 128
-    && workload.warmup.minimum_completions === 3
-    && workload.warmup.maximum_completions === 16
-    && workload.warmup.maximum_recent_mean_ratio === 1.025,
-  'workload warmup policy violates the fixed KR-2 protocol')
+  requireCondition(workload.preconditioning.predict === 1000
+    && workload.preconditioning.completions === 2,
+  'workload preconditioning policy violates the fixed KR-2 protocol')
   requireCondition(workload.measurement.predict === 1000
+    && workload.measurement.completions_per_process === 3
     && workload.measurement.process_pairs === 10
-    && workload.measurement.bootstrap_iterations >= 20000
+    && workload.measurement.bootstrap_iterations === 20000
     && workload.measurement.maximum_overhead_ratio === 1.05,
   'workload measurement policy violates the fixed KR-2 protocol')
   requireCondition(workload.timeouts.model_load_ms === 180000
@@ -170,6 +184,7 @@ requireCondition(modelSha256 === workload.model.sha256,
   `model fixture SHA-256 mismatch: expected ${workload.model.sha256}, got ${modelSha256}`)
 
 validateWorkload()
+const { sourceCommit, orchestration } = benchmarkIdentity('node')
 const runtimePackage = JSON.parse(readFileSync(join(runtimeRoot, 'package.json'), 'utf8'))
 const sdkPackage = JSON.parse(readFileSync(
   join(runtimeRoot, 'node_modules', '@qvac', 'sdk', 'package.json'),
@@ -195,7 +210,10 @@ const timeoutPolicy = {
 }
 
 let modelId
-const warmups = []
+let closed = false
+const preconditioning = []
+const measurements = []
+let phase = 'model_load'
 try {
   modelId = await loadModel({
     modelSrc: modelPath,
@@ -203,10 +221,12 @@ try {
     modelConfig: workload.model.config,
   }, { timeout: workload.timeouts.model_load_ms })
 
-  let converged = false
-  for (let index = 0; index < workload.warmup.maximum_completions; index++) {
-    const sample = await runCompletion(modelId, workload.warmup.predict)
-    warmups.push({
+  // Fixed counts equalize work across clients. Timing observations are
+  // recorded for provenance only and never control selection or stopping.
+  phase = 'preconditioning'
+  for (let index = 0; index < workload.preconditioning.completions; index++) {
+    const sample = await runCompletion(modelId, workload.preconditioning.predict)
+    preconditioning.push({
       predict: sample.predict,
       token_count: sample.token_arrival_offsets_ms.length,
       stop_reason: sample.stop_reason,
@@ -218,54 +238,70 @@ try {
       raw_output_sha256: sample.raw_output_sha256,
       backend_device: sample.stats.backendDevice,
     })
-    if (warmups.length >= workload.warmup.minimum_completions) {
-      const recent = warmups.slice(-workload.warmup.minimum_completions)
-      const means = recent.map(sample => sample.mean_token_interval_ms)
-      const ratio = Math.max(...means) / Math.min(...means)
-      const sameOutput = recent.every(sample =>
-        sample.content_sha256 === recent[0].content_sha256
-          && sample.raw_output_sha256 === recent[0].raw_output_sha256)
-      if (ratio <= workload.warmup.maximum_recent_mean_ratio && sameOutput) {
-        converged = true
-        break
-      }
-    }
   }
-  requireCondition(converged, 'streaming completion warmup did not converge')
 
-  const measurement = await runCompletion(modelId, workload.measurement.predict)
+  phase = 'measurement'
+  for (let index = 0; index < workload.measurement.completions_per_process; index++) {
+    measurements.push(await runCompletion(modelId, workload.measurement.predict))
+  }
+  phase = 'unload_model'
+  await unloadModel({ modelId })
+  modelId = undefined
+  phase = 'close'
+  await close()
+  closed = true
+  phase = 'complete'
   atomicWriteJSON(resultPath, {
-    schema_version: 1,
+    schema_version: 2,
     status: 'sample',
     client: 'node',
     api_surface: '@qvac/sdk completion(...).events',
+    source_commit: sourceCommit,
+    orchestration,
     workload_sha256: workloadSha256,
     model_sha256: modelSha256,
-    warmups,
-    measurement,
+    preconditioning,
+    measurements,
     timeout_policy: timeoutPolicy,
     toolchain,
   })
 } catch (error) {
-  // Preserve structured partial warmup evidence for a fail-closed run. The
-  // orchestrator accepts only status=sample, so this can never enter analysis.
+  // Preserve every completed preconditioning and measurement request for
+  // diagnosis. The orchestrator accepts only status=sample, so partial work
+  // can never enter the grant analysis.
   atomicWriteJSON(resultPath, {
-    schema_version: 1,
+    schema_version: 2,
     status: 'error',
     client: 'node',
     api_surface: '@qvac/sdk completion(...).events',
+    source_commit: sourceCommit,
+    orchestration,
     workload_sha256: workloadSha256,
     model_sha256: modelSha256,
     reason: error instanceof Error ? error.message : String(error),
-    warmups,
-    warmup_diagnostic: warmupDiagnostic(warmups),
+    preconditioning,
+    measurements,
+    progress: {
+      phase,
+      expected_preconditioning_completions: workload.preconditioning.completions,
+      completed_preconditioning_completions: preconditioning.length,
+      expected_measurement_completions: workload.measurement.completions_per_process,
+      completed_measurement_completions: measurements.length,
+    },
     timeout_policy: timeoutPolicy,
     toolchain,
   })
   throw error
 } finally {
-  if (modelId) await unloadModel({ modelId })
-  await close()
+  if (modelId) {
+    try {
+      await unloadModel({ modelId })
+    } catch {
+      // Preserve the original failure recorded above; the process watchdog
+      // remains the final containment boundary for failed cleanup.
+    }
+  }
+  if (!closed) await close()
 }
 
 // The SDK installs process-level signal hooks for long-lived desktop apps.
