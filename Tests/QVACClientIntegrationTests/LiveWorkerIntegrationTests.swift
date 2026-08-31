@@ -16,26 +16,11 @@ final class LiveWorkerIntegrationTests: XCTestCase {
 
     // MARK: - Environment
 
-    private static let bareBin: URL? = {
-        // 1. Honour an explicit env override.
-        if let p = ProcessInfo.processInfo.environment["QVAC_BARE_BIN"] {
-            return URL(fileURLWithPath: p)
+    private static let nodeModulesDir: URL? = {
+        if let p = ProcessInfo.processInfo.environment["QVAC_NODE_MODULES"] {
+            return URL(fileURLWithPath: p, isDirectory: true)
         }
-        // 2. Default to the homebrew location used by Phase-0 spikes.
-        let candidate = URL(fileURLWithPath: "/opt/homebrew/bin/bare")
-        if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
-        return nil
-    }()
-
-    private static let workerScript: URL? = {
-        if let p = ProcessInfo.processInfo.environment["QVAC_WORKER_SCRIPT"] {
-            return URL(fileURLWithPath: p)
-        }
-        // Walk up from the test binary's working directory looking for
-        // `spike-js/node_modules/@qvac/sdk/dist/server/worker.js` — keeps the test
-        // working whether `swift test` is run from the repo root, from CI, or from
-        // an Xcode-derived data dir.
-        let suffix = "spike-js/node_modules/@qvac/sdk/dist/server/worker.js"
+        let suffix = "tools/runtime/node_modules"
         var dir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         for _ in 0..<8 {
             let candidate = dir.appendingPathComponent(suffix)
@@ -46,37 +31,37 @@ final class LiveWorkerIntegrationTests: XCTestCase {
         return nil
     }()
 
-    private static var workingDir: URL? {
-        guard let s = workerScript else { return nil }
-        // Walk up from `node_modules/@qvac/sdk/.../worker.js` to the dir whose `node_modules`
-        // is the install root.
-        var dir = s.deletingLastPathComponent()
-        while dir.pathComponents.count > 1 {
-            let nm = dir.appendingPathComponent("node_modules")
-            if FileManager.default.fileExists(atPath: nm.path) { return dir }
-            dir.deleteLastPathComponent()
-        }
-        return nil
-    }
+    private static let bareBin: URL? = ProcessInfo.processInfo.environment["QVAC_BARE_BIN"]
+        .map { URL(fileURLWithPath: $0) }
+        ?? nodeModulesDir?.appendingPathComponent(".bin/bare")
+    private static let workerScript: URL? = ProcessInfo.processInfo.environment["QVAC_WORKER_SCRIPT"]
+        .map { URL(fileURLWithPath: $0) }
+        ?? nodeModulesDir?.appendingPathComponent("@qvac/sdk/dist/server/worker.js")
+    private var workerHome: URL!
 
     override func setUpWithError() throws {
         try XCTSkipUnless(Self.bareBin != nil, "bare runtime not available; install via `npm i -g bare-runtime` or set QVAC_BARE_BIN")
         try XCTSkipUnless(Self.workerScript != nil, "QVAC worker.js not found; set QVAC_WORKER_SCRIPT to <node_modules>/@qvac/sdk/dist/server/worker.js")
-        // Pre-test cleanup of `~/.qvac/.worker.lock` — the @qvac/sdk worker writes
-        // this lock file on the JS side to mark itself as the active instance and
-        // detect stale predecessors. A crashed worker from a previous test run can
-        // leave the file behind, which makes the next worker refuse to start. Best-
-        // effort cleanup is safe: a running worker would re-create the lock on
-        // launch, and an absent file is the worker's expected fresh-start state.
-        try? FileManager.default.removeItem(atPath: NSHomeDirectory() + "/.qvac/.worker.lock")
+        let packageJSON = try XCTUnwrap(Self.nodeModulesDir).appendingPathComponent("@qvac/sdk/package.json")
+        let data = try Data(contentsOf: packageJSON)
+        let package = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        try XCTSkipUnless(package["version"] as? String == "0.17.0", "live tests require exact @qvac/sdk 0.17.0")
+        workerHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qvac-live-worker-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workerHome, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        if let workerHome { try? FileManager.default.removeItem(at: workerHome) }
     }
 
     private func newTransport() async throws -> UnixDomainSocketTransport {
         let config = UDSTransportConfiguration(
             bareExecutable: Self.bareBin!,
             workerScript: Self.workerScript!,
-            workingDirectory: Self.workingDir!,
-            initTimeout: 10.0
+            workingDirectory: Self.nodeModulesDir!.deletingLastPathComponent(),
+            initTimeout: 60.0,
+            homeDir: workerHome.path
         )
         return try await UnixDomainSocketTransport.connect(config)
     }
@@ -89,22 +74,22 @@ final class LiveWorkerIntegrationTests: XCTestCase {
         let started = Date()
         let transport = try await newTransport()
         let rpc = BareRPCClient(transport: transport)
-        defer { Task { await rpc.close() } }
+        addTeardownBlock { await rpc.close() }
 
         // Init handshake.
-        try await QVACHandshake.sendInitConfig(on: rpc)
+        try await QVACHandshake.sendInitConfig(on: rpc, timeout: .seconds(30))
 
         // Heartbeat.
         let heartbeatRequest = QVACRequest.heartbeat(HeartbeatRequest())
         let body = try JSONEncoder.qvac.encode(heartbeatRequest)
-        let respData = try await rpc.send(command: 2, data: body)
+        let respData = try await rpc.send(command: 2, data: body, timeout: .seconds(30))
         XCTAssertNotNil(respData)
         let resp = try JSONDecoder().decode(QVACResponse.self, from: respData!)
         guard case .heartbeat(let hb) = resp else {
             return XCTFail("expected heartbeat response, got \(resp.discriminator)")
         }
         // The "number" field is the worker's uptime in seconds — sanity check it's plausible.
-        XCTAssertGreaterThan(hb.number ?? -1, 0)
+        XCTAssertGreaterThan(hb.number, 0)
 
         let elapsed = Date().timeIntervalSince(started)
         XCTAssertLessThan(elapsed, 5.0, "end-to-end should be < 5s; got \(elapsed)s")
@@ -115,18 +100,25 @@ final class LiveWorkerIntegrationTests: XCTestCase {
     func test_streaming_downloadAsset_emits_progress_and_completion() async throws {
         let transport = try await newTransport()
         let rpc = BareRPCClient(transport: transport)
-        defer { Task { await rpc.close() } }
+        addTeardownBlock { await rpc.close() }
 
-        try await QVACHandshake.sendInitConfig(on: rpc)
+        try await QVACHandshake.sendInitConfig(on: rpc, timeout: .seconds(30))
 
-        // We don't yet have a hand-written wrapper for downloadAsset (M2 work). For the
-        // integration test we send the raw JSON shape that the JS schemas expect, then
-        // decode the streamed NDJSON via JSONDecoder per chunk.
-        let requestJSON = #"""
-        {"type":"downloadAsset","assetSrc":"https://raw.githubusercontent.com/holepunchto/bare-rpc/main/README.md","withProgress":true}
-        """#
+        // Independently hash the immutable network fixture before asking the
+        // worker to download the same URL, then exercise the raw 0.17 wire shape.
+        let fixture = VerifiedModelFixture.downloadAssetProbe
+        _ = try await fixture.localURL()
+        let requestData = try JSONSerialization.data(withJSONObject: [
+            "type": "downloadAsset",
+            "assetSrc": fixture.source.absoluteString,
+            "withProgress": true,
+        ])
 
-        let stream = try await rpc.stream(command: 3, data: Data(requestJSON.utf8))
+        let stream = try await rpc.stream(
+            command: 3,
+            data: requestData,
+            timeout: .seconds(30)
+        )
         var sawProgress = false
         var sawCompletion = false
         for try await raw in stream.chunks {
@@ -152,24 +144,47 @@ final class LiveWorkerIntegrationTests: XCTestCase {
         XCTAssertTrue(sawCompletion, "expected a downloadAsset completion event")
     }
 
-    /// Cancel a nonexistent operation. The worker returns `{success:false, error: …}`
-    /// — verifies the cancel wire shape from end to end.
-    func test_cancel_nonexistent_inference_returns_error_envelope() async throws {
+    /// Exercise both native 0.17 cancel arms. A missing request id is an idempotent
+    /// success (`cancelled: 0`); broad-cancelling an unloaded model is an application
+    /// error. Legacy wire operations such as `inference` are intentionally not sent.
+    func test_cancel_native_request_and_broad_shapes() async throws {
         let transport = try await newTransport()
         let rpc = BareRPCClient(transport: transport)
-        defer { Task { await rpc.close() } }
+        addTeardownBlock { await rpc.close() }
 
-        try await QVACHandshake.sendInitConfig(on: rpc)
+        try await QVACHandshake.sendInitConfig(on: rpc, timeout: .seconds(30))
 
-        let cancelJSON = #"""
-        {"type":"cancel","operation":"inference","modelId":"this-does-not-exist"}
+        let targetedJSON = #"""
+        {"type":"cancel","operation":"request","requestId":"this-does-not-exist"}
         """#
-        let respData = try await rpc.send(command: 4, data: Data(cancelJSON.utf8))
-        XCTAssertNotNil(respData)
-        let obj = try JSONSerialization.jsonObject(with: respData!) as? [String: Any]
-        XCTAssertEqual(obj?["type"] as? String, "cancel")
-        XCTAssertEqual(obj?["success"] as? Bool, false)
-        XCTAssertTrue((obj?["error"] as? String)?.contains("not found") ?? false)
+        let targetedReply = try await rpc.send(
+            command: 4,
+            data: Data(targetedJSON.utf8),
+            timeout: .seconds(30)
+        )
+        let targetedData = try XCTUnwrap(targetedReply)
+        let targeted = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: targetedData) as? [String: Any]
+        )
+        XCTAssertEqual(targeted["type"] as? String, "cancel")
+        XCTAssertEqual(targeted["success"] as? Bool, true)
+        XCTAssertEqual(targeted["cancelled"] as? Int, 0)
+
+        let broadJSON = #"""
+        {"type":"cancel","operation":"broad","modelId":"this-does-not-exist","kind":"completion"}
+        """#
+        let broadReply = try await rpc.send(
+            command: 5,
+            data: Data(broadJSON.utf8),
+            timeout: .seconds(30)
+        )
+        let broadData = try XCTUnwrap(broadReply)
+        let broad = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: broadData) as? [String: Any]
+        )
+        XCTAssertEqual(broad["type"] as? String, "cancel")
+        XCTAssertEqual(broad["success"] as? Bool, false)
+        XCTAssertFalse((broad["error"] as? String)?.isEmpty ?? true)
     }
 
     /// Close should be idempotent and tear down cleanly. Re-running after close should
@@ -177,7 +192,7 @@ final class LiveWorkerIntegrationTests: XCTestCase {
     func test_close_idempotent() async throws {
         let transport = try await newTransport()
         let rpc = BareRPCClient(transport: transport)
-        try await QVACHandshake.sendInitConfig(on: rpc)
+        try await QVACHandshake.sendInitConfig(on: rpc, timeout: .seconds(30))
         await rpc.close()
         await rpc.close() // idempotent
     }
@@ -188,7 +203,7 @@ final class LiveWorkerIntegrationTests: XCTestCase {
     func test_close_terminates_worker_subprocess_with_clean_exit() async throws {
         let transport = try await newTransport()
         let rpc = BareRPCClient(transport: transport)
-        try await QVACHandshake.sendInitConfig(on: rpc)
+        try await QVACHandshake.sendInitConfig(on: rpc, timeout: .seconds(30))
 
         // Capture the live worker PID before close.
         let pidBefore = transport.__testWorkerPID()

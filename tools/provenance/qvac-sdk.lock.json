@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "sdkVersion": "0.17.0",
+  "source": {
+    "repository": "https://github.com/tetherto/qvac.git",
+    "commit": "e8b440665a053a9efe852f04c3601da44f0d55d8",
+    "releaseCommit": true,
+    "nonAuthoritativeTag": {
+      "name": "sdk-v0.17.0",
+      "commit": "3176cca69225a04fadb53ae367ff4de206099786",
+      "reason": "The tag currently resolves to a post-publication commit with schema and VLA drift. It is not the source of the npm 0.17.0 release."
+    },
+    "inputs": {
+      "packages/sdk/package.json": "bb576a841559123582abc5b2df988a57716ac8e91be49ffecc7e9edbc50519bf",
+      "packages/sdk/schemas/common.ts": "a1b26aeb0dc977cb31e48d3827048fb8106718c07911a4f611b3e01e17f877a7",
+      "packages/sdk/schemas/sdk-errors-client.ts": "f859ea066414b3d370fde4e20ca1389ee0c839cb764c114a177b2903d14955d5",
+      "packages/sdk/schemas/sdk-errors-server.ts": "46fc2d9feb3967e7222d4abf7ff00cfd5a064aff111359ea540a8b6d72784cde",
+      "packages/sdk/contract/manifest.json": "dfe1692346dea58c87a1d27d76601a9b91179cf06c56796896f2ce65e347a25b",
+      "packages/sdk/contract/schema.json": "6ab8aaf1b50a89bdd69418de3c9bc56b22d13e0c79a22707784aec4781fa7983",
+      "packages/sdk/contract/error-codes.json": "7309281c49af7d260fae196961a5d571e7a6d4f9ec1b8393262371fcfed31db5",
+      "packages/sdk/contract/model-type-maps.json": "d55e5936bf44c68e6b316b154539587db360c28cc42d9b0842929c474922fe8a",
+      "packages/sdk/contract/models.json": "a344c3c20e7d83a6a5345725d21c511a819a17d3865ac2e649561dbed4482376"
+    }
+  },
+  "npm": {
+    "name": "@qvac/sdk",
+    "version": "0.17.0",
+    "tarball": "https://registry.npmjs.org/@qvac/sdk/-/sdk-0.17.0.tgz",
+    "integrity": "sha512-8UE/O5jChAkUSfqGo22nnzoQ47Nd0Eh6T9aoId2JzvM7quNCWj4nZ3UrOMfzEYmCwZ5f7xep3ZJkwhk5PPX9Og==",
+    "shasum": "47db80c215806adbf0bcab7755bd8e50a6baf174",
+    "gitHead": "e8b440665a053a9efe852f04c3601da44f0d55d8",
+    "workerBundleIncluded": false
+  },
+  "toolchain": {
+    "node": "22.22.0"
+  },
+  "upstreamDependencyLock": {
+    "available": false,
+    "reason": "The authoritative release commit does not contain a root npm, pnpm, yarn, or Bun lockfile. The committed qvac-swift npm lock is therefore a separately identified, tested reconstruction; it is not claimed to be upstream's unpublished install graph."
+  }
+}

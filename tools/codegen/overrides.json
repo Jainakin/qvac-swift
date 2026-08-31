@@ -1,7 +1,8 @@
 {
-  "_comment": "Escape-hatch overrides for the type generator. The generator now auto-detects JS-only callback fields — z.function, z.custom, and z.unknown() whose name matches ^on[A-Z]/logger/signal/abortSignal/controller — and strips them automatically. Add a key here only when an upstream schema uses a non-conventional name for a callback or introduces a new unrepresentable-on-the-wire field shape the auto-detector misses.",
+  "_comment": "Escape-hatch overrides for fields that an upstream exported contract incorrectly retains even though they are JavaScript-process callbacks rather than wire data.",
 
   "omitFields": {
-    "_comment_omitFields": "Keys are <side>/<discriminator> (e.g. request/loadModel). Use * to apply to every leaf. The list is the property names to remove from the generated Codable struct."
+    "_comment_omitFields": "Keys are <side>/<discriminator> (e.g. request/loadModel). Use * to apply to every leaf. The list is the property names to remove from the generated Codable struct.",
+    "request/rag": ["onProgress"]
   }
 }

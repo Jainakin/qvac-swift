@@ -20,7 +20,7 @@ final class BareRPCCodecTests: XCTestCase {
     func test_encode_request_matches_node_fixture() throws {
         let json = #"{"type":"__init_config","config":{},"runtimeContext":{"runtime":"bare","platform":"darwin"}}"#
         let body = Data(json.utf8)
-        let frame = BareRPCCodec.encodeRequestFrame(id: 1, command: 1, stream: [], data: body)
+        let frame = BareRPCCodec.__testEncodeRequestFrame(id: 1, command: 1, stream: [], data: body)
         // Length: body is JSON; we reconstruct the expected hex via the helper to keep
         // the test resilient to JSON whitespace differences.
         let expectedBody = BareRPCCodec.encodeRequestBody(id: 1, command: 1, stream: [], data: body)
@@ -68,7 +68,7 @@ final class BareRPCCodecTests: XCTestCase {
     // MARK: - STREAM frame encode/decode
 
     func test_stream_open_response_frame_roundtrip() throws {
-        let frame = BareRPCCodec.encodeStreamFrame(id: 3, flags: [.response, .open])
+        let frame = BareRPCCodec.__testEncodeStreamFrame(id: 3, flags: [.response, .open])
         XCTAssertEqual(hex(frame), "050000000303fd0102")
         let reader = BareRPCFrameReader()
         try reader.append(frame)
@@ -82,7 +82,7 @@ final class BareRPCCodecTests: XCTestCase {
 
     func test_stream_data_frame_with_payload() throws {
         let payload = Data("hello world".utf8)
-        let frame = BareRPCCodec.encodeStreamFrame(id: 7, flags: [.response, .data], payload: .data(payload))
+        let frame = BareRPCCodec.__testEncodeStreamFrame(id: 7, flags: [.response, .data], payload: .data(payload))
         let reader = BareRPCFrameReader()
         try reader.append(frame)
         guard case .stream(let id, let flags, .data(let d)) = reader.next() else {
@@ -95,7 +95,7 @@ final class BareRPCCodecTests: XCTestCase {
 
     func test_stream_error_frame_decodes_typed_error() throws {
         let err = BareRPCError(message: "bad thing", code: "E_BAD", errno: 42)
-        let frame = BareRPCCodec.encodeStreamFrame(id: 11, flags: [.response, .error], payload: .error(err))
+        let frame = BareRPCCodec.__testEncodeStreamFrame(id: 11, flags: [.response, .error], payload: .error(err))
         let reader = BareRPCFrameReader()
         try reader.append(frame)
         guard case .stream(let id, let flags, .error(let decoded)) = reader.next() else {
@@ -117,9 +117,9 @@ final class BareRPCCodecTests: XCTestCase {
     }
 
     func test_reader_handles_multiple_frames_in_one_chunk() throws {
-        let frame1 = BareRPCCodec.encodeStreamFrame(id: 1, flags: [.response, .open])
-        let frame2 = BareRPCCodec.encodeStreamFrame(id: 1, flags: [.response, .end])
-        let frame3 = BareRPCCodec.encodeStreamFrame(id: 2, flags: [.response, .data], payload: .data(Data([1,2,3])))
+        let frame1 = BareRPCCodec.__testEncodeStreamFrame(id: 1, flags: [.response, .open])
+        let frame2 = BareRPCCodec.__testEncodeStreamFrame(id: 1, flags: [.response, .end])
+        let frame3 = BareRPCCodec.__testEncodeStreamFrame(id: 2, flags: [.response, .data], payload: .data(Data([1,2,3])))
         let combined = frame1 + frame2 + frame3
         let reader = BareRPCFrameReader()
         try reader.append(combined)
@@ -127,6 +127,30 @@ final class BareRPCCodecTests: XCTestCase {
         XCTAssertNotNil(reader.next(), "frame 2")
         XCTAssertNotNil(reader.next(), "frame 3")
         XCTAssertNil(reader.next())
+    }
+
+    func test_reader_drains_thousands_of_coalesced_frames_without_quadratic_queue_removal() throws {
+        let frameCount = 5_000
+        var coalesced = Data()
+        coalesced.reserveCapacity(frameCount * 16)
+        for id in 1...frameCount {
+            coalesced.append(BareRPCCodec.__testEncodeStreamFrame(
+                id: UInt64(id),
+                flags: [.response, .end]
+            ))
+        }
+
+        let reader = BareRPCFrameReader()
+        try reader.append(coalesced)
+        for id in 1...frameCount {
+            guard case .stream(let actualID, let flags, .control)? = reader.next() else {
+                return XCTFail("missing frame \(id)")
+            }
+            XCTAssertEqual(actualID, UInt64(id))
+            XCTAssertEqual(flags, [.response, .end])
+        }
+        XCTAssertNil(reader.next())
+        XCTAssertEqual(reader.bufferedBytes, 0)
     }
 
     func test_reader_no_frame_until_length_complete() throws {
@@ -142,8 +166,8 @@ final class BareRPCCodecTests: XCTestCase {
     // §10 from AUDIT.md — the reader must reject a frame whose declared length exceeds
     // its `maxFrameSize`. A malformed/hostile peer that ships `0xFFFFFFFF` as the length
     // prefix would otherwise grow the buffer to 4 GiB and OOM the process.
-    func test_reader_rejects_frame_larger_than_max_frame_size() {
-        let reader = BareRPCFrameReader(maxFrameSize: 1024)
+    func test_reader_rejects_frame_larger_than_max_frame_size() throws {
+        let reader = try BareRPCFrameReader(maxFrameSize: 1024)
         // 4-byte little-endian length prefix = 0x00000800 = 2048 (> 1024 max).
         let oversizeLen = Data([0x00, 0x08, 0x00, 0x00])
         XCTAssertThrowsError(try reader.append(oversizeLen)) { err in
@@ -155,11 +179,26 @@ final class BareRPCCodecTests: XCTestCase {
         }
     }
 
+    func test_decoder_rejects_uint64_payload_length_without_integer_conversion_trap() {
+        // STREAM(type=3), id=1, RESPONSE|DATA(0x210), then a compact-encoding
+        // UInt64.max payload length. The peer supplied no payload; decoding must
+        // report truncation instead of narrowing UInt64.max to Int and trapping.
+        let body = Data([
+            0x03, 0x01,
+            0xfd, 0x10, 0x02,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ])
+
+        XCTAssertThrowsError(try BareRPCCodec.decodeFrameBody(body)) { error in
+            XCTAssertEqual(error as? BareRPCCodecError, .truncated)
+        }
+    }
+
     /// Default reader must accept the largest plausibly-legitimate frame (1 MiB ≪ the
-    /// 64 MiB default cap), to keep the cap from accidentally rejecting real traffic.
+    /// configured default cap, to keep the ceiling from accidentally rejecting real traffic.
     func test_reader_accepts_one_mib_frame_under_default_cap() throws {
         let payload = Data(repeating: 0xab, count: 1 * 1024 * 1024)
-        let frame = BareRPCCodec.encodeRequestFrame(id: 1, command: 1, data: payload)
+        let frame = BareRPCCodec.__testEncodeRequestFrame(id: 1, command: 1, data: payload)
         let reader = BareRPCFrameReader()
         try reader.append(frame)
         XCTAssertNotNil(reader.next())
@@ -168,7 +207,7 @@ final class BareRPCCodecTests: XCTestCase {
     func test_reader_compacts_after_large_consumption() throws {
         // Feed 70KB of small frames; verify internal buffer doesn't grow unbounded.
         // Each frame is `04000000 03 01 fd 01 02` = 9 bytes (STREAM RESPONSE|OPEN id=1).
-        let oneFrame = BareRPCCodec.encodeStreamFrame(id: 1, flags: [.response, .open])
+        let oneFrame = BareRPCCodec.__testEncodeStreamFrame(id: 1, flags: [.response, .open])
         XCTAssertEqual(oneFrame.count, 9)
         let reader = BareRPCFrameReader()
         for _ in 0..<8000 {
@@ -199,7 +238,7 @@ final class BareRPCCodecTests: XCTestCase {
     func test_request_frame_roundtrip() throws {
         for command in [UInt64(1), UInt64(42), UInt64(0xfff), UInt64(0xfffffffff)] {
             let body = Data("payload-\(command)".utf8)
-            let frame = BareRPCCodec.encodeRequestFrame(id: command, command: command, stream: [], data: body)
+            let frame = BareRPCCodec.__testEncodeRequestFrame(id: command, command: command, stream: [], data: body)
             let reader = BareRPCFrameReader()
             try reader.append(frame)
             guard case .request(let id, let cmd, let flags, let data) = reader.next() else {
@@ -214,7 +253,7 @@ final class BareRPCCodecTests: XCTestCase {
 
     func test_response_frame_with_error_roundtrip() throws {
         let e = BareRPCError(message: "nope", code: "E_NOPE", errno: -7)
-        let frame = BareRPCCodec.encodeResponseFrame(id: 99, stream: [], payload: .failure(e))
+        let frame = BareRPCCodec.__testEncodeResponseFrame(id: 99, stream: [], payload: .failure(e))
         let reader = BareRPCFrameReader()
         try reader.append(frame)
         guard case .response(let id, _, .failure(let decoded)) = reader.next() else {

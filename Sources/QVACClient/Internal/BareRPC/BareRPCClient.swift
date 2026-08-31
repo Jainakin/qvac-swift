@@ -11,22 +11,63 @@
 
 import Foundation
 
-// MARK: - Public errors
+// MARK: - Internal errors
 
-public struct BareRPCConnectionClosed: Error, Sendable, Equatable {
-    public init() {}
+struct BareRPCConnectionClosed: Error, Sendable, Equatable {
+    init() {}
 }
 
-public struct BareRPCProtocolError: Error, Sendable, Equatable {
-    public let reason: String
-    public init(_ reason: String) { self.reason = reason }
+struct BareRPCStreamClosed: Error, Sendable, Equatable {
+    init() {}
+}
+
+struct BareRPCStreamBufferOverflow: Error, Sendable, Equatable, CustomStringConvertible {
+    let maximumBufferedBytes: Int
+    let attemptedBufferedBytes: Int
+
+    init(maximumBufferedBytes: Int, attemptedBufferedBytes: Int) {
+        self.maximumBufferedBytes = maximumBufferedBytes
+        self.attemptedBufferedBytes = attemptedBufferedBytes
+    }
+
+    var description: String {
+        "bare-rpc stream buffer would grow to \(attemptedBufferedBytes) bytes; "
+            + "maximumBufferedStreamBytes is \(maximumBufferedBytes)"
+    }
+}
+
+struct BareRPCProtocolError: Error, Sendable, Equatable {
+    let reason: String
+    init(_ reason: String) { self.reason = reason }
+}
+
+struct BareRPCInvalidArgument: Error, Sendable, Equatable {
+    let reason: String
+    init(_ reason: String) { self.reason = reason }
+}
+
+/// A local request deadline elapsed before bare-rpc reached the required state.
+///
+/// This is deliberately separate from `BareRPCError`, which represents an error
+/// frame produced by the remote worker. The client translates this value
+/// into `QVACError.requestTimedOut` with the operation discriminator attached.
+struct BareRPCRequestTimeout: Error, Sendable, Equatable, CustomStringConvertible {
+    let timeout: Duration
+
+    init(timeout: Duration) {
+        self.timeout = timeout
+    }
+
+    var description: String {
+        "bare-rpc request timed out after \(timeout)"
+    }
 }
 
 // MARK: - Streaming abstractions
 
 /// Server-pushed response stream. Consume with `for await frame in stream.chunks`.
-public final class BareRPCResponseStream: @unchecked Sendable {
-    public let chunks: AsyncThrowingStream<Data, Error>
+final class BareRPCResponseStream: @unchecked Sendable {
+    let chunks: AsyncThrowingStream<Data, Error>
     private let onCancel: @Sendable () -> Void
 
     init(chunks: AsyncThrowingStream<Data, Error>, onCancel: @escaping @Sendable () -> Void) {
@@ -36,21 +77,164 @@ public final class BareRPCResponseStream: @unchecked Sendable {
 
     /// Signal the server we want no more frames (sends `STREAM | DESTROY | RESPONSE`).
     /// Idempotent.
-    public func destroy() { onCancel() }
+    func destroy() { onCancel() }
+
+    deinit { onCancel() }
+}
+
+/// Demand-aware, byte-bounded channel used behind raw response streams. Unlike
+/// `AsyncThrowingStream`'s default buffering policy, this never retains an
+/// unbounded number of large media frames. A waiting consumer receives a value
+/// directly; otherwise queued `Data` is charged against the configured budget.
+private final class BoundedRPCDataChannel: @unchecked Sendable {
+    private enum Terminal {
+        case finished
+        case failed(Error)
+    }
+
+    private let maximumBufferedBytes: Int
+    private let onCancel: @Sendable () -> Void
+    private let lock = NSLock()
+    private var queue: [Data] = []
+    private var queueIndex = 0
+    private var bufferedBytes = 0
+    private var waiter: CheckedContinuation<Data?, Error>?
+    private var terminal: Terminal?
+    private var cancellationReported = false
+
+    init(maximumBufferedBytes: Int, onCancel: @escaping @Sendable () -> Void) {
+        self.maximumBufferedBytes = maximumBufferedBytes
+        self.onCancel = onCancel
+    }
+
+    /// Returns an overflow error when the value cannot be retained within the
+    /// budget. The caller owns terminating only that RPC operation.
+    func yield(_ value: Data) -> BareRPCStreamBufferOverflow? {
+        var waiting: CheckedContinuation<Data?, Error>?
+        lock.lock()
+        if terminal != nil {
+            lock.unlock()
+            return nil
+        }
+        if let current = waiter {
+            waiter = nil
+            waiting = current
+            lock.unlock()
+            waiting?.resume(returning: value)
+            return nil
+        }
+        let (attempted, overflowed) = bufferedBytes.addingReportingOverflow(value.count)
+        if overflowed || attempted > maximumBufferedBytes {
+            lock.unlock()
+            return BareRPCStreamBufferOverflow(
+                maximumBufferedBytes: maximumBufferedBytes,
+                attemptedBufferedBytes: overflowed ? Int.max : attempted
+            )
+        }
+        queue.append(value)
+        bufferedBytes = attempted
+        lock.unlock()
+        return nil
+    }
+
+    func finish(throwing error: Error? = nil, discardingBuffered: Bool = false) {
+        var waiting: CheckedContinuation<Data?, Error>?
+        lock.lock()
+        if terminal != nil, !discardingBuffered {
+            lock.unlock()
+            return
+        }
+        if terminal == nil {
+            terminal = error.map(Terminal.failed) ?? .finished
+        }
+        if discardingBuffered {
+            queue.removeAll(keepingCapacity: false)
+            queueIndex = 0
+            bufferedBytes = 0
+        }
+        if queueIndex >= queue.count {
+            waiting = waiter
+            waiter = nil
+        }
+        lock.unlock()
+
+        if let error {
+            waiting?.resume(throwing: error)
+        } else {
+            waiting?.resume(returning: nil)
+        }
+    }
+
+    func next() async throws -> Data? {
+        try Task.checkCancellation()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                var immediateValue: Data?
+                var immediateTerminal: Terminal?
+                var registered = false
+
+                lock.lock()
+                if queueIndex < queue.count {
+                    immediateValue = queue[queueIndex]
+                    bufferedBytes -= immediateValue?.count ?? 0
+                    queueIndex += 1
+                    if queueIndex >= 64, queueIndex >= queue.count / 2 {
+                        queue.removeFirst(queueIndex)
+                        queueIndex = 0
+                    }
+                } else if let terminal {
+                    immediateTerminal = terminal
+                } else if waiter != nil {
+                    immediateTerminal = .failed(BareRPCProtocolError(
+                        "bare-rpc response stream supports only one active iterator"
+                    ))
+                } else {
+                    waiter = continuation
+                    registered = true
+                }
+                let cancelledAfterRegistration = registered && Task.isCancelled
+                lock.unlock()
+
+                if cancelledAfterRegistration {
+                    cancelPendingNext()
+                } else if let immediateValue {
+                    continuation.resume(returning: immediateValue)
+                } else if let immediateTerminal {
+                    switch immediateTerminal {
+                    case .finished: continuation.resume(returning: nil)
+                    case .failed(let error): continuation.resume(throwing: error)
+                    }
+                }
+            }
+        } onCancel: {
+            self.cancelPendingNext()
+        }
+    }
+
+    private func cancelPendingNext() {
+        let (waiting, shouldNotify): (CheckedContinuation<Data?, Error>?, Bool) = lock.withLock {
+            defer { waiter = nil }
+            let shouldNotify = !cancellationReported && terminal == nil
+            cancellationReported = true
+            return (waiter, shouldNotify)
+        }
+        waiting?.resume(throwing: CancellationError())
+        if shouldNotify { onCancel() }
+    }
 }
 
 /// Bidirectional session for duplex APIs. Write outbound chunks via `write(_:)`,
 /// consume server frames via `chunks`.
-public final class BareRPCDuplexSession: @unchecked Sendable {
-    public let chunks: AsyncThrowingStream<Data, Error>
-    private let onWrite: @Sendable (Data) async -> Void
-    private let onEnd: @Sendable () async -> Void
+final class BareRPCDuplexSession: @unchecked Sendable {
+    let chunks: AsyncThrowingStream<Data, Error>
+    private let onWrite: @Sendable (Data) async throws -> Void
+    private let onEnd: @Sendable () async throws -> Void
     private let onDestroy: @Sendable () -> Void
 
     init(
         chunks: AsyncThrowingStream<Data, Error>,
-        onWrite: @escaping @Sendable (Data) async -> Void,
-        onEnd: @escaping @Sendable () async -> Void,
+        onWrite: @escaping @Sendable (Data) async throws -> Void,
+        onEnd: @escaping @Sendable () async throws -> Void,
         onDestroy: @escaping @Sendable () -> Void
     ) {
         self.chunks = chunks
@@ -60,64 +244,92 @@ public final class BareRPCDuplexSession: @unchecked Sendable {
     }
 
     /// Push a chunk to the server. Emits `STREAM | DATA | REQUEST` on the wire.
-    public func write(_ chunk: Data) async { await onWrite(chunk) }
+    func write(_ chunk: Data) async throws { try await onWrite(chunk) }
 
     /// Signal end-of-stream on the client→server direction. Emits `STREAM | END | REQUEST`.
-    public func end() async { await onEnd() }
+    func end() async throws { try await onEnd() }
 
-    /// Force-terminate the whole session. Emits `STREAM | DESTROY | REQUEST` and tears
-    /// down the response side.
-    public func destroy() { onDestroy() }
+    /// Force-terminate the whole session. Closes the outgoing request stream and
+    /// destroys the incoming response stream, matching bare-rpc's two half-streams.
+    func destroy() { onDestroy() }
+
+    deinit { onDestroy() }
 }
 
 // MARK: - The actor
 
-public actor BareRPCClient {
+actor BareRPCClient {
 
     // ----------- Configuration & state -----------
 
     /// Per-request bookkeeping for `send`.
-    private struct PendingSend {
+    private final class PendingSend {
         let continuation: CheckedContinuation<Data?, Error>
+        var timeoutTask: Task<Void, Never>?
+        var writeTask: Task<Void, Never>?
+        var writeStarted = false
+        var writeCompleted = false
+
+        init(continuation: CheckedContinuation<Data?, Error>) {
+            self.continuation = continuation
+        }
     }
 
     /// Per-request bookkeeping for `stream`.
     private final class PendingStream {
         let id: UInt64
-        var continuation: AsyncThrowingStream<Data, Error>.Continuation
+        let channel: BoundedRPCDataChannel
         /// Set once we've sent `STREAM | RESPONSE | OPEN`.
         var openSent = false
         /// Set once the server has sent `RESPONSE | OPEN` (or first DATA).
         var serverOpened = false
         /// True once we've yielded END/CLOSE/DESTROY (terminal).
         var finished = false
-        init(id: UInt64, continuation: AsyncThrowingStream<Data, Error>.Continuation) {
-            self.id = id; self.continuation = continuation
+        var setupContinuation: CheckedContinuation<Void, Error>?
+        var timeout: Duration?
+        var timeoutGeneration: UInt64 = 0
+        var timeoutTask: Task<Void, Never>?
+        var setupWriteTask: Task<Void, Never>?
+        var setupWriteStarted = false
+        init(id: UInt64, channel: BoundedRPCDataChannel) {
+            self.id = id; self.channel = channel
         }
     }
 
     /// Per-request bookkeeping for `duplex`.
     private final class PendingDuplex {
         let id: UInt64
-        var continuation: AsyncThrowingStream<Data, Error>.Continuation
+        let channel: BoundedRPCDataChannel
         /// `STREAM | REQUEST | OPEN` ack from server received.
         var requestOpened = false
         /// `RESPONSE | OPEN` from server received.
         var responseOpened = false
+        var localWritesComplete = false
+        var waitForRemoteOpen = false
+        var outboundEnded = false
         var finished = false
-        init(id: UInt64, continuation: AsyncThrowingStream<Data, Error>.Continuation) {
-            self.id = id; self.continuation = continuation
+        var setupContinuation: CheckedContinuation<Void, Error>?
+        var timeout: Duration?
+        var timeoutTask: Task<Void, Never>?
+        var setupWriteTask: Task<Void, Never>?
+        var setupWriteStarted = false
+        var outboundWriteTail: Task<Void, Error>?
+        init(id: UInt64, channel: BoundedRPCDataChannel) {
+            self.id = id; self.channel = channel
         }
     }
 
     private let transport: BareTransport
     private let logger: BareRPCLogger?
+    private let maximumWireMessageBytes: Int
+    private let maximumBufferedStreamBytes: Int
     private var nextId: UInt64 = 1
     private var pendingSends: [UInt64: PendingSend] = [:]
     private var pendingStreams: [UInt64: PendingStream] = [:]
     private var pendingDuplex: [UInt64: PendingDuplex] = [:]
-    private let reader = BareRPCFrameReader()
+    private let reader: BareRPCFrameReader
     private var closed = false
+    private var transportCloseTask: Task<Void, Never>?
     private var feederTask: Task<Void, Never>?
 
     /// Construct the RPC client around a connected transport. The inbound stream is
@@ -125,76 +337,215 @@ public actor BareRPCClient {
     /// to have a destination for incoming bytes) and the feeder task that pumps the
     /// stream into the RPC state machine is spawned immediately. Caller MUST `await
     /// close()` to release resources.
-    public init(transport: BareTransport, logger: BareRPCLogger? = nil) {
+    init(transport: BareTransport, logger: BareRPCLogger? = nil) {
         self.transport = transport
         self.logger = logger
+        self.maximumWireMessageBytes = BareRPCFrameReader.defaultMaxFrameSize
+        self.maximumBufferedStreamBytes = BareRPCFrameReader.defaultMaxFrameSize
+        self.reader = BareRPCFrameReader(
+            validatedMaxFrameSize: BareRPCFrameReader.defaultMaxFrameSize
+        )
         // Claim the inbound stream NOW so the transport's reader thread has somewhere
         // to deliver bytes. Doing this lazily inside a Task creates a race: if the
         // caller fires a `send` immediately and the worker's response arrives before
         // the lazy Task scheduled the inboundStream() call, the response is dropped.
         let inbound = transport.inboundStream()
+        Task { [weak self] in
+            await self?.installFeeder(for: inbound)
+        }
+    }
+
+    /// Construct a client with explicit wire and per-operation buffering ceilings.
+    /// Invalid configuration is reported as an error rather than trapping the
+    /// host process.
+    init(
+        transport: BareTransport,
+        maximumWireMessageBytes: Int,
+        maximumBufferedStreamBytes: Int? = nil,
+        logger: BareRPCLogger? = nil
+    ) throws {
+        guard maximumWireMessageBytes > 0,
+              maximumWireMessageBytes <= Int(UInt32.max) else {
+            throw BareRPCInvalidArgument(
+                "maximumWireMessageBytes must be between 1 and UInt32.max"
+            )
+        }
+        let bufferLimit = maximumBufferedStreamBytes ?? maximumWireMessageBytes
+        guard bufferLimit > 0, bufferLimit <= Int(UInt32.max) else {
+            throw BareRPCInvalidArgument(
+                "maximumBufferedStreamBytes must be between 1 and UInt32.max"
+            )
+        }
+        self.transport = transport
+        self.logger = logger
+        self.maximumWireMessageBytes = maximumWireMessageBytes
+        self.maximumBufferedStreamBytes = bufferLimit
+        self.reader = BareRPCFrameReader(validatedMaxFrameSize: maximumWireMessageBytes)
+        let inbound = transport.inboundStream()
+        Task { [weak self] in
+            await self?.installFeeder(for: inbound)
+        }
+    }
+
+    /// Internal path for callers that have already validated both limits.
+    init(
+        validatedTransport transport: BareTransport,
+        maximumWireMessageBytes: Int,
+        maximumBufferedStreamBytes: Int,
+        logger: BareRPCLogger?
+    ) {
+        self.transport = transport
+        self.logger = logger
+        self.maximumWireMessageBytes = maximumWireMessageBytes
+        self.maximumBufferedStreamBytes = maximumBufferedStreamBytes
+        self.reader = BareRPCFrameReader(validatedMaxFrameSize: maximumWireMessageBytes)
+        let inbound = transport.inboundStream()
+        Task { [weak self] in
+            await self?.installFeeder(for: inbound)
+        }
+    }
+
+    private func installFeeder(for inbound: AsyncThrowingStream<Data, Error>) {
+        guard feederTask == nil, !closed else { return }
         feederTask = Task { [weak self] in
             guard let self else { return }
             do {
                 for try await chunk in inbound {
                     try await self.feed(chunk)
                 }
-                await self.failAllInFlight(with: BareRPCConnectionClosed())
+                await self.connectionEnded(with: BareRPCConnectionClosed())
             } catch {
-                await self.failAllInFlight(with: error)
+                await self.connectionEnded(with: error)
             }
         }
     }
 
     deinit {
         feederTask?.cancel()
+        let transport = self.transport
+        Task { await transport.close() }
     }
 
     // ----------- Public surface -----------
 
     /// Single-shot RPC: send a REQUEST with `data` inline, await the RESPONSE's data.
     /// Throws on connection failure, server-side error frame, or transport timeout.
-    public func send(command: UInt64, data: Data?) async throws -> Data? {
-        try await ensureOpen()
+    func send(
+        command: UInt64,
+        data: Data?,
+        timeout: Duration? = nil
+    ) async throws -> Data? {
+        try ensureOpen()
+        try validate(timeout: timeout)
         let id = allocateId()
-        let frame = BareRPCCodec.encodeRequestFrame(id: id, command: command, stream: [], data: data)
-        return try await withCheckedThrowingContinuation { (c: CheckedContinuation<Data?, Error>) in
-            pendingSends[id] = PendingSend(continuation: c)
-            Task { [transport, weak self] in
-                do {
-                    try await transport.write(frame)
-                } catch {
-                    if let self {
-                        await self.resolveSend(id: id, with: .failure(error))
+        let frame = try BareRPCCodec.encodeRequestFrame(
+            id: id,
+            command: command,
+            stream: [],
+            data: data,
+            maximumBodyBytes: maximumWireMessageBytes
+        )
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Data?, Error>) in
+                let pending = PendingSend(continuation: c)
+                pendingSends[id] = pending
+                if Task.isCancelled {
+                    resolveSend(id: id, with: .failure(CancellationError()))
+                    return
+                }
+                if let timeout {
+                    pending.timeoutTask = makeTimeoutTask(after: timeout) { [weak self] in
+                        await self?.timeoutSend(id: id, timeout: timeout)
                     }
                 }
+                pending.writeTask = Task { [transport, weak self] in
+                    guard await self?.beginSendWrite(id: id) == true else { return }
+                    do {
+                        try Task.checkCancellation()
+                        try await transport.write(frame)
+                        await self?.completeSendWrite(id: id)
+                    } catch is CancellationError {
+                        // Cancellation already resolved and removed the pending entry.
+                    } catch {
+                        if let self {
+                            await self.resolveSend(id: id, with: .failure(error))
+                        }
+                    }
+                }
+            }
+        } onCancel: { [weak self] in
+            Task { [weak self] in
+                await self?.resolveSend(
+                    id: id,
+                    with: .failure(CancellationError()),
+                    abortIfWriteIncomplete: true
+                )
             }
         }
     }
 
     /// Server-pushed streaming RPC: send a REQUEST + STREAM-OPEN-RESPONSE handshake, then
     /// yield each DATA frame's payload. Terminates on END/CLOSE/DESTROY or error.
-    public func stream(command: UInt64, data: Data?) async throws -> BareRPCResponseStream {
-        try await ensureOpen()
+    func stream(
+        command: UInt64,
+        data: Data?,
+        timeout: Duration? = nil
+    ) async throws -> BareRPCResponseStream {
+        try ensureOpen()
+        try validate(timeout: timeout)
         let id = allocateId()
         // We need to start awaiting frames BEFORE the request goes out, because the server's
         // RESPONSE(OPEN) may race with our STREAM(RESPONSE|OPEN). Bookkeeping first.
-        let (asyncStream, cont) = makeStream()
-        let pending = PendingStream(id: id, continuation: cont)
-        pendingStreams[id] = pending
+        let (asyncStream, channel) = makeStream {
+            Task { [weak self] in await self?.destroyStream(id: id) }
+        }
+        let pending = PendingStream(id: id, channel: channel)
+        pending.timeout = timeout
         // Send REQUEST inline + STREAM(RESPONSE|OPEN) immediately (mirrors what JS
         // bare-rpc's req.createResponseStream({ eagerOpen: true }) does — see the wire
         // capture for Spike-B in docs/spike-validations.md).
-        let req = BareRPCCodec.encodeRequestFrame(id: id, command: command, stream: [], data: data)
-        let openAck = BareRPCCodec.encodeStreamFrame(id: id, flags: [.response, .open])
-        do {
-            try await transport.write(req)
-            try await transport.write(openAck)
-            pending.openSent = true
-        } catch {
-            pendingStreams.removeValue(forKey: id)
-            cont.finish(throwing: error)
-            throw error
+        let req = try BareRPCCodec.encodeRequestFrame(
+            id: id,
+            command: command,
+            stream: [],
+            data: data,
+            maximumBodyBytes: maximumWireMessageBytes
+        )
+        let openAck = try BareRPCCodec.encodeStreamFrame(
+            id: id,
+            flags: [.response, .open],
+            maximumBodyBytes: maximumWireMessageBytes
+        )
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (setup: CheckedContinuation<Void, Error>) in
+                pending.setupContinuation = setup
+                pendingStreams[id] = pending
+                if Task.isCancelled {
+                    failStream(id: id, with: CancellationError(), notifyRemote: false)
+                    return
+                }
+                pending.setupWriteTask = Task { [transport, weak self] in
+                    guard await self?.beginStreamSetupWrite(id: id) == true else { return }
+                    do {
+                        try Task.checkCancellation()
+                        try await transport.write(req)
+                        try Task.checkCancellation()
+                        try await transport.write(openAck)
+                        try Task.checkCancellation()
+                        await self?.completeStreamSetup(id: id)
+                    } catch is CancellationError {
+                        // The cancellation/timeout path owns continuation resolution and
+                        // sends teardown after this writer has stopped.
+                    } catch {
+                        await self?.failStream(id: id, with: error, notifyRemote: false)
+                    }
+                }
+                armStreamTimeout(id: id)
+            }
+        } onCancel: { [weak self] in
+            Task { [weak self] in
+                await self?.failStream(id: id, with: CancellationError(), notifyRemote: true)
+            }
         }
         let onCancel: @Sendable () -> Void = { [weak self, id] in
             Task { [weak self] in await self?.destroyStream(id: id) }
@@ -205,31 +556,83 @@ public actor BareRPCClient {
     /// Bidirectional session: emits the canonical 3-step duplex handshake
     /// (REQUEST(stream=OPEN, no data) + STREAM(RESPONSE|OPEN) + STREAM(REQUEST|DATA, payload))
     /// then exposes a session that callers can write to and iterate.
-    public func duplex(command: UInt64, initialPayload: Data) async throws -> BareRPCDuplexSession {
-        try await ensureOpen()
+    func duplex(
+        command: UInt64,
+        initialPayload: Data,
+        timeout: Duration? = nil
+    ) async throws -> BareRPCDuplexSession {
+        try ensureOpen()
+        try validate(timeout: timeout)
         let id = allocateId()
-        let (asyncStream, cont) = makeStream()
-        let pending = PendingDuplex(id: id, continuation: cont)
-        pendingDuplex[id] = pending
-
-        let openRequest = BareRPCCodec.encodeRequestFrame(id: id, command: command, stream: [.open], data: nil)
-        let openResponse = BareRPCCodec.encodeStreamFrame(id: id, flags: [.response, .open])
-        let firstChunk = BareRPCCodec.encodeStreamFrame(id: id, flags: [.request, .data], payload: .data(initialPayload))
-        do {
-            try await transport.write(openRequest)
-            try await transport.write(openResponse)
-            try await transport.write(firstChunk)
-        } catch {
-            pendingDuplex.removeValue(forKey: id)
-            cont.finish(throwing: error)
-            throw error
+        let (asyncStream, channel) = makeStream {
+            Task { [weak self] in await self?.destroyDuplex(id: id) }
+        }
+        let pending = PendingDuplex(id: id, channel: channel)
+        pending.timeout = timeout
+        pending.waitForRemoteOpen = timeout != nil
+        let openRequest = try BareRPCCodec.encodeRequestFrame(
+            id: id,
+            command: command,
+            stream: [.open],
+            data: nil,
+            maximumBodyBytes: maximumWireMessageBytes
+        )
+        let openResponse = try BareRPCCodec.encodeStreamFrame(
+            id: id,
+            flags: [.response, .open],
+            maximumBodyBytes: maximumWireMessageBytes
+        )
+        let firstChunk = try BareRPCCodec.encodeStreamFrame(
+            id: id,
+            flags: [.request, .data],
+            payload: .data(initialPayload),
+            maximumBodyBytes: maximumWireMessageBytes
+        )
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (setup: CheckedContinuation<Void, Error>) in
+                pending.setupContinuation = setup
+                pendingDuplex[id] = pending
+                if Task.isCancelled {
+                    failDuplex(id: id, with: CancellationError(), notifyRemote: false)
+                    return
+                }
+                pending.setupWriteTask = Task { [transport, weak self] in
+                    guard await self?.beginDuplexSetupWrite(id: id) == true else { return }
+                    do {
+                        try Task.checkCancellation()
+                        try await transport.write(openRequest)
+                        try Task.checkCancellation()
+                        try await transport.write(openResponse)
+                        try Task.checkCancellation()
+                        try await transport.write(firstChunk)
+                        try Task.checkCancellation()
+                        await self?.completeDuplexWrites(id: id)
+                    } catch is CancellationError {
+                        // The cancellation/timeout path owns continuation resolution and
+                        // sends teardown after this writer has stopped.
+                    } catch {
+                        await self?.failDuplex(id: id, with: error, notifyRemote: false)
+                    }
+                }
+                if let timeout {
+                    pending.timeoutTask = makeTimeoutTask(after: timeout) { [weak self] in
+                        await self?.timeoutDuplex(id: id, timeout: timeout)
+                    }
+                }
+            }
+        } onCancel: { [weak self] in
+            Task { [weak self] in
+                await self?.failDuplex(id: id, with: CancellationError(), notifyRemote: true)
+            }
         }
 
-        let onWrite: @Sendable (Data) async -> Void = { [weak self] data in
-            await self?.sendDuplexChunk(id: id, data: data)
+        let onWrite: @Sendable (Data) async throws -> Void = { [weak self] data in
+            guard let self else { throw BareRPCStreamClosed() }
+            try await self.sendDuplexChunk(id: id, data: data)
         }
-        let onEnd: @Sendable () async -> Void = { [weak self] in
-            await self?.endDuplexOutbound(id: id)
+        let onEnd: @Sendable () async throws -> Void = { [weak self] in
+            guard let self else { throw BareRPCStreamClosed() }
+            try await self.endDuplexOutbound(id: id)
         }
         let onDestroy: @Sendable () -> Void = { [weak self] in
             Task { [weak self] in await self?.destroyDuplex(id: id) }
@@ -240,18 +643,15 @@ public actor BareRPCClient {
     }
 
     /// Close the connection and fail any in-flight requests/streams.
-    public func close() async {
-        if closed { return }
-        closed = true
-        feederTask?.cancel()
-        await transport.close()
-        await failAllInFlight(with: BareRPCConnectionClosed())
+    func close() async {
+        let task = beginClosing()
+        await task.value
     }
 
     // ----------- Inbound dispatch -----------
 
     /// Feed a chunk of bytes from the transport. Used by the feeder task; not part of the
-    /// public API.
+    /// API.
     private func feed(_ data: Data) throws {
         try reader.append(data)
         while let frame = reader.next() {
@@ -278,22 +678,23 @@ public actor BareRPCClient {
         if flags.rawValue != 0 {
             if let s = pendingStreams[id] {
                 s.serverOpened = true
+                armStreamTimeout(id: id)
                 return
             }
             if let d = pendingDuplex[id] {
                 d.responseOpened = true
+                completeDuplexSetupIfReady(id: id)
                 return
             }
             // Unrequested RESPONSE(stream=*) — server bug or stale id. Ignore.
             return
         }
         // Single-shot RESPONSE.
-        guard let pending = pendingSends.removeValue(forKey: id) else { return }
         switch payload {
         case .success(let data):
-            pending.continuation.resume(returning: data)
+            resolveSend(id: id, with: .success(data))
         case .failure(let err):
-            pending.continuation.resume(throwing: err)
+            resolveSend(id: id, with: .failure(err))
         }
     }
 
@@ -312,16 +713,19 @@ public actor BareRPCClient {
         if let s = pendingStreams[id] {
             switch payload {
             case .data(let d):
-                s.continuation.yield(d)
+                s.serverOpened = true
+                armStreamTimeout(id: id)
+                if let overflow = s.channel.yield(d) {
+                    failStream(id: id, with: overflow, notifyRemote: true)
+                }
             case .error(let err):
-                s.finished = true
-                s.continuation.finish(throwing: err)
-                pendingStreams.removeValue(forKey: id)
+                failStream(id: id, with: err, notifyRemote: false)
             case .control:
                 if flags.contains(.end) || flags.contains(.close) || flags.contains(.destroy) {
-                    s.finished = true
-                    s.continuation.finish()
-                    pendingStreams.removeValue(forKey: id)
+                    finishStream(id: id)
+                } else if flags.contains(.open) || flags.contains(.resume) {
+                    s.serverOpened = true
+                    armStreamTimeout(id: id)
                 }
                 // OPEN/PAUSE/RESUME are bookkeeping for backpressure; ignore at our layer.
             }
@@ -330,16 +734,19 @@ public actor BareRPCClient {
         if let d = pendingDuplex[id] {
             switch payload {
             case .data(let chunk):
-                d.continuation.yield(chunk)
+                d.responseOpened = true
+                completeDuplexSetupIfReady(id: id)
+                if let overflow = d.channel.yield(chunk) {
+                    failDuplex(id: id, with: overflow, notifyRemote: true)
+                }
             case .error(let err):
-                d.finished = true
-                d.continuation.finish(throwing: err)
-                pendingDuplex.removeValue(forKey: id)
+                failDuplex(id: id, with: err, notifyRemote: false)
             case .control:
                 if flags.contains(.end) || flags.contains(.close) || flags.contains(.destroy) {
-                    d.finished = true
-                    d.continuation.finish()
-                    pendingDuplex.removeValue(forKey: id)
+                    finishDuplex(id: id, notifyRemote: !d.outboundEnded)
+                } else if flags.contains(.open) {
+                    d.responseOpened = true
+                    completeDuplexSetupIfReady(id: id)
                 }
             }
         }
@@ -353,45 +760,101 @@ public actor BareRPCClient {
         if let d = pendingDuplex[id] {
             if flags.contains(.open) {
                 d.requestOpened = true
+                completeDuplexSetupIfReady(id: id)
             }
             if flags.contains(.error), case .error(let err) = payload {
-                d.finished = true
-                d.continuation.finish(throwing: err)
-                pendingDuplex.removeValue(forKey: id)
+                failDuplex(id: id, with: err, notifyRemote: false)
+                return
             }
-            // RESUME/PAUSE/END/CLOSE/DESTROY on request direction: bookkeeping only.
+            if flags.contains(.end) || flags.contains(.close) || flags.contains(.destroy) {
+                d.outboundEnded = true
+            }
+            // RESUME/PAUSE are transport-level backpressure signals.
         }
     }
 
     // ----------- Duplex helpers -----------
 
-    private func sendDuplexChunk(id: UInt64, data: Data) async {
-        let frame = BareRPCCodec.encodeStreamFrame(id: id, flags: [.request, .data], payload: .data(data))
-        do { try await transport.write(frame) }
-        catch { /* Reported via stream's finish path on next failure or close */ }
+    private func sendDuplexChunk(id: UInt64, data: Data) async throws {
+        guard let d = pendingDuplex[id], !d.finished, !d.outboundEnded else {
+            throw BareRPCStreamClosed()
+        }
+        let frame = try BareRPCCodec.encodeStreamFrame(
+            id: id,
+            flags: [.request, .data],
+            payload: .data(data),
+            maximumBodyBytes: maximumWireMessageBytes
+        )
+        try await performDuplexWrite(id: id, frame: frame)
     }
 
-    private func endDuplexOutbound(id: UInt64) async {
-        let frame = BareRPCCodec.encodeStreamFrame(id: id, flags: [.request, .end])
-        try? await transport.write(frame)
+    private func endDuplexOutbound(id: UInt64) async throws {
+        guard let d = pendingDuplex[id], !d.finished, !d.outboundEnded else {
+            throw BareRPCStreamClosed()
+        }
+        d.outboundEnded = true
+        let frame = try BareRPCCodec.encodeStreamFrame(
+            id: id,
+            flags: [.request, .end],
+            maximumBodyBytes: maximumWireMessageBytes
+        )
+        try await performDuplexWrite(id: id, frame: frame)
+    }
+
+    private func performDuplexWrite(id: UInt64, frame: Data) async throws {
+        guard let duplex = pendingDuplex[id], !duplex.finished else {
+            throw BareRPCStreamClosed()
+        }
+        let predecessor = duplex.outboundWriteTail
+        let transport = self.transport
+        let task = Task<Void, Error> {
+            if let predecessor { try await predecessor.value }
+            try Task.checkCancellation()
+            try await transport.write(frame)
+        }
+        duplex.outboundWriteTail = task
+        do {
+            try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+                Task { [weak self] in await self?.cancelDuplexWrite(id: id) }
+            }
+        } catch {
+            failDuplex(id: id, with: error, notifyRemote: false)
+            throw error
+        }
+    }
+
+    private func cancelDuplexWrite(id: UInt64) {
+        guard pendingDuplex[id] != nil else { return }
+        _ = beginClosing()
     }
 
     private func destroyDuplex(id: UInt64) {
-        guard let d = pendingDuplex[id], !d.finished else { return }
+        guard let d = takeDuplex(id: id) else { return }
         d.finished = true
-        let frame = BareRPCCodec.encodeStreamFrame(id: id, flags: [.request, .destroy])
-        Task { [transport] in try? await transport.write(frame) }
-        d.continuation.finish()
-        pendingDuplex.removeValue(forKey: id)
+        resumeSetup(d, with: .failure(CancellationError()))
+        sendDuplexTeardown(
+            id: id,
+            closeRequest: !d.outboundEnded,
+            after: d.setupWriteTask
+        )
+        d.channel.finish(discardingBuffered: true)
     }
 
     private func destroyStream(id: UInt64) {
-        guard let s = pendingStreams[id], !s.finished else { return }
+        guard let s = takeStream(id: id) else { return }
         s.finished = true
-        let frame = BareRPCCodec.encodeStreamFrame(id: id, flags: [.response, .destroy])
-        Task { [transport] in try? await transport.write(frame) }
-        s.continuation.finish()
-        pendingStreams.removeValue(forKey: id)
+        resumeSetup(s, with: .failure(CancellationError()))
+        if let frame = try? BareRPCCodec.encodeStreamFrame(
+            id: id,
+            flags: [.response, .destroy],
+            maximumBodyBytes: maximumWireMessageBytes
+        ) {
+            sendTeardown(frame, after: s.setupWriteTask)
+        }
+        s.channel.finish(discardingBuffered: true)
     }
 
     // ----------- Bookkeeping primitives -----------
@@ -404,45 +867,307 @@ public actor BareRPCClient {
         return id
     }
 
-    private func resolveSend(id: UInt64, with result: Result<Data?, Error>) {
+    private func beginSendWrite(id: UInt64) -> Bool {
+        guard let pending = pendingSends[id] else { return false }
+        pending.writeStarted = true
+        return true
+    }
+
+    private func completeSendWrite(id: UInt64) {
+        pendingSends[id]?.writeCompleted = true
+    }
+
+    private func beginStreamSetupWrite(id: UInt64) -> Bool {
+        guard let stream = pendingStreams[id], !stream.finished else { return false }
+        stream.setupWriteStarted = true
+        return true
+    }
+
+    private func beginDuplexSetupWrite(id: UInt64) -> Bool {
+        guard let duplex = pendingDuplex[id], !duplex.finished else { return false }
+        duplex.setupWriteStarted = true
+        return true
+    }
+
+    private func resolveSend(
+        id: UInt64,
+        with result: Result<Data?, Error>,
+        abortIfWriteIncomplete: Bool = false
+    ) {
         guard let pending = pendingSends.removeValue(forKey: id) else { return }
+        pending.timeoutTask?.cancel()
+        pending.writeTask?.cancel()
         switch result {
         case .success(let d): pending.continuation.resume(returning: d)
         case .failure(let e): pending.continuation.resume(throwing: e)
         }
+        if abortIfWriteIncomplete && pending.writeStarted && !pending.writeCompleted {
+            _ = beginClosing()
+        }
     }
 
-    private func makeStream() -> (AsyncThrowingStream<Data, Error>, AsyncThrowingStream<Data, Error>.Continuation) {
-        var continuation: AsyncThrowingStream<Data, Error>.Continuation!
-        let stream = AsyncThrowingStream<Data, Error> { c in continuation = c }
-        return (stream, continuation)
+    private func timeoutSend(id: UInt64, timeout: Duration) {
+        resolveSend(
+            id: id,
+            with: .failure(BareRPCRequestTimeout(timeout: timeout)),
+            abortIfWriteIncomplete: true
+        )
     }
 
-    private func ensureOpen() async throws {
+    private func completeStreamSetup(id: UInt64) {
+        guard let stream = pendingStreams[id], !stream.finished else { return }
+        stream.openSent = true
+        resumeSetup(stream, with: .success(()))
+    }
+
+    private func finishStream(id: UInt64) {
+        guard let stream = takeStream(id: id) else { return }
+        stream.finished = true
+        resumeSetup(stream, with: .success(()))
+        stream.channel.finish()
+    }
+
+    private func failStream(id: UInt64, with error: Error, notifyRemote: Bool) {
+        guard let stream = takeStream(id: id) else { return }
+        stream.finished = true
+        resumeSetup(stream, with: .failure(error))
+        stream.channel.finish(throwing: error, discardingBuffered: true)
+        if notifyRemote {
+            if stream.setupWriteStarted && !stream.openSent {
+                _ = beginClosing()
+            } else if stream.openSent {
+                if let frame = try? BareRPCCodec.encodeStreamFrame(
+                    id: id,
+                    flags: [.response, .destroy],
+                    maximumBodyBytes: maximumWireMessageBytes
+                ) {
+                    sendTeardown(frame, after: stream.setupWriteTask)
+                }
+            }
+        }
+    }
+
+    private func timeoutStream(id: UInt64, timeout: Duration, generation: UInt64) {
+        guard let stream = pendingStreams[id], stream.timeoutGeneration == generation else { return }
+        failStream(id: id, with: BareRPCRequestTimeout(timeout: timeout), notifyRemote: true)
+    }
+
+    private func armStreamTimeout(id: UInt64) {
+        guard let stream = pendingStreams[id], let timeout = stream.timeout else { return }
+        stream.timeoutTask?.cancel()
+        stream.timeoutGeneration &+= 1
+        let generation = stream.timeoutGeneration
+        stream.timeoutTask = makeTimeoutTask(after: timeout) { [weak self] in
+            await self?.timeoutStream(id: id, timeout: timeout, generation: generation)
+        }
+    }
+
+    private func completeDuplexWrites(id: UInt64) {
+        guard let duplex = pendingDuplex[id], !duplex.finished else { return }
+        duplex.localWritesComplete = true
+        completeDuplexSetupIfReady(id: id)
+    }
+
+    private func completeDuplexSetupIfReady(id: UInt64) {
+        guard let duplex = pendingDuplex[id], !duplex.finished, duplex.localWritesComplete else { return }
+        if duplex.waitForRemoteOpen && !(duplex.requestOpened && duplex.responseOpened) { return }
+        duplex.timeoutTask?.cancel()
+        duplex.timeoutTask = nil
+        resumeSetup(duplex, with: .success(()))
+    }
+
+    private func timeoutDuplex(id: UInt64, timeout: Duration) {
+        failDuplex(id: id, with: BareRPCRequestTimeout(timeout: timeout), notifyRemote: true)
+    }
+
+    private func finishDuplex(id: UInt64, notifyRemote: Bool) {
+        guard let duplex = takeDuplex(id: id) else { return }
+        duplex.finished = true
+        resumeSetup(duplex, with: .success(()))
+        if notifyRemote {
+            sendDuplexTeardown(id: id, closeRequest: true, after: duplex.setupWriteTask)
+        }
+        duplex.channel.finish()
+    }
+
+    private func failDuplex(id: UInt64, with error: Error, notifyRemote: Bool) {
+        guard let duplex = takeDuplex(id: id) else { return }
+        duplex.finished = true
+        resumeSetup(duplex, with: .failure(error))
+        if notifyRemote {
+            if duplex.setupWriteStarted && !duplex.localWritesComplete {
+                _ = beginClosing()
+            } else if duplex.localWritesComplete {
+                sendDuplexTeardown(
+                    id: id,
+                    closeRequest: !duplex.outboundEnded,
+                    after: duplex.setupWriteTask
+                )
+            }
+        }
+        duplex.channel.finish(throwing: error, discardingBuffered: true)
+    }
+
+    private func sendDuplexTeardown(
+        id: UInt64,
+        closeRequest: Bool,
+        after setupWriteTask: Task<Void, Never>?
+    ) {
+        var frames = Data()
+        if closeRequest {
+            if let close = try? BareRPCCodec.encodeStreamFrame(
+                id: id,
+                flags: [.request, .close],
+                maximumBodyBytes: maximumWireMessageBytes
+            ) {
+                frames.append(close)
+            }
+        }
+        if let destroy = try? BareRPCCodec.encodeStreamFrame(
+            id: id,
+            flags: [.response, .destroy],
+            maximumBodyBytes: maximumWireMessageBytes
+        ) {
+            frames.append(destroy)
+        }
+        if !frames.isEmpty {
+            sendTeardown(frames, after: setupWriteTask)
+        }
+    }
+
+    private func sendTeardown(_ frames: Data, after setupWriteTask: Task<Void, Never>?) {
+        Task { [transport] in
+            if let setupWriteTask { await setupWriteTask.value }
+            try? await transport.write(frames)
+        }
+    }
+
+    private func takeStream(id: UInt64) -> PendingStream? {
+        guard let stream = pendingStreams.removeValue(forKey: id), !stream.finished else { return nil }
+        stream.timeoutTask?.cancel()
+        stream.timeoutTask = nil
+        stream.setupWriteTask?.cancel()
+        return stream
+    }
+
+    private func takeDuplex(id: UInt64) -> PendingDuplex? {
+        guard let duplex = pendingDuplex.removeValue(forKey: id), !duplex.finished else { return nil }
+        duplex.timeoutTask?.cancel()
+        duplex.timeoutTask = nil
+        duplex.setupWriteTask?.cancel()
+        duplex.outboundWriteTail?.cancel()
+        return duplex
+    }
+
+    private func resumeSetup(_ stream: PendingStream, with result: Result<Void, Error>) {
+        guard let continuation = stream.setupContinuation else { return }
+        stream.setupContinuation = nil
+        continuation.resume(with: result)
+    }
+
+    private func resumeSetup(_ duplex: PendingDuplex, with result: Result<Void, Error>) {
+        guard let continuation = duplex.setupContinuation else { return }
+        duplex.setupContinuation = nil
+        continuation.resume(with: result)
+    }
+
+    private func makeTimeoutTask(
+        after timeout: Duration,
+        action: @escaping @Sendable () async -> Void
+    ) -> Task<Void, Never> {
+        Task {
+            do {
+                try await Task.sleep(for: timeout)
+            } catch {
+                return
+            }
+            await action()
+        }
+    }
+
+    private func makeStream(
+        onCancel: @escaping @Sendable () -> Void
+    ) -> (AsyncThrowingStream<Data, Error>, BoundedRPCDataChannel) {
+        let channel = BoundedRPCDataChannel(
+            maximumBufferedBytes: maximumBufferedStreamBytes,
+            onCancel: onCancel
+        )
+        let stream = AsyncThrowingStream<Data, Error>(unfolding: {
+            try await channel.next()
+        })
+        return (stream, channel)
+    }
+
+    private func ensureOpen() throws {
         if closed { throw BareRPCConnectionClosed() }
     }
 
+    private func validate(timeout: Duration?) throws {
+        if let timeout, timeout <= .zero {
+            throw BareRPCInvalidArgument("timeout must be greater than zero")
+        }
+    }
+
+    private func connectionEnded(with error: Error) {
+        guard transportCloseTask == nil else { return }
+        _ = beginClosing(failingWith: error)
+    }
+
+    /// Starts transport teardown synchronously in actor state and returns the one
+    /// joinable task shared by every concurrent `close()` caller.
+    @discardableResult
+    private func beginClosing(
+        failingWith error: Error = BareRPCConnectionClosed()
+    ) -> Task<Void, Never> {
+        if let transportCloseTask { return transportCloseTask }
+        closed = true
+        let feeder = feederTask
+        feeder?.cancel()
+        failAllInFlight(with: error)
+        let transport = self.transport
+        let task = Task {
+            await transport.close()
+            if let feeder { await feeder.value }
+        }
+        transportCloseTask = task
+        return task
+    }
+
     private func failAllInFlight(with error: Error) {
-        for (_, p) in pendingSends { p.continuation.resume(throwing: error) }
+        for (_, p) in pendingSends {
+            p.timeoutTask?.cancel()
+            p.writeTask?.cancel()
+            p.continuation.resume(throwing: error)
+        }
         pendingSends.removeAll()
         for (_, s) in pendingStreams where !s.finished {
-            s.continuation.finish(throwing: error)
+            s.timeoutTask?.cancel()
+            s.setupWriteTask?.cancel()
+            resumeSetup(s, with: .failure(error))
+            s.channel.finish(throwing: error, discardingBuffered: true)
         }
         pendingStreams.removeAll()
         for (_, d) in pendingDuplex where !d.finished {
-            d.continuation.finish(throwing: error)
+            d.timeoutTask?.cancel()
+            d.setupWriteTask?.cancel()
+            d.outboundWriteTail?.cancel()
+            resumeSetup(d, with: .failure(error))
+            d.channel.finish(throwing: error, discardingBuffered: true)
         }
         pendingDuplex.removeAll()
+    }
+
+    /// Test-only visibility for proving timeout/cancellation cleanup.
+    func __testInFlightCounts() -> (sends: Int, streams: Int, duplexes: Int) {
+        (pendingSends.count, pendingStreams.count, pendingDuplex.count)
     }
 }
 
 // MARK: - Optional logger hook
 
-/// Plug-in for surfacing per-frame RPC diagnostics from the lowest layer of the
-/// client. The default `BareRPCClient` initializer leaves this `nil` so no logs
-/// are emitted; callers who need to debug worker handshake / multiplexing /
-/// stream lifecycle issues can pass an implementation that forwards to OSLog,
-/// stderr, or any sink they want.
+/// Plug-in for surfacing RPC lifecycle diagnostics from `QVACClient`. Callers
+/// who need a custom sink can pass an implementation to the public client
+/// initializer; pass `nil` to disable logging.
 ///
 /// Emitted log lines are intentionally raw — they describe frame events, not
 /// translated application errors. For application-level errors see `QVACError`.
@@ -454,8 +1179,7 @@ public actor BareRPCClient {
 ///         FileHandle.standardError.write(Data("[\(level)] \(message)\n".utf8))
 ///     }
 /// }
-/// // Then:
-/// // let rpc = BareRPCClient(transport: t, logger: StderrRPCLog())
+/// // Then pass `StderrRPCLog()` as `QVACClient`'s `logger` argument.
 /// ```
 public protocol BareRPCLogger: Sendable {
     func log(_ level: BareRPCLogLevel, _ message: String)

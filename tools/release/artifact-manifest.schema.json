@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Jainakin/qvac-swift/tools/release/artifact-manifest.schema.json",
+  "title": "QVAC Swift immutable release artifact manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "mode", "artifactTag", "sourceCommit", "sdk", "bundle", "notices", "artifacts"],
+  "properties": {
+    "schemaVersion": { "const": 2 },
+    "mode": { "const": "release" },
+    "artifactTag": { "type": "string", "pattern": "^artifacts-sdk-0\\.17\\.0-r[1-9][0-9]*$" },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sdk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "sourceCommit", "npmIntegrity", "runtimeInventorySHA256"],
+      "properties": {
+        "version": { "const": "0.17.0" },
+        "sourceCommit": { "const": "e8b440665a053a9efe852f04c3601da44f0d55d8" },
+        "npmIntegrity": { "type": "string", "pattern": "^sha512-" },
+        "runtimeInventorySHA256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "bundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assetName", "url", "size", "sha256", "bundleId", "main", "embeddedSDKVersion", "addonTargets"],
+      "properties": {
+        "assetName": { "const": "worker.mobile.bundle" },
+        "url": { "type": "string", "pattern": "^https://github\\.com/[^/]+/[^/]+/releases/download/artifacts-sdk-0\\.17\\.0-r[1-9][0-9]*/worker\\.mobile\\.bundle$" },
+        "size": { "type": "integer", "minimum": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "bundleId": { "type": "string", "minLength": 1 },
+        "main": { "type": "string", "minLength": 1 },
+        "embeddedSDKVersion": { "const": "0.17.0" },
+        "addonTargets": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[A-Za-z0-9._@-]+$" } }
+      }
+    },
+    "notices": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assetName", "url", "size", "sha256"],
+      "properties": {
+        "assetName": { "const": "THIRD_PARTY_NOTICES.md" },
+        "url": { "type": "string", "pattern": "^https://github\\.com/[^/]+/[^/]+/releases/download/artifacts-sdk-0\\.17\\.0-r[1-9][0-9]*/THIRD_PARTY_NOTICES\\.md$" },
+        "size": { "type": "integer", "minimum": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target", "assetName", "url", "size", "sha256", "swiftChecksum"],
+        "properties": {
+          "target": { "type": "string", "pattern": "^[A-Za-z0-9._@-]+$" },
+          "assetName": { "type": "string", "pattern": "^[A-Za-z0-9._@-]+\\.xcframework\\.zip$" },
+          "url": { "type": "string", "pattern": "^https://github\\.com/[^/]+/[^/]+/releases/download/artifacts-sdk-0\\.17\\.0-r[1-9][0-9]*/[A-Za-z0-9._@-]+\\.xcframework\\.zip$" },
+          "size": { "type": "integer", "minimum": 1 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "swiftChecksum": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    }
+  }
+}

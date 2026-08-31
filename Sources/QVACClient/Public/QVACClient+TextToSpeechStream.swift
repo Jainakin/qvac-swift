@@ -23,17 +23,41 @@ public extension QVACClient {
         sentenceDelimiterPreset: String? = nil,
         maxBufferScalars: Double? = nil,
         flushAfterMs: Double? = nil,
-        inputType: String? = nil
+        inputType: String? = nil,
+        description: String? = nil,
+        voiceDescription: String? = nil,
+        voice: String? = nil,
+        emotion: String? = nil,
+        pitch: String? = nil,
+        pace: String? = nil,
+        expressivity: String? = nil,
+        noise: String? = nil,
+        reverb: String? = nil,
+        quality: String? = nil,
+        rpcOptions: QVACRPCOptions = .init()
     ) async throws -> TextToSpeechStreamSession {
         let req = TextToSpeechStreamRequest(
             modelId: modelId,
             accumulateSentences: accumulateSentences,
+            description: description,
+            emotion: emotion,
+            expressivity: expressivity,
             flushAfterMs: flushAfterMs,
             inputType: inputType,
             maxBufferScalars: maxBufferScalars,
-            sentenceDelimiterPreset: sentenceDelimiterPreset
+            noise: noise,
+            pace: pace,
+            pitch: pitch,
+            quality: quality,
+            reverb: reverb,
+            sentenceDelimiterPreset: sentenceDelimiterPreset,
+            voice: voice,
+            voiceDescription: voiceDescription
         )
-        let raw: QVACDuplexSession<TextToSpeechStreamResponse> = try await duplexTyped(.textToSpeechStream(req))
+        let raw: QVACDuplexSession<TextToSpeechStreamResponse> = try await duplexTyped(
+            .textToSpeechStream(req),
+            rpcOptions: rpcOptions
+        )
         return TextToSpeechStreamSession(raw: raw)
     }
 
@@ -42,36 +66,40 @@ public extension QVACClient {
         init(raw: QVACDuplexSession<TextToSpeechStreamResponse>) { self.raw = raw }
 
         /// Send a UTF-8 text fragment. The session will synthesize audio for it incrementally.
-        public func write(text: String) async { await raw.write(Data(text.utf8)) }
+        public func write(text: String) async throws { try await raw.write(Data(text.utf8)) }
 
         /// Signal end-of-input. The session emits final audio chunks then closes.
-        public func end() async { await raw.end() }
+        public func end() async throws { try await raw.end() }
 
         /// Hard-terminate the session.
         public func destroy() { raw.destroy() }
 
         /// Async sequence of audio chunks. Single-use.
-        public var chunks: AsyncThrowingStream<TtsStreamChunk, Error> {
+        public var chunks: QVACResponseStream<TtsStreamChunk> {
             let inner = raw.responses
-            return AsyncThrowingStream<TtsStreamChunk, Error> { continuation in
-                let task = Task<Void, Never> {
-                    do {
-                        for try await response in inner {
-                            if !response.buffer.isEmpty || response.sentenceChunk != nil {
-                                continuation.yield(TtsStreamChunk(
-                                    buffer: response.buffer,
-                                    chunkIndex: response.chunkIndex,
-                                    sentenceChunk: response.sentenceChunk
-                                ))
-                            }
-                            if response.done == true { break }
-                        }
-                        continuation.finish()
-                    } catch {
-                        continuation.finish(throwing: error)
-                    }
+            let rawSession = raw
+            return QVACClient.pullMap(
+                inner,
+                onTermination: { rawSession.destroy() },
+                endOfSourceError: {
+                    QVACError.client(
+                        .streamEndedWithoutResponse,
+                        message: "textToSpeechStream ended without a terminal done frame"
+                    )
                 }
-                continuation.onTermination = { _ in task.cancel() }
+            ) { response in
+                let chunk: TtsStreamChunk? =
+                    !response.buffer.isEmpty || response.sentenceChunk != nil
+                    ? TtsStreamChunk(
+                        buffer: response.buffer,
+                        chunkIndex: response.chunkIndex,
+                        sentenceChunk: response.sentenceChunk
+                    )
+                    : nil
+                if response.done == true {
+                    return .emitThenFinish(chunk.map { [$0] } ?? [])
+                }
+                return chunk.map(QVACPullMapDecision.emit) ?? .skip
             }
         }
     }

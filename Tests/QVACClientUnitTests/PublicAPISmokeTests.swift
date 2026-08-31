@@ -18,6 +18,26 @@ final class PublicAPISmokeTests: XCTestCase {
         return try JSONDecoder().decode(T.self, from: data)
     }
 
+    #if os(macOS)
+    func test_macOS_configuration_prefers_lockfile_local_bare_runtime() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qvac-local-bare-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let nodeModules = root.appendingPathComponent("node_modules", isDirectory: true)
+        let bin = nodeModules.appendingPathComponent(".bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let localBare = bin.appendingPathComponent("bare")
+        XCTAssertTrue(FileManager.default.createFile(atPath: localBare.path, contents: Data()))
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: localBare.path)
+
+        let configuration = try QVACClient.Configuration.macOS(nodeModulesDir: nodeModules)
+        guard case .macOSSubprocess(let transport) = configuration.storage else {
+            return XCTFail("expected macOS subprocess configuration")
+        }
+        XCTAssertEqual(transport.bareExecutable.standardizedFileURL, localBare.standardizedFileURL)
+    }
+    #endif
+
     // MARK: - Single-shot request envelopes
 
     func test_heartbeat_request_envelope_round_trip() throws {
@@ -26,14 +46,13 @@ final class PublicAPISmokeTests: XCTestCase {
     }
 
     func test_cancel_request_carries_operation_specific_fields() throws {
-        var req = CancelRequest(operation: "inference")
-        req.modelId = "model-x"
+        let req = CancelRequest(operation: "request", requestId: "request-x")
         let envelope = QVACRequest.cancel(req)
         let json = try JSONEncoder.qvac.encode(envelope)
         let obj = try JSONSerialization.jsonObject(with: json) as? [String: Any]
         XCTAssertEqual(obj?["type"] as? String, "cancel")
-        XCTAssertEqual(obj?["operation"] as? String, "inference")
-        XCTAssertEqual(obj?["modelId"] as? String, "model-x")
+        XCTAssertEqual(obj?["operation"] as? String, "request")
+        XCTAssertEqual(obj?["requestId"] as? String, "request-x")
     }
 
     func test_embed_request_carries_text_payload() throws {
@@ -146,11 +165,32 @@ final class PublicAPISmokeTests: XCTestCase {
         XCTAssertEqual(r.modelId, "m-1")
     }
 
-    func test_unknown_response_type_falls_through_to_unknown_case() throws {
+    func test_unknown_response_discriminator_is_rejected_for_pinned_contract() throws {
         let json = #"{"type":"futureMessageType","field":42}"#
-        let resp = try JSONDecoder().decode(QVACResponse.self, from: Data(json.utf8))
-        guard case .unknown(let type, _) = resp else { return XCTFail("expected unknown") }
-        XCTAssertEqual(type, "futureMessageType")
+        XCTAssertThrowsError(try JSONDecoder().decode(QVACResponse.self, from: Data(json.utf8))) { error in
+            guard case DecodingError.dataCorrupted = error else {
+                return XCTFail("expected dataCorrupted, got \(error)")
+            }
+        }
+    }
+
+    func test_unknown_request_discriminator_is_rejected_for_pinned_contract() throws {
+        let json = #"{"type":"futureRequest"}"#
+        XCTAssertThrowsError(try JSONDecoder().decode(QVACRequest.self, from: Data(json.utf8))) { error in
+            guard case DecodingError.dataCorrupted = error else {
+                return XCTFail("expected dataCorrupted, got \(error)")
+            }
+        }
+    }
+
+    func test_concrete_type_rejects_mismatched_discriminator() throws {
+        let json = #"{"type":"loadModel"}"#
+        XCTAssertThrowsError(try JSONDecoder().decode(HeartbeatRequest.self, from: Data(json.utf8))) { error in
+            guard case DecodingError.dataCorrupted = error else {
+                return XCTFail("expected dataCorrupted, got \(error)")
+            }
+        }
+        XCTAssertEqual(HeartbeatRequest().type, HeartbeatRequest.discriminator)
     }
 
     // MARK: - JSONValue Codable

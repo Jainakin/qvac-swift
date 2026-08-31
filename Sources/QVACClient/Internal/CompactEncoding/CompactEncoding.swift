@@ -5,17 +5,23 @@
 // from the JS impl; see Tests/Fixtures/compact-encoding.json).
 //
 // This is an INTERNAL implementation detail of QVACClient. It is not part of the
-// public API. Public consumers should not import or depend on it directly.
+// API. Public consumers should not import or depend on it directly.
 
 import Foundation
 
 // MARK: - Errors
 
-public enum CompactEncodingError: Error, Equatable, Sendable {
+enum CompactEncodingError: Error, Equatable, Sendable {
     case outOfBounds
     case negativeUInt
     case invalidUTF8
     case incorrectFixedSize(expected: Int, got: Int)
+}
+
+@inline(__always)
+private func checkedLength(_ value: UInt64) throws -> Int {
+    guard value <= UInt64(Int.max) else { throw CompactEncodingError.outOfBounds }
+    return Int(value)
 }
 
 // MARK: - Encoder state
@@ -23,12 +29,12 @@ public enum CompactEncodingError: Error, Equatable, Sendable {
 /// Mirrors `compact-encoding`'s state object: `{ start, end, buffer }`.
 /// `preencode` walks the value to compute the byte length (advancing `end`);
 /// `encode` writes the bytes (advancing `start`); `decode` reads them.
-public struct EncoderState: Sendable {
-    public var start: Int
-    public var end: Int
-    public var buffer: Data
+struct EncoderState: Sendable {
+    var start: Int
+    var end: Int
+    var buffer: Data
 
-    public init(buffer: Data = Data()) {
+    init(buffer: Data = Data()) {
         self.start = 0
         self.end = buffer.count
         self.buffer = buffer
@@ -37,14 +43,14 @@ public struct EncoderState: Sendable {
 
 // MARK: - Codec protocol
 
-public protocol CompactCodec: Sendable {
+protocol CompactCodec: Sendable {
     associatedtype Value: Sendable
     func preencode(_ state: inout EncoderState, _ value: Value)
     func encode(_ state: inout EncoderState, _ value: Value)
     func decode(_ state: inout EncoderState) throws -> Value
 }
 
-public extension CompactCodec {
+extension CompactCodec {
     /// Encode `value` to a fresh `Data` buffer.
     func encode(_ value: Value) -> Data {
         var state = EncoderState()
@@ -64,14 +70,14 @@ public extension CompactCodec {
 
 // MARK: - Fixed-width uints
 
-public struct UInt8Codec: CompactCodec {
-    public init() {}
-    public func preencode(_ state: inout EncoderState, _ value: UInt64) { state.end += 1 }
-    public func encode(_ state: inout EncoderState, _ value: UInt64) {
+struct UInt8Codec: CompactCodec {
+    init() {}
+    func preencode(_ state: inout EncoderState, _ value: UInt64) { state.end += 1 }
+    func encode(_ state: inout EncoderState, _ value: UInt64) {
         state.buffer[state.start] = UInt8(value & 0xff)
         state.start += 1
     }
-    public func decode(_ state: inout EncoderState) throws -> UInt64 {
+    func decode(_ state: inout EncoderState) throws -> UInt64 {
         guard state.start < state.end else { throw CompactEncodingError.outOfBounds }
         let b = state.buffer[state.start]
         state.start += 1
@@ -79,15 +85,15 @@ public struct UInt8Codec: CompactCodec {
     }
 }
 
-public struct UInt16Codec: CompactCodec {
-    public init() {}
-    public func preencode(_ state: inout EncoderState, _ value: UInt64) { state.end += 2 }
-    public func encode(_ state: inout EncoderState, _ value: UInt64) {
+struct UInt16Codec: CompactCodec {
+    init() {}
+    func preencode(_ state: inout EncoderState, _ value: UInt64) { state.end += 2 }
+    func encode(_ state: inout EncoderState, _ value: UInt64) {
         state.buffer[state.start]     = UInt8(value        & 0xff)
         state.buffer[state.start + 1] = UInt8((value >> 8) & 0xff)
         state.start += 2
     }
-    public func decode(_ state: inout EncoderState) throws -> UInt64 {
+    func decode(_ state: inout EncoderState) throws -> UInt64 {
         guard state.end - state.start >= 2 else { throw CompactEncodingError.outOfBounds }
         let v = UInt64(state.buffer[state.start]) | (UInt64(state.buffer[state.start + 1]) << 8)
         state.start += 2
@@ -95,14 +101,14 @@ public struct UInt16Codec: CompactCodec {
     }
 }
 
-public struct UInt24Codec: CompactCodec {
-    public init() {}
-    public func preencode(_ state: inout EncoderState, _ value: UInt64) { state.end += 3 }
-    public func encode(_ state: inout EncoderState, _ value: UInt64) {
+struct UInt24Codec: CompactCodec {
+    init() {}
+    func preencode(_ state: inout EncoderState, _ value: UInt64) { state.end += 3 }
+    func encode(_ state: inout EncoderState, _ value: UInt64) {
         for i in 0..<3 { state.buffer[state.start + i] = UInt8((value >> (8 * i)) & 0xff) }
         state.start += 3
     }
-    public func decode(_ state: inout EncoderState) throws -> UInt64 {
+    func decode(_ state: inout EncoderState) throws -> UInt64 {
         guard state.end - state.start >= 3 else { throw CompactEncodingError.outOfBounds }
         var v: UInt64 = 0
         for i in 0..<3 { v |= UInt64(state.buffer[state.start + i]) << (8 * i) }
@@ -111,14 +117,14 @@ public struct UInt24Codec: CompactCodec {
     }
 }
 
-public struct UInt32Codec: CompactCodec {
-    public init() {}
-    public func preencode(_ state: inout EncoderState, _ value: UInt64) { state.end += 4 }
-    public func encode(_ state: inout EncoderState, _ value: UInt64) {
+struct UInt32Codec: CompactCodec {
+    init() {}
+    func preencode(_ state: inout EncoderState, _ value: UInt64) { state.end += 4 }
+    func encode(_ state: inout EncoderState, _ value: UInt64) {
         for i in 0..<4 { state.buffer[state.start + i] = UInt8((value >> (8 * i)) & 0xff) }
         state.start += 4
     }
-    public func decode(_ state: inout EncoderState) throws -> UInt64 {
+    func decode(_ state: inout EncoderState) throws -> UInt64 {
         guard state.end - state.start >= 4 else { throw CompactEncodingError.outOfBounds }
         var v: UInt64 = 0
         for i in 0..<4 { v |= UInt64(state.buffer[state.start + i]) << (8 * i) }
@@ -127,14 +133,14 @@ public struct UInt32Codec: CompactCodec {
     }
 }
 
-public struct UInt64Codec: CompactCodec {
-    public init() {}
-    public func preencode(_ state: inout EncoderState, _ value: UInt64) { state.end += 8 }
-    public func encode(_ state: inout EncoderState, _ value: UInt64) {
+struct UInt64Codec: CompactCodec {
+    init() {}
+    func preencode(_ state: inout EncoderState, _ value: UInt64) { state.end += 8 }
+    func encode(_ state: inout EncoderState, _ value: UInt64) {
         for i in 0..<8 { state.buffer[state.start + i] = UInt8((value >> (8 * i)) & 0xff) }
         state.start += 8
     }
-    public func decode(_ state: inout EncoderState) throws -> UInt64 {
+    func decode(_ state: inout EncoderState) throws -> UInt64 {
         guard state.end - state.start >= 8 else { throw CompactEncodingError.outOfBounds }
         var v: UInt64 = 0
         for i in 0..<8 { v |= UInt64(state.buffer[state.start + i]) << (8 * i) }
@@ -151,15 +157,15 @@ public struct UInt64Codec: CompactCodec {
 /// `0xfe <uint32>` (5 bytes total);
 /// `0xff <uint64>` (9 bytes total).
 /// All multi-byte values are little-endian.
-public struct UIntVarintCodec: CompactCodec {
-    public init() {}
-    public func preencode(_ state: inout EncoderState, _ value: UInt64) {
+struct UIntVarintCodec: CompactCodec {
+    init() {}
+    func preencode(_ state: inout EncoderState, _ value: UInt64) {
         if      value <= 0xfc       { state.end += 1 }
         else if value <= 0xffff     { state.end += 3 }
         else if value <= 0xffffffff { state.end += 5 }
         else                        { state.end += 9 }
     }
-    public func encode(_ state: inout EncoderState, _ value: UInt64) {
+    func encode(_ state: inout EncoderState, _ value: UInt64) {
         if value <= 0xfc {
             state.buffer[state.start] = UInt8(value); state.start += 1
         } else if value <= 0xffff {
@@ -173,7 +179,7 @@ public struct UIntVarintCodec: CompactCodec {
             UInt64Codec().encode(&state, value)
         }
     }
-    public func decode(_ state: inout EncoderState) throws -> UInt64 {
+    func decode(_ state: inout EncoderState) throws -> UInt64 {
         guard state.start < state.end else { throw CompactEncodingError.outOfBounds }
         let tag = state.buffer[state.start]
         if tag <= 0xfc { state.start += 1; return UInt64(tag) }
@@ -189,12 +195,12 @@ public struct UIntVarintCodec: CompactCodec {
 /// ZigZag-encoded signed varint built on `UIntVarintCodec`.
 /// Maps signed integers to unsigned via the standard zigzag scheme:
 /// `0, -1, 1, -2, 2, ...` → `0, 1, 2, 3, 4, ...`.
-public struct IntVarintCodec: CompactCodec {
+struct IntVarintCodec: CompactCodec {
     private let inner = UIntVarintCodec()
-    public init() {}
-    public func preencode(_ state: inout EncoderState, _ value: Int64) { inner.preencode(&state, zigzag(value)) }
-    public func encode(_ state: inout EncoderState, _ value: Int64)    { inner.encode(&state, zigzag(value)) }
-    public func decode(_ state: inout EncoderState) throws -> Int64    { unzigzag(try inner.decode(&state)) }
+    init() {}
+    func preencode(_ state: inout EncoderState, _ value: Int64) { inner.preencode(&state, zigzag(value)) }
+    func encode(_ state: inout EncoderState, _ value: Int64)    { inner.encode(&state, zigzag(value)) }
+    func decode(_ state: inout EncoderState) throws -> Int64    { unzigzag(try inner.decode(&state)) }
 
     /// ZigZag encoding maps Int64 → UInt64 without overflow at the boundaries.
     /// Standard bit-twiddle form: `(n << 1) ^ (n >> 63)`. Works for the full domain
@@ -215,14 +221,14 @@ public struct IntVarintCodec: CompactCodec {
 
 // MARK: - Primitives
 
-public struct BoolCodec: CompactCodec {
-    public init() {}
-    public func preencode(_ state: inout EncoderState, _ value: Bool) { state.end += 1 }
-    public func encode(_ state: inout EncoderState, _ value: Bool) {
+struct BoolCodec: CompactCodec {
+    init() {}
+    func preencode(_ state: inout EncoderState, _ value: Bool) { state.end += 1 }
+    func encode(_ state: inout EncoderState, _ value: Bool) {
         state.buffer[state.start] = value ? 1 : 0
         state.start += 1
     }
-    public func decode(_ state: inout EncoderState) throws -> Bool {
+    func decode(_ state: inout EncoderState) throws -> Bool {
         guard state.start < state.end else { throw CompactEncodingError.outOfBounds }
         let b = state.buffer[state.start] == 1
         state.start += 1
@@ -231,22 +237,22 @@ public struct BoolCodec: CompactCodec {
 }
 
 /// `utf8`: uint-prefixed UTF-8 string bytes.
-public struct UTF8Codec: CompactCodec {
+struct UTF8Codec: CompactCodec {
     private let uvar = UIntVarintCodec()
-    public init() {}
-    public func preencode(_ state: inout EncoderState, _ value: String) {
+    init() {}
+    func preencode(_ state: inout EncoderState, _ value: String) {
         let len = value.utf8.count
         uvar.preencode(&state, UInt64(len))
         state.end += len
     }
-    public func encode(_ state: inout EncoderState, _ value: String) {
+    func encode(_ state: inout EncoderState, _ value: String) {
         let bytes = Array(value.utf8)
         uvar.encode(&state, UInt64(bytes.count))
         for i in 0..<bytes.count { state.buffer[state.start + i] = bytes[i] }
         state.start += bytes.count
     }
-    public func decode(_ state: inout EncoderState) throws -> String {
-        let len = Int(try uvar.decode(&state))
+    func decode(_ state: inout EncoderState) throws -> String {
+        let len = try checkedLength(uvar.decode(&state))
         guard state.end - state.start >= len else { throw CompactEncodingError.outOfBounds }
         let slice = state.buffer.subdata(in: state.start..<(state.start + len))
         state.start += len
@@ -256,14 +262,14 @@ public struct UTF8Codec: CompactCodec {
 }
 
 /// `buffer`: uint-prefixed raw bytes.
-public struct BufferCodec: CompactCodec {
+struct BufferCodec: CompactCodec {
     private let uvar = UIntVarintCodec()
-    public init() {}
-    public func preencode(_ state: inout EncoderState, _ value: Data) {
+    init() {}
+    func preencode(_ state: inout EncoderState, _ value: Data) {
         uvar.preencode(&state, UInt64(value.count))
         state.end += value.count
     }
-    public func encode(_ state: inout EncoderState, _ value: Data) {
+    func encode(_ state: inout EncoderState, _ value: Data) {
         uvar.encode(&state, UInt64(value.count))
         value.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
             state.buffer.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
@@ -273,8 +279,8 @@ public struct BufferCodec: CompactCodec {
         }
         state.start += value.count
     }
-    public func decode(_ state: inout EncoderState) throws -> Data {
-        let len = Int(try uvar.decode(&state))
+    func decode(_ state: inout EncoderState) throws -> Data {
+        let len = try checkedLength(uvar.decode(&state))
         guard state.end - state.start >= len else { throw CompactEncodingError.outOfBounds }
         let slice = state.buffer.subdata(in: state.start..<(state.start + len))
         state.start += len
@@ -284,10 +290,10 @@ public struct BufferCodec: CompactCodec {
 
 /// `optionalBuffer`: like `buffer` but a length of 0 decodes to `nil`.
 /// Encoding `nil` (or empty `Data`) writes a single 0 byte.
-public struct OptionalBufferCodec: CompactCodec {
+struct OptionalBufferCodec: CompactCodec {
     private let uvar = UIntVarintCodec()
-    public init() {}
-    public func preencode(_ state: inout EncoderState, _ value: Data?) {
+    init() {}
+    func preencode(_ state: inout EncoderState, _ value: Data?) {
         if let v = value, !v.isEmpty {
             uvar.preencode(&state, UInt64(v.count))
             state.end += v.count
@@ -295,7 +301,7 @@ public struct OptionalBufferCodec: CompactCodec {
             state.end += 1
         }
     }
-    public func encode(_ state: inout EncoderState, _ value: Data?) {
+    func encode(_ state: inout EncoderState, _ value: Data?) {
         if let v = value, !v.isEmpty {
             uvar.encode(&state, UInt64(v.count))
             v.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
@@ -310,8 +316,8 @@ public struct OptionalBufferCodec: CompactCodec {
             state.start += 1
         }
     }
-    public func decode(_ state: inout EncoderState) throws -> Data? {
-        let len = Int(try uvar.decode(&state))
+    func decode(_ state: inout EncoderState) throws -> Data? {
+        let len = try checkedLength(uvar.decode(&state))
         if len == 0 { return nil }
         guard state.end - state.start >= len else { throw CompactEncodingError.outOfBounds }
         let slice = state.buffer.subdata(in: state.start..<(state.start + len))
@@ -322,11 +328,11 @@ public struct OptionalBufferCodec: CompactCodec {
 
 /// Fixed-width raw bytes. The size is part of the codec, not the wire (so encoding a Data
 /// whose length ≠ `size` is an error).
-public struct FixedBytesCodec: CompactCodec {
-    public let size: Int
-    public init(size: Int) { self.size = size }
-    public func preencode(_ state: inout EncoderState, _ value: Data) { state.end += size }
-    public func encode(_ state: inout EncoderState, _ value: Data) {
+struct FixedBytesCodec: CompactCodec {
+    let size: Int
+    init(size: Int) { self.size = size }
+    func preencode(_ state: inout EncoderState, _ value: Data) { state.end += size }
+    func encode(_ state: inout EncoderState, _ value: Data) {
         // We intentionally don't throw on size mismatch from encode (mirrors JS which throws
         // synchronously); we trap with a precondition for fail-fast bugs.
         precondition(value.count == size, "FixedBytesCodec(\(size)).encode: got \(value.count) bytes")
@@ -338,7 +344,7 @@ public struct FixedBytesCodec: CompactCodec {
         }
         state.start += size
     }
-    public func decode(_ state: inout EncoderState) throws -> Data {
+    func decode(_ state: inout EncoderState) throws -> Data {
         guard state.end - state.start >= size else { throw CompactEncodingError.outOfBounds }
         let slice = state.buffer.subdata(in: state.start..<(state.start + size))
         state.start += size
@@ -348,10 +354,10 @@ public struct FixedBytesCodec: CompactCodec {
 
 // MARK: - Float
 
-public struct Float32Codec: CompactCodec {
-    public init() {}
-    public func preencode(_ state: inout EncoderState, _ value: Float) { state.end += 4 }
-    public func encode(_ state: inout EncoderState, _ value: Float) {
+struct Float32Codec: CompactCodec {
+    init() {}
+    func preencode(_ state: inout EncoderState, _ value: Float) { state.end += 4 }
+    func encode(_ state: inout EncoderState, _ value: Float) {
         var bits = value.bitPattern.littleEndian
         withUnsafeBytes(of: &bits) { src in
             state.buffer.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
@@ -361,7 +367,7 @@ public struct Float32Codec: CompactCodec {
         }
         state.start += 4
     }
-    public func decode(_ state: inout EncoderState) throws -> Float {
+    func decode(_ state: inout EncoderState) throws -> Float {
         guard state.end - state.start >= 4 else { throw CompactEncodingError.outOfBounds }
         var bits: UInt32 = 0
         for i in 0..<4 { bits |= UInt32(state.buffer[state.start + i]) << (8 * i) }
@@ -370,10 +376,10 @@ public struct Float32Codec: CompactCodec {
     }
 }
 
-public struct Float64Codec: CompactCodec {
-    public init() {}
-    public func preencode(_ state: inout EncoderState, _ value: Double) { state.end += 8 }
-    public func encode(_ state: inout EncoderState, _ value: Double) {
+struct Float64Codec: CompactCodec {
+    init() {}
+    func preencode(_ state: inout EncoderState, _ value: Double) { state.end += 8 }
+    func encode(_ state: inout EncoderState, _ value: Double) {
         var bits = value.bitPattern.littleEndian
         withUnsafeBytes(of: &bits) { src in
             state.buffer.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
@@ -383,7 +389,7 @@ public struct Float64Codec: CompactCodec {
         }
         state.start += 8
     }
-    public func decode(_ state: inout EncoderState) throws -> Double {
+    func decode(_ state: inout EncoderState) throws -> Double {
         guard state.end - state.start >= 8 else { throw CompactEncodingError.outOfBounds }
         var bits: UInt64 = 0
         for i in 0..<8 { bits |= UInt64(state.buffer[state.start + i]) << (8 * i) }
@@ -395,23 +401,23 @@ public struct Float64Codec: CompactCodec {
 // MARK: - Higher-order
 
 /// `array(Codec)`: uint-length-prefixed homogeneous list.
-public struct ArrayCodec<E: CompactCodec>: CompactCodec {
+struct ArrayCodec<E: CompactCodec>: CompactCodec {
     private let element: E
     private let uvar = UIntVarintCodec()
     /// JS reference enforces a hard cap to defend against pathological inputs.
     /// We mirror the same 0x100000 (≈1M elements) limit.
-    public static var maxLength: Int { 0x100000 }
-    public init(_ element: E) { self.element = element }
-    public func preencode(_ state: inout EncoderState, _ value: [E.Value]) {
+    static var maxLength: Int { 0x100000 }
+    init(_ element: E) { self.element = element }
+    func preencode(_ state: inout EncoderState, _ value: [E.Value]) {
         uvar.preencode(&state, UInt64(value.count))
         for v in value { element.preencode(&state, v) }
     }
-    public func encode(_ state: inout EncoderState, _ value: [E.Value]) {
+    func encode(_ state: inout EncoderState, _ value: [E.Value]) {
         uvar.encode(&state, UInt64(value.count))
         for v in value { element.encode(&state, v) }
     }
-    public func decode(_ state: inout EncoderState) throws -> [E.Value] {
-        let n = Int(try uvar.decode(&state))
+    func decode(_ state: inout EncoderState) throws -> [E.Value] {
+        let n = try checkedLength(uvar.decode(&state))
         if n > Self.maxLength { throw CompactEncodingError.outOfBounds }
         var out: [E.Value] = []
         out.reserveCapacity(n)
@@ -422,11 +428,11 @@ public struct ArrayCodec<E: CompactCodec>: CompactCodec {
 
 /// `frame(Codec)`: uint-prefixed by the SIZE of the encoded inner value.
 /// Useful when the inner is variable-width and the consumer wants to skip ahead.
-public struct FrameCodec<Inner: CompactCodec>: CompactCodec {
+struct FrameCodec<Inner: CompactCodec>: CompactCodec {
     private let inner: Inner
     private let uvar = UIntVarintCodec()
-    public init(_ inner: Inner) { self.inner = inner }
-    public func preencode(_ state: inout EncoderState, _ value: Inner.Value) {
+    init(_ inner: Inner) { self.inner = inner }
+    func preencode(_ state: inout EncoderState, _ value: Inner.Value) {
         // Measure inner size first, then add its uint-length prefix.
         var probe = EncoderState()
         inner.preencode(&probe, value)
@@ -434,15 +440,15 @@ public struct FrameCodec<Inner: CompactCodec>: CompactCodec {
         uvar.preencode(&state, UInt64(innerLen))
         state.end += innerLen
     }
-    public func encode(_ state: inout EncoderState, _ value: Inner.Value) {
+    func encode(_ state: inout EncoderState, _ value: Inner.Value) {
         var probe = EncoderState()
         inner.preencode(&probe, value)
         let innerLen = probe.end
         uvar.encode(&state, UInt64(innerLen))
         inner.encode(&state, value)
     }
-    public func decode(_ state: inout EncoderState) throws -> Inner.Value {
-        let claimedLen = Int(try uvar.decode(&state))
+    func decode(_ state: inout EncoderState) throws -> Inner.Value {
+        let claimedLen = try checkedLength(uvar.decode(&state))
         let originalEnd = state.end
         guard originalEnd - state.start >= claimedLen else { throw CompactEncodingError.outOfBounds }
         state.end = state.start + claimedLen
@@ -455,21 +461,21 @@ public struct FrameCodec<Inner: CompactCodec>: CompactCodec {
 
 // MARK: - Singletons (mirrors JS `c.uint`, `c.utf8`, etc.)
 
-public enum c {
-    public static let uint8           = UInt8Codec()
-    public static let uint16          = UInt16Codec()
-    public static let uint24          = UInt24Codec()
-    public static let uint32          = UInt32Codec()
-    public static let uint64          = UInt64Codec()
-    public static let uint            = UIntVarintCodec()
-    public static let int             = IntVarintCodec()
-    public static let bool            = BoolCodec()
-    public static let utf8            = UTF8Codec()
-    public static let buffer          = BufferCodec()
-    public static let optionalBuffer  = OptionalBufferCodec()
-    public static let float32         = Float32Codec()
-    public static let float64         = Float64Codec()
-    public static func fixed(_ n: Int) -> FixedBytesCodec { FixedBytesCodec(size: n) }
-    public static func array<E: CompactCodec>(_ e: E) -> ArrayCodec<E> { ArrayCodec(e) }
-    public static func frame<I: CompactCodec>(_ i: I) -> FrameCodec<I> { FrameCodec(i) }
+enum c {
+    static let uint8           = UInt8Codec()
+    static let uint16          = UInt16Codec()
+    static let uint24          = UInt24Codec()
+    static let uint32          = UInt32Codec()
+    static let uint64          = UInt64Codec()
+    static let uint            = UIntVarintCodec()
+    static let int             = IntVarintCodec()
+    static let bool            = BoolCodec()
+    static let utf8            = UTF8Codec()
+    static let buffer          = BufferCodec()
+    static let optionalBuffer  = OptionalBufferCodec()
+    static let float32         = Float32Codec()
+    static let float64         = Float64Codec()
+    static func fixed(_ n: Int) -> FixedBytesCodec { FixedBytesCodec(size: n) }
+    static func array<E: CompactCodec>(_ e: E) -> ArrayCodec<E> { ArrayCodec(e) }
+    static func frame<I: CompactCodec>(_ i: I) -> FrameCodec<I> { FrameCodec(i) }
 }

@@ -1,5 +1,11 @@
 # QVAC Swift Client — Audit Findings
 
+> **Historical snapshot (QVAC SDK 0.10.2).** This audit records the May 2026
+> implementation and is retained for traceability only. It is not a statement of
+> the current release status. The submission candidate targets the exact published
+> `@qvac/sdk@0.17.0`; see `README.md`, `docs/distribution.md`, and the current CI
+> workflows for authoritative build and verification instructions.
+
 Comprehensive findings from the 2026-05-12 code + security review against the
 Tether QVAC SDK Swift Client grant (3'000 USDt, M1+M2+M3).
 

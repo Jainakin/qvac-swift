@@ -33,6 +33,10 @@ final class BenchmarkTests: XCTestCase {
         Int(ProcessInfo.processInfo.environment["QVAC_BENCH_ITERS"] ?? "") ?? 200
     }()
 
+    private static let warmupIterations: Int = {
+        Int(ProcessInfo.processInfo.environment["QVAC_BENCH_WARMUP"] ?? "") ?? 50
+    }()
+
     private static let resultPath: String = {
         ProcessInfo.processInfo.environment["QVAC_BENCH_RESULT"]
             ?? FileManager.default.currentDirectoryPath + "/bench/swift-result.json"
@@ -41,8 +45,21 @@ final class BenchmarkTests: XCTestCase {
     override func setUpWithError() throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["QVAC_RUN_BENCH"] == "1",
                           "set QVAC_RUN_BENCH=1 to run the heartbeat benchmark")
-        try XCTSkipUnless(Self.bareBin != nil,        "set QVAC_BARE_BIN")
-        try XCTSkipUnless(Self.nodeModulesDir != nil, "set QVAC_NODE_MODULES")
+        guard let bare = Self.bareBin, FileManager.default.isExecutableFile(atPath: bare.path) else {
+            throw IntegrationPrerequisiteError("QVAC_RUN_BENCH=1 but QVAC_BARE_BIN is missing or not executable")
+        }
+        guard let modules = Self.nodeModulesDir else {
+            throw IntegrationPrerequisiteError("QVAC_RUN_BENCH=1 but QVAC_NODE_MODULES is missing")
+        }
+        let packageJSON = modules.appendingPathComponent("@qvac/sdk/package.json")
+        guard let data = try? Data(contentsOf: packageJSON),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["version"] as? String == "0.17.0" else {
+            throw IntegrationPrerequisiteError("benchmark requires exact @qvac/sdk 0.17.0 from tools/runtime/package-lock.json")
+        }
+        guard Self.iterations >= 100, Self.warmupIterations > 0 else {
+            throw IntegrationPrerequisiteError("benchmark requires >=100 samples and at least one warmup")
+        }
     }
 
     func test_heartbeat_latency_swift_baseline() async throws {
@@ -52,36 +69,64 @@ final class BenchmarkTests: XCTestCase {
             workerScript: Self.nodeModulesDir!
                 .appendingPathComponent("@qvac/sdk/dist/server/worker.js"),
             workingDirectory: Self.nodeModulesDir!.deletingLastPathComponent(),
-            initTimeout: 30.0
+            initTimeout: 30.0,
+            homeDir: ProcessInfo.processInfo.environment["QVAC_BENCH_HOME"]
         )
-        let transport = try await UnixDomainSocketTransport.connect(cfg)
-        let rpc = BareRPCClient(transport: transport)
-        try await QVACHandshake.sendInitConfig(on: rpc)
+        let client = try await QVACClient(
+            configuration: .macOSSubprocess(cfg),
+            initHandshakeTimeout: .seconds(30),
+            logger: nil
+        )
+        let clock = ContinuousClock()
+        var samples: [Double] = []
+        do {
+            for _ in 0..<Self.warmupIterations {
+                _ = try await client.heartbeat()
+            }
 
-        let hbBody = try JSONEncoder().encode(QVACRequest.heartbeat(HeartbeatRequest()))
-        var cmd: UInt64 = 2
-
-        // Warmup.
-        _ = try await rpc.send(command: cmd, data: hbBody); cmd += 1
-
-        var samples: [TimeInterval] = []
-        samples.reserveCapacity(iters)
-        for _ in 0..<iters {
-            let start = Date()
-            _ = try await rpc.send(command: cmd, data: hbBody); cmd += 1
-            samples.append(Date().timeIntervalSince(start) * 1000.0)
+            samples.reserveCapacity(iters)
+            for _ in 0..<iters {
+                let start = clock.now
+                _ = try await client.heartbeat()
+                let duration = start.duration(to: clock.now).components
+                samples.append(
+                    Double(duration.seconds) * 1_000.0
+                        + Double(duration.attoseconds) / 1_000_000_000_000_000.0
+                )
+            }
+            await client.close()
+        } catch {
+            await client.close()
+            throw error
         }
-        await rpc.close()
+        guard samples.count == iters, samples.allSatisfy({ $0.isFinite && $0 > 0 }) else {
+            throw IntegrationPrerequisiteError("Swift public heartbeat benchmark produced invalid samples")
+        }
 
         let sorted = samples.sorted()
         let result: [String: Any] = [
             "client": "swift",
             "iterations": iters,
+            "warmup_iterations": Self.warmupIterations,
             "min_ms":  sorted.first ?? 0,
             "mean_ms": samples.reduce(0, +) / Double(samples.count),
             "p50_ms":  sorted[sorted.count / 2],
             "p99_ms":  sorted[Int(Double(sorted.count) * 0.99)],
             "max_ms":  sorted.last ?? 0,
+            "samples_ms": samples,
+            "api_surface": "QVACClient.heartbeat()",
+            "timeout_policy": "outer-owned-process-watchdog-no-per-call-timeout",
+            "toolchain": [
+                "node": ProcessInfo.processInfo.environment["QVAC_BENCH_NODE_VERSION"] ?? "unknown",
+                "bare": ProcessInfo.processInfo.environment["QVAC_BENCH_BARE_VERSION"] ?? "unknown",
+                "swift": ProcessInfo.processInfo.environment["QVAC_BENCH_SWIFT_VERSION"] ?? "unknown",
+                "host": ProcessInfo.processInfo.environment["QVAC_BENCH_HOST"] ?? "unknown",
+                "watchdog_seconds": Int(
+                    ProcessInfo.processInfo.environment["QVAC_BENCH_PROCESS_TIMEOUT_SECONDS"] ?? ""
+                ) ?? -1,
+                "sdk": "0.17.0",
+                "configuration": "release",
+            ],
         ]
         let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: URL(fileURLWithPath: Self.resultPath))

@@ -4,13 +4,21 @@
   "private": true,
   "type": "module",
   "description": "Generates Sources/QVACClient/Generated/*.swift from the QVAC SDK schemas.",
+  "engines": {
+    "node": "22.22.0"
+  },
   "scripts": {
-    "all": "node generate-errors.mjs && node generate-types.mjs && node generate-api.mjs",
+    "all": "./run.sh",
+    "bootstrap": "./bootstrap.sh",
+    "verify": "node verify-provenance.mjs && node verify-contract-parity.mjs && node verify-generated-output.mjs",
+    "test": "node verify-generated-output.mjs && bash test-bootstrap-safety.sh",
     "errors": "node generate-errors.mjs",
-    "types":  "node generate-types.mjs",
-    "api":    "node generate-api.mjs"
+    "types": "node generate-types.mjs",
+    "api": "node generate-api.mjs"
   },
   "dependencies": {
-    "zod": "^4.3.0"
+    "@qvac/sdk": "0.17.0",
+    "prettier": "3.9.4",
+    "zod": "4.4.3"
   }
 }

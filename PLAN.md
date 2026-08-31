@@ -1,5 +1,11 @@
 # QVAC SDK — Swift Client: Implementation Plan
 
+> **Historical grant plan (original 0.10.x target).** Retained to preserve grant
+> traceability. The implementation has since been rebased directly onto the exact
+> published `@qvac/sdk@0.17.0`, with no migration or compatibility layer. Current
+> release and validation procedures live in `README.md`, `docs/distribution.md`,
+> and `.github/workflows/`.
+
 **Grant:** [Tether bounty 2885283454](https://tether.dev/grants/bounties/2885283454/) — "QVAC SDK — Swift Client"
 **Reward:** 3,000 USD₮ across 3 milestones (M1: 800 / M2: 1,000 / M3: 1,200)
 **Submission deadline:** 2026-06-24

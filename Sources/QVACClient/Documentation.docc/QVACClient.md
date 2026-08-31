@@ -1,89 +1,77 @@
-#  ``QVACClient``
+# ``QVACClient``
 
-A native Swift client for the [QVAC SDK](https://docs.qvac.tether.io/) —
-Tether's local-first on-device AI runtime.
+A native Swift concurrency client for the exact QVAC SDK 0.17.0 wire contract.
 
 ## Overview
 
-`QVACClient` is an actor that owns a connection to a Bare worker process and exposes
-QVAC's full inference + RAG + plugin API as idiomatic Swift `async`/`await` methods,
-with streaming responses delivered via `AsyncSequence`.
+`QVACClient` is an actor that owns one worker connection, performs the required
+`__init_config` handshake, multiplexes concurrent RPCs, and closes the underlying
+worker deterministically. macOS uses a spawned Bare process over a private
+Unix-domain socket; iOS runs the verified mobile worker in a BareKit worklet.
 
-It supports two transport models, picked by ``Configuration``:
+The generated contract contains 39 methods across request/reply, server-stream,
+and duplex call shapes. Every generated request and response validates its literal
+discriminator, and unknown response types are rejected instead of being hidden.
 
-- **macOS / Linux**: Spawn `bare worker.js` as a subprocess; communicate over Unix
-  Domain Socket.
-- **iOS**: Run the worker in-process as a libuv thread via Holepunch's BareKit, with
-  IPC over a socketpair the host app never has to manage.
+Rich operation APIs provide:
 
-The wire format is bare-rpc binary framing with NDJSON inside — the same protocol the
-QVAC JavaScript client uses, validated byte-for-byte against the JS reference.
+- request IDs and targeted cancellation;
+- typed progress, event, token, and terminal-result views;
+- `Data` to base64 conversion for audio, image, video, and VLA inputs;
+- bounded fan-out streams and byte-bounded raw transport queues;
+- per-request deadlines and profiling metadata capture; and
+- typed `QVACError` values for worker, transport, timeout, encoding, and protocol
+  failures.
+
+Exact generated `wire…` methods remain available for applications that need all
+optional 0.17 contract fields directly.
+
+## Operation groups
+
+| Group | Swift surfaces |
+|---|---|
+| Lifecycle | `heartbeat`, `close`, `cancel`, `suspend`, `resume`, `state` |
+| Models and cache | `loadModel`, `loadModelStreaming`, `unloadModel`, `downloadAsset`, `deleteCache`, model information and registry APIs |
+| Language | `completion`, `batchCompletion`, `completionOrchestrate`, `embed`, `translate` |
+| Audio | `transcribe`, `transcribeStream`, `bciTranscribe`, `bciTranscribeStream`, `textToSpeech`, `textToSpeechStream`, `audioGen` |
+| Vision and media | `ocr`, `classify`, `diffusion`, `video`, `upscale`, VLA preprocessing and inference |
+| Data and extensions | RAG operations, plugins, finetuning, logging, and provider lifecycle |
+
+## Contract identity
+
+`QVACSDKContract` publishes the generated SDK version, upstream commit, exact
+method inventory, call shapes, and conditional-progress metadata. The same pinned
+contract produces the concrete Swift types, the 136 error codes, and exhaustive
+round-trip tests.
+
+The committed worker is independently reproduced from a lockfile-pinned runtime
+graph and verified to embed SDK 0.17.0. Source generation never evaluates a
+floating npm SDK package.
+
+## Resource limits
+
+The default maximum wire message is 256 MiB to support 0.17 media operations that
+return one complete base64 output per JSON record. Configure
+`maximumWireMessageBytes` and `maximumBufferedStreamBytes` on initialization for
+the application's model set and memory budget.
+
+Per-operation public event streams retain at most 64 elements. Falling behind
+fails that view explicitly with `QVACStreamBufferOverflow`; it never silently drops
+events or grows without bound.
 
 ## Topics
 
-### Getting started
+### Guides
 
-- ``QVACClient/init(configuration:runtimeContext:config:)``
-- ``QVACClient/Configuration``
-- ``QVACClient/heartbeat()``
-- ``QVACClient/close()``
+- <doc:GettingStarted>
+- <doc:Architecture>
+- <doc:Security>
 
-### Loading models
-
-- ``QVACClient/loadModel(modelSrc:modelType:modelConfig:modelName:)``
-- ``QVACClient/loadModelStreaming(modelSrc:modelType:modelConfig:modelName:)``
-- ``QVACClient/unloadModel(modelId:clearStorage:)``
-- ``QVACClient/downloadAsset(assetSrc:seed:)``
-- ``QVACClient/downloadAssetStreaming(assetSrc:seed:)``
-
-### Inference
-
-- ``QVACClient/completion(modelId:history:generationParams:captureThinking:)``
-- ``QVACClient/embed(modelId:text:)-9z2nb``
-- ``QVACClient/translate(modelId:modelType:text:from:to:context:)``
-
-### Audio
-
-- ``QVACClient/transcribe(modelId:audioPath:prompt:)-7gv3n``
-- ``QVACClient/transcribeStream(modelId:prompt:metadata:)``
-- ``QVACClient/textToSpeech(modelId:text:sentenceStream:sentenceStreamLocale:sentenceStreamMaxChunkScalars:inputType:)``
-- ``QVACClient/textToSpeechStream(modelId:accumulateSentences:sentenceDelimiterPreset:maxBufferScalars:flushAfterMs:inputType:)``
-
-### Vision
-
-- ``QVACClient/ocr(modelId:imagePath:options:)-9d2nb``
-- ``QVACClient/diffusion(modelId:prompt:negativePrompt:width:height:steps:cfgScale:guidance:samplingMethod:scheduler:seed:batchCount:initImage:strength:)``
-
-### Retrieval-Augmented Generation (RAG)
-
-- ``QVACClient/ragIngest(modelId:documents:workspace:chunkOpts:)``
-- ``QVACClient/ragSearch(modelId:query:topK:workspace:)``
-- ``QVACClient/ragChunk(documents:chunkOpts:)``
-- ``QVACClient/ragSaveEmbeddings(documents:modelId:workspace:)``
-- ``QVACClient/ragDeleteEmbeddings(ids:workspace:)``
-- ``QVACClient/ragListWorkspaces()``
-- ``QVACClient/ragCloseWorkspace(workspace:deleteOnClose:)``
-- ``QVACClient/ragDeleteWorkspace(workspace:)``
-- ``QVACClient/ragReindex(workspace:n:)``
-
-### Plugin invocation
-
-- ``QVACClient/invokePlugin(modelId:handler:params:as:)``
-- ``QVACClient/invokePluginStream(modelId:handler:params:as:)``
-
-### Cancellation
-
-- ``QVACClient/cancel(_:)``
-- ``QVACClient/CancelOperation``
-
-### Errors
+### Core public types
 
 - ``QVACError``
 - ``QVACErrorCode``
 - ``QVACErrorCategory``
-
-### Operational notes
-
-- <doc:Security>
-- <doc:Architecture>
-- <doc:GettingStarted>
+- ``QVACRPCOptions``
+- ``QVACResponseStream``
+- ``QVACSDKContract``

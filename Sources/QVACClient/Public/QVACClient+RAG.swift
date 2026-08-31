@@ -14,34 +14,105 @@ public extension QVACClient {
 
     // MARK: - Domain types
 
-    /// A document to ingest. Either plain text or a `{text, metadata}` pair.
-    struct RagDocument: Sendable, Equatable {
-        public let text: String
-        public let metadata: JSONValue?
-        public init(_ text: String, metadata: JSONValue? = nil) {
-            self.text = text; self.metadata = metadata
+    /// Chunking controls accepted by QVAC SDK 0.17.
+    struct RagChunkOptions: Sendable, Equatable {
+        public enum ChunkStrategy: String, Sendable {
+            case character
+            case paragraph
         }
-        var asJSON: JSONValue {
-            if let m = metadata {
-                return .object(["text": .string(text), "metadata": m])
-            }
-            return .string(text)
+
+        public enum SplitStrategy: String, Sendable {
+            case character
+            case word
+            case token
+            case sentence
+            case line
+        }
+
+        public let chunkSize: Double?
+        public let chunkOverlap: Double?
+        public let chunkStrategy: ChunkStrategy?
+        public let splitStrategy: SplitStrategy?
+
+        public init(
+            chunkSize: Double? = nil,
+            chunkOverlap: Double? = nil,
+            chunkStrategy: ChunkStrategy? = nil,
+            splitStrategy: SplitStrategy? = nil
+        ) {
+            self.chunkSize = chunkSize
+            self.chunkOverlap = chunkOverlap
+            self.chunkStrategy = chunkStrategy
+            self.splitStrategy = splitStrategy
+        }
+
+        fileprivate var wireValue: JSONValue {
+            var object: [String: JSONValue] = [:]
+            if let chunkSize { object["chunkSize"] = .number(chunkSize) }
+            if let chunkOverlap { object["chunkOverlap"] = .number(chunkOverlap) }
+            if let chunkStrategy { object["chunkStrategy"] = .string(chunkStrategy.rawValue) }
+            if let splitStrategy { object["splitStrategy"] = .string(splitStrategy.rawValue) }
+            return .object(object)
         }
     }
 
-    /// A document chunk produced by `ragChunk` or `ragIngest` (intermediate output).
+    /// A document chunk produced by ``ragChunk(documents:chunkOpts:rpcOptions:)``.
     struct RagChunk: Sendable, Equatable {
         public let id: String
-        public let text: String
-        public let metadata: JSONValue?
+        public let content: String
     }
 
     /// One search result.
     struct RagSearchResult: Sendable, Equatable {
         public let id: String
-        public let text: String
+        public let content: String
         public let score: Double
-        public let metadata: JSONValue?
+    }
+
+    /// A pre-embedded document accepted by `ragSaveEmbeddings`.
+    struct RagEmbeddedDocument: Sendable, Equatable {
+        public let id: String
+        public let content: String
+        public let embedding: [Double]
+        public let embeddingModelId: String
+        public let metadata: [String: JSONValue]?
+
+        public init(
+            id: String,
+            content: String,
+            embedding: [Double],
+            embeddingModelId: String,
+            metadata: [String: JSONValue]? = nil
+        ) {
+            self.id = id
+            self.content = content
+            self.embedding = embedding
+            self.embeddingModelId = embeddingModelId
+            self.metadata = metadata
+        }
+
+        fileprivate var wireValue: JSONValue {
+            var object: [String: JSONValue] = [
+                "id": .string(id),
+                "content": .string(content),
+                "embedding": .array(embedding.map(JSONValue.number)),
+                "embeddingModelId": .string(embeddingModelId),
+            ]
+            if let metadata { object["metadata"] = .object(metadata) }
+            return .object(object)
+        }
+    }
+
+    /// Per-document storage outcome returned by ingest/save operations.
+    struct RagSaveResult: Sendable, Equatable {
+        public enum Status: String, Sendable {
+            case fulfilled
+            case rejected
+        }
+
+        public let status: Status
+        public let id: String?
+        public let error: String?
     }
 
     /// One workspace entry from `ragListWorkspaces`.
@@ -52,8 +123,32 @@ public extension QVACClient {
 
     /// Outcome of `ragIngest` / `ragSaveEmbeddings`.
     struct RagIngestResult: Sendable, Equatable {
-        public let processed: [JSONValue]
+        public let processed: [RagSaveResult]
         public let droppedIndices: [Int]
+    }
+
+    /// Outcome of a workspace reindex operation.
+    struct RagReindexResult: Sendable, Equatable {
+        public let reindexed: Bool
+        public let details: [String: JSONValue]?
+    }
+
+    /// A cancellable RAG ingest/save/reindex operation matching the published 0.17
+    /// decorated-promise contract.
+    final class RagOperationRun<Output: Sendable>: @unchecked Sendable {
+        public let requestId: String
+        public let progress: AsyncThrowingStream<RagProgressResponse, Error>
+        public let result: Task<Output, Error>
+
+        init(
+            requestId: String,
+            progress: AsyncThrowingStream<RagProgressResponse, Error>,
+            result: Task<Output, Error>
+        ) {
+            self.requestId = requestId
+            self.progress = progress
+            self.result = result
+        }
     }
 
     // MARK: - 1) ragIngest — chunk + embed + save (full pipeline)
@@ -62,19 +157,33 @@ public extension QVACClient {
     @discardableResult
     func ragIngest(
         modelId: String,
-        documents: [RagDocument],
+        documents: [String],
         workspace: String? = nil,
-        chunkOpts: JSONValue? = nil
-    ) async throws -> RagIngestResult {
+        chunk: Bool = true,
+        chunkOpts: RagChunkOptions? = nil,
+        withProgress: Bool = false,
+        progressInterval: Double? = nil,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws -> RagOperationRun<RagIngestResult> {
         var req = RagRequest(operation: "ingest")
         req.modelId = modelId
-        req.documents = documents.map(\.asJSON)
+        req.documents = documents.map(JSONValue.string)
         req.workspace = workspace
-        req.chunkOpts = chunkOpts
-        return try await runRagAndExtract(req, op: "ingest") { r in
-            RagIngestResult(
-                processed: r.processed ?? [],
-                droppedIndices: (r.droppedIndices ?? []).map { Int($0) }
+        req.chunk = chunk
+        req.chunkOpts = chunkOpts?.wireValue
+        req.withProgress = withProgress ? true : nil
+        req.progressInterval = progressInterval
+        return try await makeRagRun(req, op: "ingest", rpcOptions: rpcOptions) { r in
+            guard let processed = r.processed, let droppedIndices = r.droppedIndices else {
+                throw QVACError.protocolViolation(
+                    "rag ingest response omitted processed or droppedIndices"
+                )
+            }
+            return RagIngestResult(
+                processed: try processed.map(Self.parseRagSaveResult),
+                droppedIndices: try droppedIndices.map {
+                    try Self.checkedWireInteger($0, field: "rag.ingest.droppedIndices")
+                }
             )
         }
     }
@@ -88,27 +197,49 @@ public extension QVACClient {
         modelId: String,
         query: String,
         topK: Int = 5,
-        workspace: String? = nil
+        n: Int = 3,
+        workspace: String? = nil,
+        rpcOptions: QVACRPCOptions = .init()
     ) async throws -> [RagSearchResult] {
+        guard !query.isEmpty else {
+            throw QVACError.invalidArgument("rag search query must not be empty")
+        }
+        guard topK > 0 else {
+            throw QVACError.invalidArgument("rag search topK must be greater than zero")
+        }
+        guard n > 0 else {
+            throw QVACError.invalidArgument("rag search n must be greater than zero")
+        }
         var req = RagRequest(operation: "search")
         req.modelId = modelId
         req.query = query
         req.topK = Double(topK)
+        req.n = Double(n)
         req.workspace = workspace
-        return try await runRagAndExtract(req, op: "search") { r in
-            (r.results ?? []).compactMap { Self.parseRagSearchResult($0) }
+        return try await runRagAndExtract(req, op: "search", rpcOptions: rpcOptions) { r in
+            guard let results = r.results else {
+                throw QVACError.protocolViolation("rag search response omitted results")
+            }
+            return try results.map(Self.parseRagSearchResult)
         }
     }
 
     // MARK: - 3) ragChunk — standalone chunking (no embed, no save)
 
     /// Run the chunker over `documents` and return the chunks.
-    func ragChunk(documents: [RagDocument], chunkOpts: JSONValue? = nil) async throws -> [RagChunk] {
+    func ragChunk(
+        documents: [String],
+        chunkOpts: RagChunkOptions? = nil,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws -> [RagChunk] {
         var req = RagRequest(operation: "chunk")
-        req.documents = documents.map(\.asJSON)
-        req.chunkOpts = chunkOpts
-        return try await runRagAndExtract(req, op: "chunk") { r in
-            (r.chunks ?? []).compactMap { Self.parseRagChunk($0) }
+        req.documents = documents.map(JSONValue.string)
+        req.chunkOpts = chunkOpts?.wireValue
+        return try await runRagAndExtract(req, op: "chunk", rpcOptions: rpcOptions) { r in
+            guard let chunks = r.chunks else {
+                throw QVACError.protocolViolation("rag chunk response omitted chunks")
+            }
+            return try chunks.map(Self.parseRagChunk)
         }
     }
 
@@ -118,113 +249,297 @@ public extension QVACClient {
     /// and want to persist the vectors).
     @discardableResult
     func ragSaveEmbeddings(
-        documents: [JSONValue],
+        documents: [RagEmbeddedDocument],
         modelId: String? = nil,
-        workspace: String? = nil
-    ) async throws -> RagIngestResult {
+        workspace: String? = nil,
+        withProgress: Bool = false,
+        progressInterval: Double? = nil,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws -> RagOperationRun<[RagSaveResult]> {
         var req = RagRequest(operation: "saveEmbeddings")
-        req.documents = documents
+        req.documents = documents.map(\.wireValue)
         req.modelId = modelId
         req.workspace = workspace
-        return try await runRagAndExtract(req, op: "saveEmbeddings") { r in
-            RagIngestResult(
-                processed: r.processed ?? [],
-                droppedIndices: (r.droppedIndices ?? []).map { Int($0) }
-            )
+        req.withProgress = withProgress ? true : nil
+        req.progressInterval = progressInterval
+        return try await makeRagRun(
+            req,
+            op: "saveEmbeddings",
+            rpcOptions: rpcOptions
+        ) { r in
+            guard let processed = r.processed else {
+                throw QVACError.protocolViolation("rag saveEmbeddings response omitted processed")
+            }
+            return try processed.map(Self.parseRagSaveResult)
         }
     }
 
     // MARK: - 5) ragDeleteEmbeddings — delete by ids
 
     /// Delete embeddings by document id from `workspace`.
-    /// Throws `QVACError.server(.ragWorkspaceNotFound, …)` if the workspace doesn't exist.
-    func ragDeleteEmbeddings(ids: [String], workspace: String? = nil) async throws {
+    /// Matches the 0.17 JavaScript client by throwing
+    /// `QVACError.server(.ragDeleteFailed, …)` when deletion fails, including when
+    /// the workspace has not been initialized.
+    func ragDeleteEmbeddings(
+        ids: [String],
+        workspace: String? = nil,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws {
+        guard !ids.isEmpty else {
+            throw QVACError.invalidArgument("rag deleteEmbeddings ids must not be empty")
+        }
         var req = RagRequest(operation: "deleteEmbeddings")
         req.ids = ids
         req.workspace = workspace
-        _ = try await runRagAndExtract(req, op: "deleteEmbeddings") { _ in () }
+        _ = try await runRagAndExtract(req, op: "deleteEmbeddings", rpcOptions: rpcOptions) { _ in () }
     }
 
     // MARK: - 6) ragListWorkspaces
 
     /// List all workspaces (open + closed).
-    func ragListWorkspaces() async throws -> [RagWorkspaceInfo] {
+    func ragListWorkspaces(rpcOptions: QVACRPCOptions = .init()) async throws -> [RagWorkspaceInfo] {
         let req = RagRequest(operation: "listWorkspaces")
-        return try await runRagAndExtract(req, op: "listWorkspaces") { r in
-            (r.workspaces ?? []).compactMap { Self.parseWorkspaceInfo($0) }
+        return try await runRagAndExtract(req, op: "listWorkspaces", rpcOptions: rpcOptions) { r in
+            guard let workspaces = r.workspaces else {
+                throw QVACError.protocolViolation("rag listWorkspaces response omitted workspaces")
+            }
+            return try workspaces.map(Self.parseWorkspaceInfo)
         }
     }
 
     // MARK: - 7) ragCloseWorkspace
 
     /// Close a workspace, optionally deleting it on the way out.
-    func ragCloseWorkspace(workspace: String? = nil, deleteOnClose: Bool = false) async throws {
+    func ragCloseWorkspace(
+        workspace: String? = nil,
+        deleteOnClose: Bool = false,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws {
         var req = RagRequest(operation: "closeWorkspace")
         req.workspace = workspace
         req.deleteOnClose = deleteOnClose
-        _ = try await runRagAndExtract(req, op: "closeWorkspace") { _ in () }
+        _ = try await runRagAndExtract(req, op: "closeWorkspace", rpcOptions: rpcOptions) { _ in () }
     }
 
     // MARK: - 8) ragDeleteWorkspace
 
     /// Delete a workspace. Throws if the workspace is currently loaded — close it first.
-    func ragDeleteWorkspace(workspace: String) async throws {
+    func ragDeleteWorkspace(
+        workspace: String,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws {
+        guard !workspace.isEmpty else {
+            throw QVACError.invalidArgument("rag deleteWorkspace workspace must not be empty")
+        }
         var req = RagRequest(operation: "deleteWorkspace")
         req.workspace = workspace
-        _ = try await runRagAndExtract(req, op: "deleteWorkspace") { _ in () }
+        _ = try await runRagAndExtract(req, op: "deleteWorkspace", rpcOptions: rpcOptions) { _ in () }
     }
 
     // MARK: - 9) ragReindex — k-means cluster optimization
 
-    /// Reindex `workspace` to optimize search. `n` is the target cluster count;
-    /// `nil` lets the worker pick.
-    func ragReindex(workspace: String? = nil, n: Int? = nil) async throws -> JSONValue? {
+    /// Reindex `workspace` to optimize search.
+    func ragReindex(
+        workspace: String? = nil,
+        withProgress: Bool = false,
+        progressInterval: Double? = nil,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws -> RagOperationRun<RagReindexResult> {
         var req = RagRequest(operation: "reindex")
         req.workspace = workspace
-        req.n = n.map { Double($0) }
-        return try await runRagAndExtract(req, op: "reindex") { $0.result }
+        req.withProgress = withProgress ? true : nil
+        req.progressInterval = progressInterval
+        return try await makeRagRun(req, op: "reindex", rpcOptions: rpcOptions) { response in
+            guard let result = response.result else {
+                throw QVACError.protocolViolation("rag reindex response omitted result")
+            }
+            return try Self.parseRagReindexResult(result)
+        }
     }
 
     // MARK: - Internal
 
-    private func runRagAndExtract<T>(_ req: RagRequest, op: String, extractor: (RagResponse) -> T) async throws -> T {
-        let response: QVACResponse = try await sendTyped(.rag(req))
+    private func makeRagRun<Output: Sendable>(
+        _ input: RagRequest,
+        op: String,
+        rpcOptions: QVACRPCOptions,
+        extractor: @escaping @Sendable (RagResponse) throws -> Output
+    ) async throws -> RagOperationRun<Output> {
+        var request = input
+        let requestId = UUID().uuidString
+        request.requestId = requestId
+        let (progress, progressSink) = Self.makeStream(
+            of: RagProgressResponse.self,
+            name: "rag:\(op):progress"
+        )
+
+        if request.withProgress == true {
+            let source: QVACResponseStream<QVACResponse> = try await streamTyped(
+                .rag(request),
+                rpcOptions: rpcOptions
+            )
+            let result = Task<Output, Error> {
+                do {
+                    for try await response in source {
+                        switch response {
+                        case .ragProgress(let event):
+                            guard event.operation == op else {
+                                throw QVACError.protocolViolation(
+                                    "rag \(op) received progress for \(event.operation)"
+                                )
+                            }
+                            // Progress is an optional bounded view. If it overflows,
+                            // the sink terminates that view explicitly while this task
+                            // continues draining toward the authoritative result.
+                            progressSink.yield(event)
+                        case .rag(let terminal):
+                            let validated = try Self.validateRagResponse(terminal, op: op)
+                            progressSink.finish()
+                            return try extractor(validated)
+                        case .error(let error):
+                            throw QVACError.fromWire(
+                                code: try Self.checkedWireErrorCode(error.code),
+                                message: error.message
+                            )
+                        default:
+                            try Self.rejectUnexpectedResponse(
+                                response,
+                                expected: "rag or rag:progress"
+                            )
+                        }
+                    }
+                    throw QVACError.client(
+                        .streamEndedWithoutResponse,
+                        message: "rag \(op) stream ended without a terminal response"
+                    )
+                } catch {
+                    progressSink.finish(throwing: error)
+                    throw error
+                }
+            }
+            return RagOperationRun(
+                requestId: requestId,
+                progress: progress,
+                result: result
+            )
+        }
+
+        progressSink.finish()
+        let result = Task<Output, Error> {
+            let response: QVACResponse = try await self.sendTyped(
+                .rag(request),
+                rpcOptions: rpcOptions
+            )
+            guard case .rag(let terminal) = response else {
+                throw QVACError.protocolViolation(
+                    "expected rag response, got \(response.discriminator)"
+                )
+            }
+            return try extractor(Self.validateRagResponse(terminal, op: op))
+        }
+        return RagOperationRun(requestId: requestId, progress: progress, result: result)
+    }
+
+    private func runRagAndExtract<T>(
+        _ req: RagRequest,
+        op: String,
+        rpcOptions: QVACRPCOptions,
+        extractor: (RagResponse) throws -> T
+    ) async throws -> T {
+        let response: QVACResponse = try await sendTyped(.rag(req), rpcOptions: rpcOptions)
         guard case .rag(let r) = response else {
             throw QVACError.protocolViolation("expected rag response, got \(response.discriminator)")
         }
-        guard r.operation == op else {
-            throw QVACError.protocolViolation("rag response operation \(r.operation) ≠ \(op)")
+        return try extractor(try Self.validateRagResponse(r, op: op))
+    }
+
+    private static func validateRagResponse(
+        _ response: RagResponse,
+        op: String
+    ) throws -> RagResponse {
+        guard response.operation == op else {
+            throw QVACError.protocolViolation(
+                "rag response operation \(response.operation) ≠ \(op)"
+            )
         }
-        if r.success != true {
-            throw QVACError.server(.ragHyperdbFailed, message: r.error)
+        guard response.success == true else {
+            let code: QVACErrorCode
+            switch op {
+            case "chunk": code = .ragChunkFailed
+            case "ingest", "saveEmbeddings": code = .ragSaveFailed
+            case "search": code = .ragSearchFailed
+            case "deleteEmbeddings", "deleteWorkspace": code = .ragDeleteFailed
+            case "closeWorkspace": code = .ragWorkspaceCloseFailed
+            case "listWorkspaces": code = .ragListWorkspacesFailed
+            default: code = .ragHyperdbFailed
+            }
+            throw QVACError.server(code, message: response.error)
         }
-        return extractor(r)
+        return response
     }
 
     // MARK: - JSON parsing helpers
 
-    private static func parseRagChunk(_ value: JSONValue) -> RagChunk? {
+    private static func parseRagChunk(_ value: JSONValue) throws -> RagChunk {
         guard case .object(let obj) = value,
               case .string(let id) = obj["id"] ?? .null,
-              case .string(let text) = obj["text"] ?? .null
-        else { return nil }
-        return RagChunk(id: id, text: text, metadata: obj["metadata"])
+              case .string(let content) = obj["content"] ?? .null
+        else {
+            throw QVACError.protocolViolation("rag chunk must contain string id and content")
+        }
+        return RagChunk(id: id, content: content)
     }
 
-    private static func parseRagSearchResult(_ value: JSONValue) -> RagSearchResult? {
+    private static func parseRagSearchResult(_ value: JSONValue) throws -> RagSearchResult {
         guard case .object(let obj) = value,
               case .string(let id) = obj["id"] ?? .null,
-              case .string(let text) = obj["text"] ?? .null,
+              case .string(let content) = obj["content"] ?? .null,
               case .number(let score) = obj["score"] ?? .null
-        else { return nil }
-        return RagSearchResult(id: id, text: text, score: score, metadata: obj["metadata"])
+        else {
+            throw QVACError.protocolViolation(
+                "rag search result must contain string id/content and numeric score"
+            )
+        }
+        guard score.isFinite else {
+            throw QVACError.protocolViolation("rag search score must be finite")
+        }
+        return RagSearchResult(id: id, content: content, score: score)
     }
 
-    private static func parseWorkspaceInfo(_ value: JSONValue) -> RagWorkspaceInfo? {
+    private static func parseRagSaveResult(_ value: JSONValue) throws -> RagSaveResult {
+        guard case .object(let object) = value,
+              case .string(let rawStatus) = object["status"] ?? .null,
+              let status = RagSaveResult.Status(rawValue: rawStatus)
+        else {
+            throw QVACError.protocolViolation(
+                "rag save result must contain fulfilled or rejected status"
+            )
+        }
+        let id: String?
+        if case .string(let value) = object["id"] { id = value } else { id = nil }
+        let error: String?
+        if case .string(let value) = object["error"] { error = value } else { error = nil }
+        return RagSaveResult(status: status, id: id, error: error)
+    }
+
+    private static func parseRagReindexResult(_ value: JSONValue) throws -> RagReindexResult {
+        guard case .object(let object) = value,
+              case .bool(let reindexed) = object["reindexed"] ?? .null
+        else {
+            throw QVACError.protocolViolation("rag reindex result must contain reindexed")
+        }
+        let details: [String: JSONValue]?
+        if case .object(let value) = object["details"] { details = value } else { details = nil }
+        return RagReindexResult(reindexed: reindexed, details: details)
+    }
+
+    private static func parseWorkspaceInfo(_ value: JSONValue) throws -> RagWorkspaceInfo {
         guard case .object(let obj) = value,
               case .string(let name) = obj["name"] ?? .null,
               case .bool(let open) = obj["open"] ?? .null
-        else { return nil }
+        else {
+            throw QVACError.protocolViolation("rag workspace must contain string name and bool open")
+        }
         return RagWorkspaceInfo(name: name, open: open)
     }
 }

@@ -17,6 +17,10 @@ public extension QVACClient {
         case text(String)
         /// Whole transcribed segment with timing (when `metadata: true` requested).
         case segment(TranscribeSegment)
+        /// Voice-activity update emitted when `emitVadEvents` is enabled.
+        case vad(JSONValue)
+        /// Conversation boundary emitted by Whisper or Parakeet streaming modes.
+        case endOfTurn(JSONValue)
         /// Stream finished.
         case done
     }
@@ -26,57 +30,86 @@ public extension QVACClient {
     func transcribeStream(
         modelId: String,
         prompt: String? = nil,
-        metadata: Bool = false
+        metadata: Bool = false,
+        emitVadEvents: Bool = false,
+        endOfTurnSilenceMs: Int? = nil,
+        vadRunIntervalMs: Int? = nil,
+        parakeetStreamingConfig: JSONValue? = nil,
+        rpcOptions: QVACRPCOptions = .init()
     ) async throws -> TranscribeStreamSession {
-        let req = TranscribeStreamRequest(modelId: modelId, metadata: metadata, prompt: prompt)
-        let raw: QVACDuplexSession<TranscribeStreamResponse> = try await duplexTyped(.transcribeStream(req))
-        return TranscribeStreamSession(raw: raw)
+        if let endOfTurnSilenceMs, endOfTurnSilenceMs < 0 {
+            throw QVACError.invalidArgument("endOfTurnSilenceMs must not be negative")
+        }
+        if let vadRunIntervalMs, vadRunIntervalMs <= 0 {
+            throw QVACError.invalidArgument("vadRunIntervalMs must be positive")
+        }
+        let requestId = UUID().uuidString
+        let req = TranscribeStreamRequest(
+            modelId: modelId,
+            emitVadEvents: emitVadEvents ? true : nil,
+            endOfTurnSilenceMs: endOfTurnSilenceMs,
+            metadata: metadata ? true : nil,
+            parakeetStreamingConfig: parakeetStreamingConfig,
+            prompt: prompt,
+            requestId: requestId,
+            vadRunIntervalMs: vadRunIntervalMs
+        )
+        let raw: QVACDuplexSession<TranscribeStreamResponse> = try await duplexTyped(
+            .transcribeStream(req),
+            rpcOptions: rpcOptions
+        )
+        return TranscribeStreamSession(requestId: requestId, raw: raw)
     }
 
     /// Session handle. Write audio via `write(_:)`; iterate `events` for transcripts;
     /// call `end()` to signal you're done sending audio.
     final class TranscribeStreamSession: @unchecked Sendable {
+        public let requestId: String
         private let raw: QVACDuplexSession<TranscribeStreamResponse>
-        init(raw: QVACDuplexSession<TranscribeStreamResponse>) { self.raw = raw }
+        init(requestId: String, raw: QVACDuplexSession<TranscribeStreamResponse>) {
+            self.requestId = requestId
+            self.raw = raw
+        }
 
         /// Send a chunk of audio bytes. Format depends on the loaded model (Whisper expects
         /// 16 kHz mono int16 PCM).
-        public func write(_ audio: Data) async { await raw.write(audio) }
+        public func write(_ audio: Data) async throws { try await raw.write(audio) }
 
         /// Signal end-of-audio. The server will still emit any pending segments.
-        public func end() async { await raw.end() }
+        public func end() async throws { try await raw.end() }
 
         /// Hard-terminate the session.
         public func destroy() { raw.destroy() }
 
         /// Async sequence of transcription events. Single-use.
-        public var events: AsyncThrowingStream<TranscribeStreamEvent, Error> {
+        public var events: QVACResponseStream<TranscribeStreamEvent> {
             let inner = raw.responses
-            return AsyncThrowingStream<TranscribeStreamEvent, Error> { continuation in
-                let task = Task<Void, Never> {
-                    do {
-                        for try await response in inner {
-                            if let err = response.error {
-                                continuation.finish(throwing: QVACError.server(.transcriptionFailed, message: err))
-                                return
-                            }
-                            if let seg = response.segment, let parsed = TranscribeSegment(from: seg) {
-                                continuation.yield(.segment(parsed))
-                            }
-                            if let t = response.text, !t.isEmpty {
-                                continuation.yield(.text(t))
-                            }
-                            if response.done == true {
-                                continuation.yield(.done)
-                                break
-                            }
-                        }
-                        continuation.finish()
-                    } catch {
-                        continuation.finish(throwing: error)
-                    }
+            let rawSession = raw
+            return QVACClient.pullMap(
+                inner,
+                onTermination: { rawSession.destroy() },
+                endOfSourceError: {
+                    QVACError.client(
+                        .streamEndedWithoutResponse,
+                        message: "transcribeStream ended without a terminal done frame"
+                    )
                 }
-                continuation.onTermination = { _ in task.cancel() }
+            ) { response in
+                if let error = response.error {
+                    throw QVACError.server(.transcriptionFailed, message: error)
+                }
+                var events: [TranscribeStreamEvent] = []
+                if let rawSegment = response.segment {
+                    events.append(.segment(try TranscribeSegment(from: rawSegment)))
+                }
+                if let text = response.text, !text.isEmpty { events.append(.text(text)) }
+                if let vad = response.vad { events.append(.vad(vad)) }
+                if let endOfTurn = response.endOfTurn { events.append(.endOfTurn(endOfTurn)) }
+                if response.done == true {
+                    events.append(.done)
+                    return .emitThenFinish(events)
+                }
+                return .emitMany(events)
             }
         }
     }

@@ -39,8 +39,19 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
     }()
 
     override func setUpWithError() throws {
-        try XCTSkipUnless(Self.bareBin != nil,         "set QVAC_BARE_BIN")
-        try XCTSkipUnless(Self.nodeModulesDir != nil,  "set QVAC_NODE_MODULES")
+        try XCTSkipUnless(Self.bareBin != nil, "set QVAC_BARE_BIN")
+        try XCTSkipUnless(Self.nodeModulesDir != nil, "set QVAC_NODE_MODULES")
+        guard FileManager.default.isExecutableFile(atPath: Self.bareBin!.path) else {
+            throw IntegrationPrerequisiteError("QVAC_BARE_BIN is not executable")
+        }
+        let packageJSON = Self.nodeModulesDir!.appendingPathComponent("@qvac/sdk/package.json")
+        guard let data = try? Data(contentsOf: packageJSON),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["version"] as? String == "0.17.0" else {
+            throw IntegrationPrerequisiteError(
+                "QVAC_NODE_MODULES must contain exact @qvac/sdk 0.17.0 from tools/runtime/package-lock.json"
+            )
+        }
     }
 
     /// Decide whether a thrown error from the public API counts as a successful
@@ -48,11 +59,11 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
     ///   - the call did not throw at all (worker processed the request, we decoded the response)
     ///   - `QVACError.server(...)` / `.serverUntyped(...)` — worker returned a typed
     ///      or addon-defined error envelope; wire format OK
-    ///   - `QVACError.client(...)` — client-side typed error code; wire format OK
-    ///   - `QVACError.transport(...)` for download-fetch failures specifically (we feed dummy URLs)
     /// We FAIL on:
     ///   - `QVACError.encoding(...)` — Swift couldn't decode the worker's response
     ///   - `QVACError.protocolViolation(...)` — wire-format invariant violated
+    ///   - local timeout / transport / cancellation — the call did not complete a
+    ///     bounded exchange with the live worker
     private func assertWireRoundTrip(
         _ name: String,
         file: StaticString = #file, line: UInt = #line,
@@ -66,17 +77,29 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
                 XCTFail("\(name): wire decode failure — \(msg)", file: file, line: line)
             case .protocolViolation(let msg):
                 XCTFail("\(name): protocol violation — \(msg)", file: file, line: line)
-            case .server, .serverUntyped, .client, .transport:
+            case .server, .serverUntyped:
                 // Application-level error; wire format succeeded. AC-4 met.
                 break
+            case .client(let code, let message):
+                XCTFail(
+                    "\(name): local SDK failure \(code.name) — \(message ?? "no message")",
+                    file: file,
+                    line: line
+                )
+            case .transport(let reason, _):
+                XCTFail("\(name): transport failure — \(reason)", file: file, line: line)
+            case .requestTimedOut:
+                XCTFail("\(name): request unexpectedly timed out", file: file, line: line)
+            case .invalidArgument(let message):
+                XCTFail("\(name): invalid local argument — \(message)", file: file, line: line)
+            case .streamBufferOverflow(let operation, let maximumBytes, let attemptedBytes):
+                XCTFail(
+                    "\(name): \(operation) buffered \(attemptedBytes) bytes, limit \(maximumBytes)",
+                    file: file,
+                    line: line
+                )
             }
         } catch {
-            // Non-QVACError throwers (e.g. BareRPCError) also count as wire-level failure
-            // unless they're stream-cancel errors. Be strict.
-            let s = String(describing: error)
-            if s.contains("BareRPCConnectionClosed") || s.contains("CancellationError") {
-                return
-            }
             XCTFail("\(name): unexpected error type — \(error)", file: file, line: line)
         }
     }
@@ -86,9 +109,12 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
         let cfg = try QVACClient.Configuration.macOS(
             nodeModulesDir: Self.nodeModulesDir!,
             bareExecutable: Self.bareBin!,
-            initTimeout: 10.0
+            initTimeout: 60.0
         )
-        let client = try await QVACClient(configuration: cfg)
+        let client = try await QVACClient(
+            configuration: cfg,
+            initHandshakeTimeout: .seconds(60)
+        )
         do {
             try await body(client)
         } catch {
@@ -102,206 +128,355 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
 
     func test_all_public_apis_round_trip_at_the_wire_level() async throws {
         try await withClient { client in
-            // 1. heartbeat — happy path, must succeed.
+            let rpc = QVACRPCOptions(timeout: .seconds(5))
+            let registryRPC = QVACRPCOptions(timeout: .seconds(60))
+            let providerRPC = QVACRPCOptions(timeout: .seconds(60))
+            let missingModel = "__qvac_017_wire_probe_missing__"
+            let missingAsset = "/__qvac_017_wire_probe_missing__.gguf"
+            var exercised: [String] = []
+
+            exercised.append("heartbeat")
             await self.assertWireRoundTrip("heartbeat") {
-                let hb = try await client.heartbeat()
-                XCTAssertGreaterThan(hb.number, 0)
+                let heartbeat = try await client.heartbeat(rpcOptions: rpc)
+                XCTAssertGreaterThan(heartbeat.number, 0)
             }
 
-            // 2. cancel(.inference) — nonexistent op, expect error envelope.
-            await self.assertWireRoundTrip("cancel.inference") {
-                try await client.cancel(.inference(modelId: "nonexistent"))
+            // The 0.17 worker retains global startup logs for five seconds. Open
+            // this stream immediately after init/heartbeat so the probe observes
+            // real buffered data instead of timing out after unrelated calls.
+            exercised.append("loggingStream")
+            await self.assertWireRoundTrip("loggingStream") {
+                let stream = try await client.loggingStream(id: "__all__", rpcOptions: rpc)
+                var iterator = stream.makeAsyncIterator()
+                let firstLog = try await iterator.next()
+                XCTAssertNotNil(firstLog, "global SDK log stream should emit a buffered startup log")
             }
 
-            // 3. cancel(.downloadAsset) — nonexistent key.
-            await self.assertWireRoundTrip("cancel.downloadAsset") {
-                try await client.cancel(.downloadAsset(downloadKey: "nonexistent", clearCache: false))
+            exercised.append("cancel")
+            await self.assertWireRoundTrip("cancel") {
+                try await client.cancel(
+                    .request(requestId: "__qvac_017_no_such_request__"),
+                    rpcOptions: rpc
+                )
             }
 
-            // 4. cancel(.rag) — nonexistent workspace.
-            await self.assertWireRoundTrip("cancel.rag") {
-                try await client.cancel(.rag(workspace: "nonexistent"))
+            exercised.append("getSystemResources")
+            await self.assertWireRoundTrip("getSystemResources") {
+                _ = try await client.getSystemResources(sample: false, rpcOptions: rpc)
             }
 
-            // 5. unloadModel — model not loaded, expect error envelope.
-            await self.assertWireRoundTrip("unloadModel") {
-                _ = try await client.unloadModel(modelId: "not-loaded")
+            exercised.append("state")
+            await self.assertWireRoundTrip("state") {
+                _ = try await client.state(rpcOptions: rpc)
             }
 
-            // 6. downloadAsset — bogus URL, worker returns fetch error envelope.
+            exercised.append("modelRegistryList")
+            await self.assertWireRoundTrip("modelRegistryList") {
+                _ = try await client.modelRegistryList(rpcOptions: registryRPC)
+            }
+
+            exercised.append("modelRegistrySearch")
+            await self.assertWireRoundTrip("modelRegistrySearch") {
+                _ = try await client.modelRegistrySearch(
+                    filter: "__qvac_017_no_match__",
+                    rpcOptions: registryRPC
+                )
+            }
+
+            exercised.append("modelRegistryGetModel")
+            await self.assertWireRoundTrip("modelRegistryGetModel") {
+                _ = try await client.modelRegistryGetModel(
+                    registryPath: "__qvac_017_no_match__",
+                    registrySource: "huggingface",
+                    rpcOptions: registryRPC
+                )
+            }
+
+            exercised.append("getModelInfo")
+            await self.assertWireRoundTrip("getModelInfo") {
+                _ = try await client.getModelInfo(name: missingModel, rpcOptions: rpc)
+            }
+
+            exercised.append("getLoadedModelInfo")
+            await self.assertWireRoundTrip("getLoadedModelInfo") {
+                _ = try await client.getLoadedModelInfo(modelId: missingModel, rpcOptions: rpc)
+            }
+
+            exercised.append("downloadAsset")
             await self.assertWireRoundTrip("downloadAsset") {
-                _ = try await client.downloadAsset(
-                    assetSrc: "https://0.0.0.0/never-resolves.bin",
-                    seed: false
+                let run = try await client.downloadAsset(
+                    assetSrc: missingAsset,
+                    seed: false,
+                    rpcOptions: rpc
                 )
+                _ = try await run.result.value
             }
 
-            // 7. downloadAssetStreaming — same URL, exercises stream wire shape.
-            await self.assertWireRoundTrip("downloadAssetStreaming") {
-                let (progress, idTask) = try await client.downloadAssetStreaming(
-                    assetSrc: "https://0.0.0.0/never-resolves.bin",
-                    seed: false
-                )
-                // Drain progress quickly even though it will fail — we just need wire-format proof.
-                Task { for try await _ in progress {} }
-                _ = try await idTask.value
-            }
-
-            // 8. loadModel — bogus URL, worker returns download error envelope.
+            exercised.append("loadModel")
             await self.assertWireRoundTrip("loadModel") {
-                _ = try await client.loadModel(
-                    modelSrc: "https://0.0.0.0/never-resolves.gguf",
-                    modelType: "llamacpp-completion"
-                )
-            }
-
-            // 9. loadModelStreaming — same.
-            await self.assertWireRoundTrip("loadModelStreaming") {
-                let (progress, idTask) = try await client.loadModelStreaming(
-                    modelSrc: "https://0.0.0.0/never-resolves.gguf",
-                    modelType: "llamacpp-completion"
-                )
-                Task { for try await _ in progress {} }
-                _ = try await idTask.value
-            }
-
-            // 10. embed — model not loaded → error envelope.
-            await self.assertWireRoundTrip("embed") {
-                _ = try await client.embed(modelId: "not-loaded", text: "hello")
-            }
-
-            // 11. embed (batch) — model not loaded → error envelope.
-            await self.assertWireRoundTrip("embed(batch)") {
-                _ = try await client.embed(modelId: "not-loaded", texts: ["a", "b"])
-            }
-
-            // 12. completion (streaming) — model not loaded; stream errors immediately.
-            await self.assertWireRoundTrip("completion") {
-                let run = try await client.completion(
-                    modelId: "not-loaded",
-                    history: [.user("hi")]
-                )
-                for try await _ in run.tokenStream {}
-            }
-
-            // 13. transcribe(path) — model not loaded.
-            await self.assertWireRoundTrip("transcribe(path)") {
-                _ = try await client.transcribe(
-                    modelId: "not-loaded",
-                    audioPath: "/dev/null",
-                    prompt: nil
-                )
-            }
-
-            // 14. transcribe(bytes).
-            await self.assertWireRoundTrip("transcribe(bytes)") {
-                _ = try await client.transcribe(
-                    modelId: "not-loaded",
-                    audioBytes: Data([0, 1, 2]),
-                    prompt: nil
-                )
-            }
-
-            // 15. textToSpeech — model not loaded.
-            await self.assertWireRoundTrip("textToSpeech") {
-                let run = try await client.textToSpeech(modelId: "not-loaded", text: "hello")
-                _ = try await run.audio.value
-            }
-
-            // 16. translate — model not loaded.
-            await self.assertWireRoundTrip("translate") {
-                let run = try await client.translate(
-                    modelId: "not-loaded",
+                let run = try await client.loadModel(
+                    modelSrc: missingAsset,
                     modelType: "llamacpp-completion",
-                    text: "hello",
-                    from: "en",
-                    to: "fr"
+                    rpcOptions: rpc
                 )
-                _ = try await run.text.value
+                _ = try await run.result.value
             }
 
-            // 17. diffusion — model not loaded.
-            await self.assertWireRoundTrip("diffusion") {
+            exercised.append("embed")
+            await self.assertWireRoundTrip("embed") {
+                let run = try await client.embed(
+                    modelId: missingModel,
+                    text: "hello",
+                    rpcOptions: rpc
+                )
+                _ = try await run.result.value
+            }
+
+            exercised.append("completionStream")
+            await self.assertWireRoundTrip("completionStream") {
+                let run = try await client.completion(
+                    modelId: missingModel,
+                    history: [.user("hello")],
+                    rpcOptions: rpc
+                )
+                _ = try await run.final.value
+            }
+
+            exercised.append("diffusionStream")
+            await self.assertWireRoundTrip("diffusionStream") {
                 let run = try await client.diffusion(
-                    modelId: "not-loaded",
-                    prompt: "a cat"
+                    modelId: missingModel,
+                    prompt: "wire probe",
+                    rpcOptions: rpc
                 )
                 _ = try await run.outputs.value
             }
 
-            // 18. ocr(path).
-            await self.assertWireRoundTrip("ocr(path)") {
+            exercised.append("ocrStream")
+            await self.assertWireRoundTrip("ocrStream") {
                 let run = try await client.ocr(
-                    modelId: "not-loaded",
-                    imagePath: "/dev/null",
-                    options: nil
+                    modelId: missingModel,
+                    imageBytes: Data([0x89, 0x50, 0x4E, 0x47]),
+                    options: nil,
+                    rpcOptions: rpc
                 )
                 _ = try await run.blocks.value
             }
 
-            // 19. ocr(bytes).
-            await self.assertWireRoundTrip("ocr(bytes)") {
-                let run = try await client.ocr(
-                    modelId: "not-loaded",
-                    imageBytes: Data([0xff, 0xd8]),
-                    options: nil
+            exercised.append("textToSpeech")
+            await self.assertWireRoundTrip("textToSpeech") {
+                let run = try await client.textToSpeech(
+                    modelId: missingModel,
+                    text: "hello",
+                    rpcOptions: rpc
                 )
-                _ = try await run.blocks.value
+                _ = try await run.buffer.value
             }
 
-            // 20–28. RAG ops.
-            await self.assertWireRoundTrip("ragIngest") {
-                _ = try await client.ragIngest(
-                    modelId: "not-loaded",
-                    documents: [QVACClient.RagDocument("hello")]
+            exercised.append("transcribe")
+            await self.assertWireRoundTrip("transcribe") {
+                let run = try await client.transcribe(
+                    modelId: missingModel,
+                    audioBytes: Data([0, 1, 2]),
+                    prompt: nil,
+                    rpcOptions: rpc
                 )
-            }
-            await self.assertWireRoundTrip("ragSearch") {
-                _ = try await client.ragSearch(modelId: "not-loaded", query: "q")
-            }
-            await self.assertWireRoundTrip("ragChunk") {
-                _ = try await client.ragChunk(
-                    documents: [QVACClient.RagDocument("hello")]
-                )
-            }
-            await self.assertWireRoundTrip("ragSaveEmbeddings") {
-                _ = try await client.ragSaveEmbeddings(documents: [])
-            }
-            await self.assertWireRoundTrip("ragDeleteEmbeddings") {
-                try await client.ragDeleteEmbeddings(ids: ["nope"])
-            }
-            await self.assertWireRoundTrip("ragListWorkspaces") {
-                _ = try await client.ragListWorkspaces()
-            }
-            await self.assertWireRoundTrip("ragCloseWorkspace") {
-                try await client.ragCloseWorkspace(workspace: "default", deleteOnClose: false)
-            }
-            await self.assertWireRoundTrip("ragDeleteWorkspace") {
-                try await client.ragDeleteWorkspace(workspace: "nonexistent")
-            }
-            await self.assertWireRoundTrip("ragReindex") {
-                _ = try await client.ragReindex()
+                _ = try await run.result.value
             }
 
-            // 29. invokePlugin (untyped).
-            await self.assertWireRoundTrip("invokePlugin") {
+            exercised.append("translate")
+            await self.assertWireRoundTrip("translate") {
+                let run = try await client.translate(
+                    modelId: missingModel,
+                    modelType: "nmtcpp-translation",
+                    text: "hello",
+                    from: "en",
+                    to: "fr",
+                    stream: false,
+                    rpcOptions: rpc
+                )
+                _ = try await run.text.value
+            }
+
+            exercised.append("upscaleStream")
+            await self.assertWireRoundTrip("upscaleStream") {
+                let run = try await client.upscale(
+                    modelId: missingModel,
+                    image: Data([0x89, 0x50, 0x4E, 0x47]),
+                    rpcOptions: rpc
+                )
+                _ = try await run.outputs.value
+            }
+
+            exercised.append("videoStream")
+            await self.assertWireRoundTrip("videoStream") {
+                let run = try await client.video(
+                    modelId: missingModel,
+                    mode: "txt2vid",
+                    prompt: "wire probe",
+                    rpcOptions: rpc
+                )
+                _ = try await run.outputs.value
+            }
+
+            exercised.append("classify")
+            await self.assertWireRoundTrip("classify") {
+                _ = try await client.classify(
+                    modelId: missingModel,
+                    image: Data([0x89, 0x50, 0x4E, 0x47]),
+                    rpcOptions: rpc
+                )
+            }
+
+            exercised.append("audioGenStream")
+            await self.assertWireRoundTrip("audioGenStream") {
+                let run = try await client.audioGen(
+                    modelId: missingModel,
+                    caption: "wire probe",
+                    rpcOptions: rpc
+                )
+                _ = try await run.audio.value
+            }
+
+            exercised.append("batchCompletionStream")
+            await self.assertWireRoundTrip("batchCompletionStream") {
+                let run = try await client.batchCompletion(
+                    modelId: missingModel,
+                    prompts: [.init(id: "p1", history: [.user("hello")])],
+                    rpcOptions: rpc
+                )
+                _ = try await run.results.value
+            }
+
+            exercised.append("bciTranscribe")
+            await self.assertWireRoundTrip("bciTranscribe") {
+                let run = try await client.bciTranscribe(
+                    modelId: missingModel,
+                    neuralData: .data(Data([0, 1, 2])),
+                    rpcOptions: rpc
+                )
+                _ = try await run.result.value
+            }
+
+            exercised.append("pluginInvoke")
+            await self.assertWireRoundTrip("pluginInvoke") {
                 _ = try await client.invokePlugin(
-                    modelId: "not-loaded",
-                    handler: "nope",
-                    params: ["k": "v"]
+                    modelId: missingModel,
+                    handler: "__qvac_017_no_handler__",
+                    params: ["probe": true],
+                    as: JSONValue.self,
+                    rpcOptions: rpc
                 )
             }
 
-            // 30. invokePluginStream.
-            await self.assertWireRoundTrip("invokePluginStream") {
-                let s = try await client.invokePluginStream(
-                    modelId: "not-loaded",
-                    handler: "nope",
-                    params: ["k": "v"],
-                    as: JSONValue.self
+            exercised.append("pluginInvokeStream")
+            await self.assertWireRoundTrip("pluginInvokeStream") {
+                let stream = try await client.invokePluginStream(
+                    modelId: missingModel,
+                    handler: "__qvac_017_no_handler__",
+                    params: ["probe": true],
+                    as: JSONValue.self,
+                    rpcOptions: rpc
                 )
-                for try await _ in s {}
+                for try await _ in stream {}
             }
+
+            exercised.append("rag")
+            await self.assertWireRoundTrip("rag") {
+                _ = try await client.ragListWorkspaces(rpcOptions: rpc)
+            }
+
+            exercised.append("finetune")
+            await self.assertWireRoundTrip("finetune") {
+                _ = try await client.finetune(
+                    .init(modelId: missingModel, operation: "cancel"),
+                    rpcOptions: rpc
+                )
+            }
+
+            exercised.append("deleteCache")
+            await self.assertWireRoundTrip("deleteCache") {
+                _ = try await client.deleteCache(
+                    .init(modelId: missingModel),
+                    rpcOptions: rpc
+                )
+            }
+
+            exercised.append("bciTranscribeStream")
+            await self.assertWireRoundTrip("bciTranscribeStream") {
+                let session = try await client.bciTranscribeStream(
+                    modelId: missingModel,
+                    rpcOptions: rpc
+                )
+                try await session.end()
+                for try await _ in session.events {}
+            }
+
+            exercised.append("completionOrchestrate")
+            await self.assertWireRoundTrip("completionOrchestrate") {
+                let session = try await client.completionOrchestrate(
+                    modelId: missingModel,
+                    history: [.user("hello")],
+                    tools: [],
+                    rpcOptions: rpc
+                )
+                try await session.end()
+                for try await _ in session.events {}
+            }
+
+            exercised.append("textToSpeechStream")
+            await self.assertWireRoundTrip("textToSpeechStream") {
+                let session = try await client.textToSpeechStream(
+                    modelId: missingModel,
+                    rpcOptions: rpc
+                )
+                try await session.end()
+                for try await _ in session.chunks {}
+            }
+
+            exercised.append("transcribeStream")
+            await self.assertWireRoundTrip("transcribeStream") {
+                let session = try await client.transcribeStream(
+                    modelId: missingModel,
+                    rpcOptions: rpc
+                )
+                try await session.end()
+                for try await _ in session.events {}
+            }
+
+            exercised.append("provide")
+            await self.assertWireRoundTrip("provide") {
+                _ = try await client.startQVACProvider(rpcOptions: providerRPC)
+            }
+
+            exercised.append("stopProvide")
+            await self.assertWireRoundTrip("stopProvide") {
+                _ = try await client.stopQVACProvider(rpcOptions: providerRPC)
+            }
+
+            exercised.append("suspend")
+            await self.assertWireRoundTrip("suspend") {
+                try await client.suspend(rpcOptions: rpc)
+            }
+
+            exercised.append("resume")
+            await self.assertWireRoundTrip("resume") {
+                try await client.resume(rpcOptions: rpc)
+            }
+
+            // Last only to keep lifecycle-sensitive calls grouped at the end; 0.17
+            // keeps the client open after unloading its final model.
+            exercised.append("unloadModel")
+            await self.assertWireRoundTrip("unloadModel") {
+                _ = try await client.unloadModel(modelId: missingModel, rpcOptions: rpc)
+            }
+
+            XCTAssertEqual(exercised.count, 39)
+            XCTAssertEqual(
+                Set(exercised),
+                Set(QVACSDKContract.methods.map(\.name)),
+                "live public-API coverage must exactly equal the published 0.17 manifest"
+            )
         }
     }
 }

@@ -14,9 +14,9 @@ public extension QVACClient {
     /// Throws on transport failure or if the worker is unreachable.
     /// On success guarantees the wire-level handshake is healthy.
     @discardableResult
-    func heartbeat() async throws -> HeartbeatResponse {
+    func heartbeat(rpcOptions: QVACRPCOptions = .init()) async throws -> HeartbeatResponse {
         let request = QVACRequest.heartbeat(HeartbeatRequest())
-        let response: QVACResponse = try await sendTyped(request)
+        let response: QVACResponse = try await sendTyped(request, rpcOptions: rpcOptions)
         guard case .heartbeat(let hb) = response else {
             throw QVACError.protocolViolation(
                 "expected heartbeat response, got \(response.discriminator)"

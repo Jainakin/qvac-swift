@@ -1,197 +1,61 @@
 #!/usr/bin/env bash
-# tools/release/prepare-release.sh — rewrite Package.swift for an SPM-consumer release.
-#
-# Package.swift in this repo is a *dev-mode* manifest that uses path-based
-# binaryTargets pointing into spike-swift/Vendor/ (populated by
-# tools/dev/vendor-from-release.sh). SPM consumers using
-# `.package(url: "...", from: "0.1.0")` cannot resolve those paths in their
-# checkout, so for a real release we need a manifest that uses
-# `binaryTarget(url:, checksum:)` pointing at GitHub Release artifacts.
-#
-# This script:
-#   1. Downloads the release's manifest.json (produced by release.yml ->
-#      compute-manifest.mjs) which lists the exact framework set the
-#      committed bundle needs.
-#   2. Downloads each listed xcframework zip + BareKit zip, computes
-#      SHA-256s.
-#   3. Rewrites Package.swift in place — emits one `.binaryTarget` per
-#      framework AND declares QVACClient as depending on every one (without
-#      `.target(name:)` SPM declares but never links a binaryTarget; the
-#      old release pipeline shipped 48 xcframeworks but only ever linked
-#      BareKit, causing dlopen failures at runtime).
-#
-# Usage:
-#   tools/release/prepare-release.sh v0.1.0
-#
-# Pre-conditions:
-#   - The tag `v0.1.0` exists on GitHub.
-#   - `release.yml` has uploaded BareKit.xcframework.zip, the addon
-#     xcframework zips, worker.mobile.bundle, AND manifest.json.
-#   - `gh` CLI is authenticated against the repo.
-#
-# Post-conditions:
-#   - Package.swift is rewritten with URL+checksum binaryTargets, ALL of
-#     which are wired into QVACClient.dependencies.
-#   - The dev-mode manifest is preserved as Package.swift.dev for monorepo work.
-#   - A summary of computed checksums is printed.
+# Validate a published artifact release against the exact, already-prepared
+# source commit. This command is deliberately read-only for the repository:
+# candidate Package.swift generation happens from a dry-run workflow artifact,
+# before final artifact publication and source tagging.
 
 set -euo pipefail
 
-VERSION="${1:-}"
-if [ -z "$VERSION" ]; then
-    echo "usage: $0 <version>   (e.g. v0.1.0)" >&2
+ARTIFACT_TAG="${1:-}"
+if [[ ! "$ARTIFACT_TAG" =~ ^artifacts-sdk-0\.17\.0-r[1-9][0-9]*$ || "$#" -ne 1 ]]; then
+    echo "usage: $0 artifacts-sdk-0.17.0-rN" >&2
     exit 2
 fi
 
-REPO_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/../.." && pwd )"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPOSITORY="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
+DOWNLOAD_DIR="$(mktemp -d)"
+trap 'rm -rf "$DOWNLOAD_DIR"' EXIT
+
 cd "$REPO_ROOT"
-
-REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
-WORKDIR="$(mktemp -d)"
-trap 'rm -rf "$WORKDIR"' EXIT
-
-echo "[prepare-release] repo=$REPO  tag=$VERSION  workdir=$WORKDIR"
-
-# 1. Download manifest.json from the release. The manifest pins the exact
-#    framework set the committed bundle needs (see compute-manifest.mjs).
-gh release download "$VERSION" --repo "$REPO" --pattern "manifest.json" --dir "$WORKDIR"
-if [ ! -f "$WORKDIR/manifest.json" ]; then
-    echo "[prepare-release] error: release $VERSION has no manifest.json — did release.yml run compute-manifest.mjs?" >&2
+CURRENT_COMMIT="$(git rev-parse HEAD)"
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "[prepare-release] error: tracked files must be committed before release validation" >&2
     exit 3
 fi
 
-# Parse manifest with python (jq isn't always installed; bash 3.2 needs to stay portable).
-HOST_RUNTIME=$(python3 -c "import json; print(json.load(open('$WORKDIR/manifest.json'))['hostRuntime'])")
-ADDON_LIST=$(python3 -c "import json; print('\n'.join(json.load(open('$WORKDIR/manifest.json'))['addons']))")
-ADDON_COUNT=$(echo "$ADDON_LIST" | grep -c . || echo 0)
-echo "[prepare-release] manifest: 1 host runtime ($HOST_RUNTIME) + $ADDON_COUNT addons"
+REMOTE_REFS="$(git ls-remote --tags origin \
+    "refs/tags/$ARTIFACT_TAG" "refs/tags/$ARTIFACT_TAG^{}")"
+ARTIFACT_COMMIT="$(printf '%s\n' "$REMOTE_REFS" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')"
+if [[ -z "$ARTIFACT_COMMIT" ]]; then
+    ARTIFACT_COMMIT="$(printf '%s\n' "$REMOTE_REFS" | awk 'NF == 2 { print $1; exit }')"
+fi
+if [[ "$ARTIFACT_COMMIT" != "$CURRENT_COMMIT" ]]; then
+    echo "[prepare-release] error: $ARTIFACT_TAG resolves to $ARTIFACT_COMMIT, not current source $CURRENT_COMMIT" >&2
+    exit 3
+fi
 
-# 2a. Build the full target list (host runtime first, then addons sorted).
-ALL_TARGETS=("$HOST_RUNTIME")
-while IFS= read -r line; do
-    [ -n "$line" ] && ALL_TARGETS+=("$line")
-done <<<"$ADDON_LIST"
+echo "[prepare-release] downloading immutable artifact release $REPOSITORY@$ARTIFACT_TAG"
+gh release download "$ARTIFACT_TAG" --repo "$REPOSITORY" --dir "$DOWNLOAD_DIR"
+MANIFEST="$DOWNLOAD_DIR/artifact-manifest.json"
+if [[ ! -f "$MANIFEST" ]]; then
+    echo "[prepare-release] error: $ARTIFACT_TAG has no artifact-manifest.json" >&2
+    exit 3
+fi
 
-# 2b. Validate every asset name before letting it flow into a generated
-#     Package.swift literal or shell command. A compromised GitHub release
-#     could otherwise inject Swift code via a crafted asset name like
-#     `foo"; eval(...); ".xcframework.zip`. The regex permits exactly the
-#     shape `bare-link` / our release pipeline actually produces.
-SAFE_NAME_RE='^[A-Za-z0-9._@-]+$'
-for name in "${ALL_TARGETS[@]}"; do
-    if [[ ! "$name" =~ $SAFE_NAME_RE ]]; then
-        echo "[prepare-release] error: refusing to process unsafe name: $name" >&2
-        exit 4
-    fi
-done
+MANIFEST_TAG="$(node -e 'const m=require(process.argv[1]); process.stdout.write(m.artifactTag ?? "")' "$MANIFEST")"
+if [[ "$MANIFEST_TAG" != "$ARTIFACT_TAG" ]]; then
+    echo "[prepare-release] error: manifest says $MANIFEST_TAG, expected $ARTIFACT_TAG" >&2
+    exit 4
+fi
 
-# 2c. Download each + compute SHA-256. Parallel arrays (TARGETS[i] / CHECKSUMS[i])
-#     rather than associative array — bash 3.2 (macOS default) has no `declare -A`.
-CHECKSUMS=()
-for name in "${ALL_TARGETS[@]}"; do
-    asset="${name}.xcframework.zip"
-    echo "[prepare-release]   downloading $asset..."
-    gh release download "$VERSION" --repo "$REPO" --pattern "$asset" --dir "$WORKDIR"
-    sha=$(shasum -a 256 "$WORKDIR/$asset" | awk '{print $1}')
-    # Defense in depth — a corrupted shasum binary or odd platform should not
-    # embed garbage into Package.swift.
-    if [[ ! "$sha" =~ ^[a-f0-9]{64}$ ]]; then
-        echo "[prepare-release] error: shasum returned non-hex for $asset: $sha" >&2
-        exit 5
-    fi
-    CHECKSUMS+=("$sha")
-done
+node "$SCRIPT_DIR/verify-release.mjs" "$MANIFEST" \
+    --source-commit "$CURRENT_COMMIT" \
+    --assets-dir "$DOWNLOAD_DIR" \
+    --package "$REPO_ROOT/Package.swift" \
+    --bundle "$REPO_ROOT/Sources/QVACClient/Resources/worker.mobile.bundle"
+swift package --package-path "$REPO_ROOT" dump-package >/dev/null
 
-# 3. Back up the dev-mode manifest so monorepo dev keeps working.
-cp Package.swift Package.swift.dev
-
-# 4. Emit the URL-based manifest.
-URL_BASE="https://github.com/$REPO/releases/download/$VERSION"
-{
-    cat <<EOF
-// swift-tools-version:5.10
-// QVAC Swift Client — SPM-consumer manifest (release ${VERSION}).
-//
-// Generated by tools/release/prepare-release.sh — do not edit by hand. The
-// dev-mode manifest that uses local vendored paths is preserved as
-// Package.swift.dev.
-//
-// QVACClient depends on every binaryTarget declared below — without that,
-// SPM declares the targets but never links them, and the host app's
-// Frameworks/ directory ends up missing the native binaries the worker
-// bundle dlopens at runtime (the failure mode we hit during the v0.0.1-rc1
-// production-mode test).
-
-import PackageDescription
-
-let package = Package(
-    name: "QVACClient",
-    platforms: [
-        .macOS(.v14),
-        .iOS(.v17),
-    ],
-    products: [
-        .library(name: "QVACClient", targets: ["QVACClient"]),
-    ],
-    targets: [
-EOF
-    # binaryTarget declarations
-    for i in "${!ALL_TARGETS[@]}"; do
-        name="${ALL_TARGETS[$i]}"
-        sha="${CHECKSUMS[$i]}"
-        cat <<EOF
-        .binaryTarget(
-            name: "${name}",
-            url: "${URL_BASE}/${name}.xcframework.zip",
-            checksum: "${sha}"
-        ),
-EOF
-    done
-    # QVACClient target — depends on EVERY binaryTarget so SPM links them all.
-    cat <<EOF
-        .target(
-            name: "QVACClient",
-            dependencies: [
-EOF
-    for name in "${ALL_TARGETS[@]}"; do
-        echo "                .target(name: \"${name}\", condition: .when(platforms: [.iOS])),"
-    done
-    cat <<'EOF'
-            ],
-            path: "Sources/QVACClient",
-            resources: [
-                .copy("Resources/worker.mobile.bundle"),
-            ]
-        ),
-        .testTarget(
-            name: "QVACClientUnitTests",
-            dependencies: ["QVACClient"],
-            path: "Tests/QVACClientUnitTests",
-            resources: [.copy("Fixtures")]
-        ),
-        .testTarget(
-            name: "QVACClientIntegrationTests",
-            dependencies: ["QVACClient"],
-            path: "Tests/QVACClientIntegrationTests"
-        ),
-    ]
-)
-EOF
-} > Package.swift
-
-echo
-echo "[prepare-release] ✅ Package.swift rewritten."
-echo "[prepare-release]    URL base:       $URL_BASE"
-echo "[prepare-release]    Binary targets: ${#ALL_TARGETS[@]} ($HOST_RUNTIME + $ADDON_COUNT addons)"
-echo "[prepare-release]    All wired into QVACClient.dependencies"
-echo
-echo "[prepare-release] Next steps:"
-echo "  1. Review:        diff Package.swift.dev Package.swift"
-echo "  2. Sanity check:  swift package describe"
-echo "  3. Build sample:  cd Examples/QVACChat && xcodegen generate && \\"
-echo "                    xcodebuild -project QVACChat.xcodeproj \\"
-echo "                      -scheme QVACChat-iOS -destination 'generic/platform=iOS Simulator' build"
-echo "  4. Commit:        git add Package.swift Package.swift.dev && \\"
-echo "                    git commit -m 'release: pin ${VERSION} binary targets'"
-echo "  5. Move the tag:  git tag -fa ${VERSION} -m '${VERSION}'"
-echo "  6. Push:          git push origin main && git push origin ${VERSION} --force-with-lease"
+echo "[prepare-release] published artifacts, canonical URL manifest, and source commit are identical"
+echo "[prepare-release] run the Source Release workflow from this exact main commit; it verifies again before creating a SemVer tag"

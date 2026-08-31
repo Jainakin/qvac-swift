@@ -1,0 +1,84 @@
+// QVACModelTypeContractTests.generated.swift
+//
+// AUTO-GENERATED from the exact @qvac/sdk@0.17.0
+// contract/model-type-maps.json at gitHead e8b440665a053a9efe852f04c3601da44f0d55d8.
+// DO NOT EDIT BY HAND.
+
+import XCTest
+@testable import QVACClient
+
+final class QVACModelTypeContractTests: XCTestCase {
+    func test_all_pinned_maps_are_emitted_exactly() {
+        XCTAssertEqual(QVACModelTypeContract.aliasToCanonical, [
+            "audiogen": "audiogen-ggml",
+            "bci": "bci-whispercpp-transcription",
+            "classification": "ggml-classification",
+            "diffusion": "sdcpp-generation",
+            "embeddings": "llamacpp-embedding",
+            "llm": "llamacpp-completion",
+            "nmt": "nmtcpp-translation",
+            "ocr": "ggml-ocr",
+            "parakeet": "parakeet-transcription",
+            "tts": "tts-ggml",
+            "vla": "ggml-vla",
+            "whisper": "whispercpp-transcription",
+    ])
+        XCTAssertEqual(QVACModelTypeContract.engineToAddon, [
+            "audiogen-ggml": "audiogen",
+            "bci-whispercpp-transcription": "bci",
+            "ggml-classification": "classification",
+            "ggml-ocr": "ocr",
+            "ggml-vla": "vla",
+            "llamacpp-completion": "llm",
+            "llamacpp-embedding": "embeddings",
+            "nmtcpp-translation": "nmt",
+            "onnx-tts": "tts",
+            "onnx-vad": "vad",
+            "parakeet-transcription": "parakeet",
+            "sdcpp-generation": "diffusion",
+            "tts-ggml": "tts",
+            "whispercpp-transcription": "whisper",
+    ])
+        XCTAssertEqual(QVACModelTypeContract.legacyEngineToCanonical, [
+            "@qvac/audiogen": "audiogen-ggml",
+            "@qvac/audiogen-ggml": "audiogen-ggml",
+            "@qvac/bci-whispercpp": "bci-whispercpp-transcription",
+            "@qvac/classification-ggml": "ggml-classification",
+            "@qvac/diffusion-cpp": "sdcpp-generation",
+            "@qvac/embed-llamacpp": "llamacpp-embedding",
+            "@qvac/llm-llamacpp": "llamacpp-completion",
+            "@qvac/ocr-ggml": "ggml-ocr",
+            "@qvac/ocr-onnx": "ggml-ocr",
+            "@qvac/transcription-parakeet": "parakeet-transcription",
+            "@qvac/transcription-whispercpp": "whispercpp-transcription",
+            "@qvac/translation-llamacpp": "nmtcpp-translation",
+            "@qvac/translation-nmtcpp": "nmtcpp-translation",
+            "@qvac/tts": "tts-ggml",
+            "@qvac/tts-ggml": "tts-ggml",
+            "@qvac/tts-onnx": "tts-ggml",
+            "@qvac/vad-silero": "onnx-vad",
+            "@qvac/vla-ggml": "ggml-vla",
+            "audiogen": "audiogen-ggml",
+            "bci": "bci-whispercpp-transcription",
+            "classification": "ggml-classification",
+            "diffusion": "sdcpp-generation",
+            "embedding": "llamacpp-embedding",
+            "generation": "llamacpp-completion",
+            "ocr": "ggml-ocr",
+            "onnx-ocr": "ggml-ocr",
+            "transcription": "whispercpp-transcription",
+            "translation": "nmtcpp-translation",
+            "tts": "tts-ggml",
+            "vad": "onnx-vad",
+            "vla": "ggml-vla",
+    ])
+    }
+
+    func test_normalizer_matches_pinned_alias_semantics_and_preserves_other_values() {
+        for (alias, canonical) in QVACModelTypeContract.aliasToCanonical {
+            XCTAssertEqual(QVACModelTypeContract.normalize(alias), canonical)
+            XCTAssertEqual(QVACModelTypeContract.normalize(canonical), canonical)
+        }
+        XCTAssertEqual(QVACModelTypeContract.normalize("custom-plugin-model"), "custom-plugin-model")
+    }
+}

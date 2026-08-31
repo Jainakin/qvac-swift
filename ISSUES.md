@@ -1,6 +1,11 @@
 # QVAC Swift Client — Issue Tracker
 
-> **This is the authoritative issue tracker.** All work for this grant is tracked here. The format is **strict** — see [PLAN.md §4](PLAN.md#4-issue-tracker-schema) for the canonical schema.
+> **Historical planning record.** This tracker describes the original grant work
+> and the May 0.10.x implementation. It is no longer the authoritative status of
+> the 0.17.0 submission candidate; use `README.md`, `docs/distribution.md`, and CI.
+
+> This was the authoritative tracker for the original grant implementation. Its
+> strict record format is documented in [PLAN.md §4](PLAN.md#4-issue-tracker-schema).
 
 ## Index
 

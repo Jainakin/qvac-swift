@@ -15,39 +15,41 @@ import OSLog
 
 private let _bareKitLogger = Logger(subsystem: "io.qvac.client", category: "barekit")
 
-public final class BareIPCTransport: BareTransport, @unchecked Sendable {
+final class BareIPCTransport: BareTransport, @unchecked Sendable {
 
-    public enum Error: Swift.Error, CustomStringConvertible {
+    enum Error: Swift.Error, CustomStringConvertible {
         case workletInitFailed
         case ipcInitFailed
+        case invalidConfiguration(String)
         case writeFailed(underlying: Swift.Error)
 
-        public var description: String {
+        var description: String {
             switch self {
             case .workletInitFailed: return "BareWorklet init returned nil"
             case .ipcInitFailed:     return "BareIPC init returned nil"
+            case .invalidConfiguration(let reason): return "Invalid BareIPC configuration: \(reason)"
             case .writeFailed(let u): return "BareIPC.write failed: \(u)"
             }
         }
     }
 
-    public struct Configuration {
+    struct Configuration: Sendable {
         /// Inline raw bare-bundle binary for the worklet (length-prefix + JSON header + assets).
         /// Typical use: the QVAC `worker.mobile.bundle` resource shipped in `QVACClient.bundle`
         /// (produced by `tools/bundle/unwrap-bundle.mjs` from `qvac bundle sdk` output).
         /// NOTE: pass raw bundle bytes here, not a JS wrapper — bare-module's `.bundle`
         /// extension handler parses this verbatim and rejects JS source.
-        public var workletSource: Data
+        var workletSource: Data
         /// Virtual file name used by the worklet's module loader for stack traces / require resolution.
-        public var workletEntryName: String
+        var workletEntryName: String
         /// Arguments passed as `process.argv` inside the worklet (mirrors QVAC's JSON-arg pattern).
-        public var arguments: [String]
+        var arguments: [String]
         /// Optional memory ceiling (in bytes). 0 = use BareKit default.
-        public var memoryLimit: UInt = 0
+        var memoryLimit: UInt = 0
         /// Optional path to a bundle of assets for the worklet to access.
-        public var assets: String?
+        var assets: String?
 
-        public init(
+        init(
             workletSource: Data,
             workletEntryName: String = "/worker.bundle",
             arguments: [String] = [],
@@ -64,11 +66,19 @@ public final class BareIPCTransport: BareTransport, @unchecked Sendable {
 
     private let worklet: BareWorklet
     private let ipc: BareIPC
-    private var readContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation?
+    private let inbound: BoundedTransportInboundChannel
     private var closed = false
+    private var closeFinished = false
+    private var closeWaiters: [CheckedContinuation<Void, Never>] = []
     private let lock = NSLock()
 
-    public static func connect(_ config: Configuration) throws -> BareIPCTransport {
+    static func connect(
+        _ config: Configuration,
+        maximumInboundBufferedBytes: Int = BareRPCFrameReader.defaultMaxFrameSize + 4
+    ) throws -> BareIPCTransport {
+        guard maximumInboundBufferedBytes > 0 else {
+            throw Error.invalidConfiguration("maximumInboundBufferedBytes must be greater than zero")
+        }
         _bareKitLogger.info("BareIPCTransport.connect: building BareWorkletConfiguration")
         guard let configObj = BareWorkletConfiguration.default() else {
             _bareKitLogger.error("BareWorkletConfiguration.default() returned nil")
@@ -83,7 +93,7 @@ public final class BareIPCTransport: BareTransport, @unchecked Sendable {
             throw Error.workletInitFailed
         }
 
-        _bareKitLogger.info("BareIPCTransport.connect: starting worklet entry=\(config.workletEntryName, privacy: .public) bundleBytes=\(config.workletSource.count, privacy: .public) argv=\(config.arguments, privacy: .public)")
+        _bareKitLogger.info("BareIPCTransport.connect: starting worklet bundleBytes=\(config.workletSource.count, privacy: .public) argumentCount=\(config.arguments.count, privacy: .public)")
         worklet.start(config.workletEntryName, source: config.workletSource, arguments: config.arguments)
         _bareKitLogger.info("BareIPCTransport.connect: worklet.start returned (fire-and-forget); allocating IPC")
 
@@ -93,12 +103,22 @@ public final class BareIPCTransport: BareTransport, @unchecked Sendable {
             throw Error.ipcInitFailed
         }
         _bareKitLogger.info("BareIPCTransport.connect: IPC ready")
-        return BareIPCTransport(worklet: worklet, ipc: ipc)
+        return BareIPCTransport(
+            worklet: worklet,
+            ipc: ipc,
+            maximumInboundBufferedBytes: maximumInboundBufferedBytes
+        )
     }
 
-    private init(worklet: BareWorklet, ipc: BareIPC) {
+    private init(worklet: BareWorklet, ipc: BareIPC, maximumInboundBufferedBytes: Int) {
         self.worklet = worklet
         self.ipc = ipc
+        self.inbound = BoundedTransportInboundChannel(
+            maximumBufferedBytes: maximumInboundBufferedBytes
+        )
+        self.inbound.setCancellationHandler { [weak self] in
+            Task { [weak self] in await self?.close() }
+        }
         // Install the readable callback right away. BareIPC fires it on its internal GCD
         // queue (`to.holepunch.bare.kit.ipc`) so we marshal back via the continuation,
         // which is thread-safe per AsyncThrowingStream contract.
@@ -106,51 +126,68 @@ public final class BareIPCTransport: BareTransport, @unchecked Sendable {
             guard let self = self else { return }
             // Drain everything available on this fire — read() returns nil when empty.
             while let chunk = ipcRef.read(), chunk.count > 0 {
-                _bareKitLogger.info("BareIPC <- worker: \(chunk.count, privacy: .public) bytes (first16=\((chunk as Data).prefix(16).map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public))")
-                self.lock.lock()
-                let cont = self.readContinuation
-                self.lock.unlock()
-                cont?.yield(chunk as Data)
+                if self.inbound.yield(chunk as Data) != nil {
+                    Task { [weak self] in await self?.close() }
+                    return
+                }
             }
         }
     }
 
     /// Single-use — see UnixDomainSocketTransport.inboundStream() for the same
     /// invariant. Calling twice would silently abandon the first continuation.
-    public func inboundStream() -> AsyncThrowingStream<Data, Swift.Error> {
-        AsyncThrowingStream<Data, Swift.Error> { continuation in
-            lock.lock()
-            precondition(readContinuation == nil,
-                         "BareIPCTransport.inboundStream() may be called only once per transport instance")
-            readContinuation = continuation
-            lock.unlock()
-            continuation.onTermination = { [weak self] _ in
+    func inboundStream() -> AsyncThrowingStream<Data, Swift.Error> {
+        inbound.stream()
+    }
+
+    func write(_ data: Data) async throws {
+        do {
+            try await withTaskCancellationHandler {
+                try Task.checkCancellation()
+                try await ipc.write(data)
+                try Task.checkCancellation()
+            } onCancel: {
                 Task { [weak self] in await self?.close() }
             }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error {
+            _bareKitLogger.error("BareIPC -> worker write failed")
+            throw Error.writeFailed(underlying: error)
         }
     }
 
-    public func write(_ data: Data) async throws {
-        _bareKitLogger.info("BareIPC -> worker: \(data.count, privacy: .public) bytes (first16=\(data.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public))")
-        do {
-            try await ipc.write(data)
-        } catch let err {
-            _bareKitLogger.error("BareIPC -> worker FAILED: \(err.localizedDescription, privacy: .public)")
-            throw Error.writeFailed(underlying: err)
+    func close() async {
+        let ownsClose = lock.withLock { () -> Bool in
+            guard !closed else { return false }
+            closed = true
+            return true
         }
-    }
+        guard ownsClose else {
+            await waitForCloseCompletion()
+            return
+        }
 
-    public func close() async {
-        lock.lock()
-        if closed { lock.unlock(); return }
-        closed = true
-        let cont = readContinuation
-        readContinuation = nil
-        lock.unlock()
-
-        cont?.finish()
+        inbound.finish(discardingBuffered: true)
         ipc.close()
         worklet.terminate()
+        let waiters: [CheckedContinuation<Void, Never>] = lock.withLock {
+            closeFinished = true
+            defer { closeWaiters.removeAll() }
+            return closeWaiters
+        }
+        for waiter in waiters { waiter.resume() }
+    }
+
+    private func waitForCloseCompletion() async {
+        await withCheckedContinuation { continuation in
+            let completed = lock.withLock { () -> Bool in
+                if closeFinished { return true }
+                closeWaiters.append(continuation)
+                return false
+            }
+            if completed { continuation.resume() }
+        }
     }
 }
 

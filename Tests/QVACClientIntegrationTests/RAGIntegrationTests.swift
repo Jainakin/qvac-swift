@@ -5,8 +5,8 @@
 //   → ragListWorkspaces → ragDeleteEmbeddings → ragCloseWorkspace
 //   → ragDeleteWorkspace → unloadModel
 //
-// Gated on `QVAC_RUN_RAG_TESTS=1` because they download a ~20MB embedding model.
-// Optional `HF_TOKEN` for HuggingFace gated models.
+// Gated on `QVAC_RUN_RAG_TESTS=1` because they download a 20,999,104-byte
+// public embedding model. The immutable revision and SHA-256 are verified first.
 
 import XCTest
 @testable import QVACClient
@@ -23,7 +23,7 @@ final class RAGIntegrationTests: XCTestCase {
 
     private static let nodeModulesDir: URL? = {
         if let p = ProcessInfo.processInfo.environment["QVAC_NODE_MODULES"] { return URL(fileURLWithPath: p) }
-        let suffix = "spike-js/node_modules"
+        let suffix = "tools/runtime/node_modules"
         var dir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         for _ in 0..<8 {
             let c = dir.appendingPathComponent(suffix)
@@ -34,28 +34,59 @@ final class RAGIntegrationTests: XCTestCase {
         return nil
     }()
 
-    private static let embeddingModelURL: String = {
-        ProcessInfo.processInfo.environment["QVAC_TEST_EMBEDDING_URL"]
-            ?? "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf"
-    }()
+    private var workerHome: URL!
 
     override func setUpWithError() throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["QVAC_RUN_RAG_TESTS"] == "1",
                           "set QVAC_RUN_RAG_TESTS=1 to opt into RAG live tests (requires downloading an embedding model)")
-        try XCTSkipUnless(Self.bareBin != nil)
-        try XCTSkipUnless(Self.nodeModulesDir != nil)
-        if Self.embeddingModelURL.contains("huggingface.co")
-            && ProcessInfo.processInfo.environment["HF_TOKEN"] == nil {
-            throw XCTSkip("HF model URL requires HF_TOKEN; or set QVAC_TEST_EMBEDDING_URL to a public source")
+        guard let bare = Self.bareBin, FileManager.default.isExecutableFile(atPath: bare.path) else {
+            throw IntegrationPrerequisiteError("QVAC_RUN_RAG_TESTS=1 but QVAC_BARE_BIN is missing or not executable")
         }
-        try? FileManager.default.removeItem(atPath: NSHomeDirectory() + "/.qvac/.worker.lock")
+        guard let modules = Self.nodeModulesDir, FileManager.default.fileExists(atPath: modules.path) else {
+            throw IntegrationPrerequisiteError("QVAC_RUN_RAG_TESTS=1 but QVAC_NODE_MODULES is missing")
+        }
+        try Self.requireSDK017(in: modules)
+        _ = try Self.fixture()
+        workerHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qvac-rag-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workerHome, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        if let workerHome { try? FileManager.default.removeItem(at: workerHome) }
+    }
+
+    private static func fixture() throws -> VerifiedModelFixture {
+        try VerifiedModelFixture.fromEnvironment(
+            default: .embeddingModelDefault,
+            urlKey: "QVAC_TEST_EMBEDDING_URL",
+            sha256Key: "QVAC_TEST_EMBEDDING_SHA256",
+            sizeKey: "QVAC_TEST_EMBEDDING_SIZE"
+        )
+    }
+
+    private static func requireSDK017(in modules: URL) throws {
+        let packageJSON = modules.appendingPathComponent("@qvac/sdk/package.json")
+        guard let data = try? Data(contentsOf: packageJSON),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["version"] as? String == "0.17.0" else {
+            throw IntegrationPrerequisiteError("QVAC_NODE_MODULES must contain exact @qvac/sdk 0.17.0 (run npm ci --prefix tools/runtime)")
+        }
     }
 
     private func makeClient() async throws -> QVACClient {
-        let cfg = try QVACClient.Configuration.macOS(
-            nodeModulesDir: Self.nodeModulesDir!, bareExecutable: Self.bareBin!, initTimeout: 30.0
+        let modules = Self.nodeModulesDir!
+        let cfg = QVACClient.Configuration.macOSSubprocess(UDSTransportConfiguration(
+            bareExecutable: Self.bareBin!,
+            workerScript: modules.appendingPathComponent("@qvac/sdk/dist/server/worker.js"),
+            workingDirectory: modules.deletingLastPathComponent(),
+            initTimeout: 30.0,
+            homeDir: workerHome.path
+        ))
+        return try await QVACClient(
+            configuration: cfg,
+            initHandshakeTimeout: .seconds(30)
         )
-        return try await QVACClient(configuration: cfg)
     }
 
     // MARK: - ragChunk (no model needed)
@@ -64,15 +95,18 @@ final class RAGIntegrationTests: XCTestCase {
     /// Quick sanity check of the rag pipeline + RagChunk shape decode.
     func test_ragChunk_returns_chunks_for_document() async throws {
         let client = try await makeClient()
-        defer { Task { await client.close() } }
-        let docs: [QVACClient.RagDocument] = [
-            QVACClient.RagDocument("The quick brown fox jumps over the lazy dog. This is a second sentence for chunking.")
+        addTeardownBlock { await client.close() }
+        let docs = [
+            "The quick brown fox jumps over the lazy dog. This is a second sentence for chunking."
         ]
-        let chunks = try await client.ragChunk(documents: docs)
+        let chunks = try await client.ragChunk(
+            documents: docs,
+            rpcOptions: .init(timeout: .seconds(120))
+        )
         XCTAssertGreaterThan(chunks.count, 0, "expected at least 1 chunk")
         for c in chunks {
             XCTAssertFalse(c.id.isEmpty)
-            XCTAssertFalse(c.text.isEmpty)
+            XCTAssertFalse(c.content.isEmpty)
         }
     }
 
@@ -80,48 +114,93 @@ final class RAGIntegrationTests: XCTestCase {
 
     func test_full_RAG_ingest_search_delete_workspace_cycle() async throws {
         let client = try await makeClient()
-        defer { Task { await client.close() } }
+        addTeardownBlock { await client.close() }
         let workspace = "qvac-swift-test-\(UUID().uuidString)"
+        let modelURL = try await Self.fixture().localURL()
 
         // 1. Load the embedding model.
-        let modelId = try await client.loadModel(
-            modelSrc: Self.embeddingModelURL,
-            modelType: "llamacpp-embedding"
+        let load = try await client.loadModel(
+            modelSrc: modelURL.path,
+            modelType: "llamacpp-embedding",
+            rpcOptions: .init(timeout: .seconds(600))
         )
+        let modelId = try await load.result.value
 
-        defer {
-            Task {
-                try? await client.ragDeleteWorkspace(workspace: workspace)
-                try? await client.unloadModel(modelId: modelId)
+        do {
+            // 2. Ingest 3 short documents.
+            let documents = [
+                "Apples are red fruit that grow on trees.",
+                "Pythons are large nonvenomous snakes.",
+                "Swift is a programming language by Apple.",
+            ]
+            let ingest = try await client.ragIngest(
+                modelId: modelId,
+                documents: documents,
+                workspace: workspace,
+                rpcOptions: .init(timeout: .seconds(120))
+            )
+            let ingestResult = try await ingest.result.value
+            XCTAssertGreaterThan(ingestResult.processed.count, 0)
+
+            // 3. Search for a programming-language query — should rank Swift first.
+            let results = try await client.ragSearch(
+                modelId: modelId,
+                query: "what programming language",
+                topK: 3,
+                n: 3,
+                workspace: workspace,
+                rpcOptions: .init(timeout: .seconds(120))
+            )
+            XCTAssertGreaterThan(results.count, 0)
+            XCTAssertTrue(results.first?.content.lowercased().contains("swift") ?? false,
+                          "expected first result to mention swift; got \(results.first?.content ?? "<nil>")")
+
+            // 4. List workspaces — should contain ours.
+            let workspaces = try await client.ragListWorkspaces(
+                rpcOptions: .init(timeout: .seconds(120))
+            )
+            XCTAssertTrue(workspaces.contains { $0.name == workspace })
+
+            // 5. Close/delete and unload are part of the required success path.
+            try await client.ragCloseWorkspace(
+                workspace: workspace,
+                deleteOnClose: true,
+                rpcOptions: .init(timeout: .seconds(10))
+            )
+            try await client.unloadModel(
+                modelId: modelId,
+                rpcOptions: .init(timeout: .seconds(10))
+            )
+        } catch let operationError {
+            do {
+                try await client.ragCloseWorkspace(
+                    workspace: workspace,
+                    deleteOnClose: true,
+                    rpcOptions: .init(timeout: .seconds(10))
+                )
+            } catch let closeError {
+                do {
+                    try await client.ragDeleteWorkspace(
+                        workspace: workspace,
+                        rpcOptions: .init(timeout: .seconds(10))
+                    )
+                } catch {
+                    XCTFail(
+                        "RAG failure cleanup could neither close/delete workspace "
+                        + "(close: \(closeError), delete: \(error))"
+                    )
+                }
             }
+            do {
+                try await client.unloadModel(
+                    modelId: modelId,
+                    rpcOptions: .init(timeout: .seconds(10))
+                )
+            } catch {
+                XCTFail("RAG failure cleanup could not unload model: \(error)")
+            }
+            throw operationError
         }
-
-        // 2. Ingest 3 short documents.
-        let documents: [QVACClient.RagDocument] = [
-            .init("Apples are red fruit that grow on trees."),
-            .init("Pythons are large nonvenomous snakes."),
-            .init("Swift is a programming language by Apple."),
-        ]
-        let ingestResult = try await client.ragIngest(
-            modelId: modelId, documents: documents, workspace: workspace
-        )
-        XCTAssertGreaterThan(ingestResult.processed.count, 0)
-
-        // 3. Search for a programming-language query — should rank Swift first.
-        let results = try await client.ragSearch(
-            modelId: modelId, query: "what programming language", topK: 3, workspace: workspace
-        )
-        XCTAssertGreaterThan(results.count, 0)
-        // Top result should mention Swift.
-        XCTAssertTrue(results.first?.text.lowercased().contains("swift") ?? false,
-                      "expected first result to mention swift; got \(results.first?.text ?? "<nil>")")
-
-        // 4. List workspaces — should contain ours.
-        let workspaces = try await client.ragListWorkspaces()
-        XCTAssertTrue(workspaces.contains { $0.name == workspace })
-
-        // 5. Close + delete.
-        try await client.ragCloseWorkspace(workspace: workspace, deleteOnClose: true)
     }
 }
 

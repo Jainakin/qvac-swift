@@ -21,7 +21,7 @@ import Foundation
 
 // MARK: - Message type tag (header position 1)
 
-public enum BareRPCMessageType: UInt64, Sendable {
+enum BareRPCMessageType: UInt64, Sendable {
     case request  = 1
     case response = 2
     case stream   = 3
@@ -33,22 +33,22 @@ public enum BareRPCMessageType: UInt64, Sendable {
 // Direction bits 0x100 / 0x200 distinguish the OUTGOING request-stream from the
 // INCOMING response-stream when a single message id has both.
 
-public struct BareRPCStreamFlags: OptionSet, Sendable, Hashable, CustomStringConvertible {
-    public let rawValue: UInt64
-    public init(rawValue: UInt64) { self.rawValue = rawValue }
+struct BareRPCStreamFlags: OptionSet, Sendable, Hashable, CustomStringConvertible {
+    let rawValue: UInt64
+    init(rawValue: UInt64) { self.rawValue = rawValue }
 
-    public static let open     = BareRPCStreamFlags(rawValue: 0x1)
-    public static let close    = BareRPCStreamFlags(rawValue: 0x2)
-    public static let pause    = BareRPCStreamFlags(rawValue: 0x4)
-    public static let resume   = BareRPCStreamFlags(rawValue: 0x8)
-    public static let data     = BareRPCStreamFlags(rawValue: 0x10)
-    public static let end      = BareRPCStreamFlags(rawValue: 0x20)
-    public static let destroy  = BareRPCStreamFlags(rawValue: 0x40)
-    public static let error    = BareRPCStreamFlags(rawValue: 0x80)
-    public static let request  = BareRPCStreamFlags(rawValue: 0x100)
-    public static let response = BareRPCStreamFlags(rawValue: 0x200)
+    static let open     = BareRPCStreamFlags(rawValue: 0x1)
+    static let close    = BareRPCStreamFlags(rawValue: 0x2)
+    static let pause    = BareRPCStreamFlags(rawValue: 0x4)
+    static let resume   = BareRPCStreamFlags(rawValue: 0x8)
+    static let data     = BareRPCStreamFlags(rawValue: 0x10)
+    static let end      = BareRPCStreamFlags(rawValue: 0x20)
+    static let destroy  = BareRPCStreamFlags(rawValue: 0x40)
+    static let error    = BareRPCStreamFlags(rawValue: 0x80)
+    static let request  = BareRPCStreamFlags(rawValue: 0x100)
+    static let response = BareRPCStreamFlags(rawValue: 0x200)
 
-    public var description: String {
+    var description: String {
         if rawValue == 0 { return "[]" }
         var parts: [String] = []
         if contains(.open)     { parts.append("OPEN") }
@@ -69,19 +69,19 @@ public struct BareRPCStreamFlags: OptionSet, Sendable, Hashable, CustomStringCon
 
 /// Wire-level error payload carried inside a `RESPONSE` or `STREAM(ERROR)` frame.
 /// Mirrors the JS `error = { message: utf8, code: utf8, errno: int }`.
-public struct BareRPCError: Error, Equatable, Sendable, CustomStringConvertible {
-    public let message: String
-    public let code: String
-    public let errno: Int64
-    public init(message: String, code: String, errno: Int64) {
+struct BareRPCError: Error, Equatable, Sendable, CustomStringConvertible {
+    let message: String
+    let code: String
+    let errno: Int64
+    init(message: String, code: String, errno: Int64) {
         self.message = message
         self.code = code
         self.errno = errno
     }
-    public var description: String { "\(code) \(message) (errno=\(errno))" }
+    var description: String { "\(code) \(message) (errno=\(errno))" }
 }
 
-public enum BareRPCCodecError: Error, Equatable, Sendable {
+enum BareRPCCodecError: Error, Equatable, Sendable {
     case truncated
     case unknownType(UInt64)
     /// The length prefix on an incoming frame exceeds `BareRPCFrameReader.maxFrameSize`.
@@ -91,12 +91,12 @@ public enum BareRPCCodecError: Error, Equatable, Sendable {
 
 // MARK: - Decoded frame
 
-public enum BareRPCFrame: Sendable, Equatable {
+enum BareRPCFrame: Sendable, Equatable {
     case request(id: UInt64, command: UInt64, stream: BareRPCStreamFlags, data: Data?)
     case response(id: UInt64, stream: BareRPCStreamFlags, payload: BareRPCResponsePayload)
     case stream(id: UInt64, flags: BareRPCStreamFlags, payload: BareRPCStreamPayload)
 
-    public var id: UInt64 {
+    var id: UInt64 {
         switch self {
         case .request(let id, _, _, _),
              .response(let id, _, _),
@@ -106,12 +106,12 @@ public enum BareRPCFrame: Sendable, Equatable {
     }
 }
 
-public enum BareRPCResponsePayload: Sendable, Equatable {
+enum BareRPCResponsePayload: Sendable, Equatable {
     case success(Data?)
     case failure(BareRPCError)
 }
 
-public enum BareRPCStreamPayload: Sendable, Equatable {
+enum BareRPCStreamPayload: Sendable, Equatable {
     /// `DATA` flag — chunk of bytes inside the stream.
     case data(Data)
     /// `ERROR` flag — error carried inline.
@@ -122,12 +122,12 @@ public enum BareRPCStreamPayload: Sendable, Equatable {
 
 // MARK: - Codec
 
-public enum BareRPCCodec {
+enum BareRPCCodec {
 
     // MARK: Encode
 
     /// Encode the body of a REQUEST (without the outer uint32 length prefix).
-    public static func encodeRequestBody(
+    static func encodeRequestBody(
         id: UInt64,
         command: UInt64,
         stream: BareRPCStreamFlags = [],
@@ -158,7 +158,7 @@ public enum BareRPCCodec {
     }
 
     /// Encode the body of a RESPONSE (without the outer uint32 length prefix).
-    public static func encodeResponseBody(
+    static func encodeResponseBody(
         id: UInt64,
         stream: BareRPCStreamFlags,
         payload: BareRPCResponsePayload
@@ -205,7 +205,7 @@ public enum BareRPCCodec {
     }
 
     /// Encode the body of a STREAM frame (without the outer uint32 length prefix).
-    public static func encodeStreamBody(
+    static func encodeStreamBody(
         id: UInt64,
         flags: BareRPCStreamFlags,
         payload: BareRPCStreamPayload = .control
@@ -245,27 +245,79 @@ public enum BareRPCCodec {
 
     // MARK: Frame wrappers (prepend uint32 LE length)
 
-    public static func encodeRequestFrame(
-        id: UInt64, command: UInt64, stream: BareRPCStreamFlags = [], data: Data?
-    ) -> Data {
-        return prefixWithLength(encodeRequestBody(id: id, command: command, stream: stream, data: data))
+    /// Every frame wrapper validates both the configured resource ceiling and the
+    /// protocol's UInt32 length field before narrowing or allocating the outer frame.
+    static func encodeRequestFrame(
+        id: UInt64,
+        command: UInt64,
+        stream: BareRPCStreamFlags = [],
+        data: Data?,
+        maximumBodyBytes: Int
+    ) throws -> Data {
+        if let data, data.count > maximumBodyBytes {
+            throw BareRPCInvalidArgument(
+                "outbound request payload is \(data.count) bytes; maximumWireMessageBytes is \(maximumBodyBytes)"
+            )
+        }
+        return try prefixWithLength(
+            encodeRequestBody(id: id, command: command, stream: stream, data: data),
+            maximumBodyBytes: maximumBodyBytes
+        )
     }
-    public static func encodeResponseFrame(
-        id: UInt64, stream: BareRPCStreamFlags, payload: BareRPCResponsePayload
-    ) -> Data {
-        return prefixWithLength(encodeResponseBody(id: id, stream: stream, payload: payload))
+
+    static func encodeStreamFrame(
+        id: UInt64,
+        flags: BareRPCStreamFlags,
+        payload: BareRPCStreamPayload = .control,
+        maximumBodyBytes: Int
+    ) throws -> Data {
+        if case .data(let data) = payload, data.count > maximumBodyBytes {
+            throw BareRPCInvalidArgument(
+                "outbound stream chunk is \(data.count) bytes; maximumWireMessageBytes is \(maximumBodyBytes)"
+            )
+        }
+        return try prefixWithLength(
+            encodeStreamBody(id: id, flags: flags, payload: payload),
+            maximumBodyBytes: maximumBodyBytes
+        )
     }
-    public static func encodeStreamFrame(
-        id: UInt64, flags: BareRPCStreamFlags, payload: BareRPCStreamPayload = .control
-    ) -> Data {
-        return prefixWithLength(encodeStreamBody(id: id, flags: flags, payload: payload))
+
+    static func encodeResponseFrame(
+        id: UInt64,
+        stream: BareRPCStreamFlags,
+        payload: BareRPCResponsePayload,
+        maximumBodyBytes: Int
+    ) throws -> Data {
+        return try prefixWithLength(
+            encodeResponseBody(id: id, stream: stream, payload: payload),
+            maximumBodyBytes: maximumBodyBytes
+        )
     }
 
     // MARK: Decode
 
     /// Decode a complete frame body (everything after the uint32 LE length prefix).
-    public static func decodeFrameBody(_ body: Data) throws -> BareRPCFrame {
+    static func decodeFrameBody(_ body: Data) throws -> BareRPCFrame {
         var state = EncoderState(buffer: body)
+        return try decodeFrame(from: &state)
+    }
+
+    /// Decode a body already resident in a larger receive buffer. Keeping the storage
+    /// copy-on-write avoids duplicating an entire 0.17 video frame before extracting its
+    /// payload.
+    static func decodeFrameBody(_ storage: Data, in range: Range<Int>) throws -> BareRPCFrame {
+        guard range.lowerBound >= storage.startIndex,
+              range.upperBound <= storage.endIndex,
+              range.lowerBound <= range.upperBound else {
+            throw BareRPCCodecError.truncated
+        }
+        var state = EncoderState(buffer: storage)
+        state.start = range.lowerBound
+        state.end = range.upperBound
+        return try decodeFrame(from: &state)
+    }
+
+    private static func decodeFrame(from state: inout EncoderState) throws -> BareRPCFrame {
         let type = try c.uint.decode(&state)
         let id = try c.uint.decode(&state)
         switch type {
@@ -310,31 +362,52 @@ public enum BareRPCCodec {
 
     // MARK: Helpers
 
-    private static func prefixWithLength(_ body: Data) -> Data {
+    private static func prefixWithValidatedLength(_ body: Data) -> Data {
         var out = Data(count: 4 + body.count)
         let bodyLen = UInt32(body.count)
         for i in 0..<4 { out[i] = UInt8((bodyLen >> (8 * i)) & 0xff) }
         body.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
             out.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
-                let s = src.bindMemory(to: UInt8.self)
-                for i in 0..<body.count { dst[4 + i] = s[i] }
+                guard body.count > 0, let source = src.baseAddress, let destination = dst.baseAddress else {
+                    return
+                }
+                destination.advanced(by: 4).copyMemory(from: source, byteCount: body.count)
             }
         }
         return out
     }
 
+    private static func prefixWithLength(_ body: Data, maximumBodyBytes: Int) throws -> Data {
+        guard body.count <= maximumBodyBytes else {
+            throw BareRPCInvalidArgument(
+                "outbound bare-rpc frame is \(body.count) bytes; maximumWireMessageBytes is \(maximumBodyBytes)"
+            )
+        }
+        guard body.count <= Int(UInt32.max) else {
+            throw BareRPCInvalidArgument("outbound bare-rpc frame exceeds the UInt32 wire capacity")
+        }
+        return prefixWithValidatedLength(body)
+    }
+
     private static func appendPayload(into state: inout EncoderState, payload: Data) {
         payload.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
             state.buffer.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
-                let s = src.bindMemory(to: UInt8.self)
-                for i in 0..<payload.count { dst[state.start + i] = s[i] }
+                guard payload.count > 0,
+                      let source = src.baseAddress,
+                      let destination = dst.baseAddress else { return }
+                destination.advanced(by: state.start).copyMemory(
+                    from: source,
+                    byteCount: payload.count
+                )
             }
         }
         state.start += payload.count
     }
 
     private static func readDataField(_ state: inout EncoderState) throws -> Data? {
-        let len = Int(try c.uint.decode(&state))
+        let encodedLength = try c.uint.decode(&state)
+        guard encodedLength <= UInt64(Int.max) else { throw BareRPCCodecError.truncated }
+        let len = Int(encodedLength)
         if len == 0 { return nil }
         guard state.end - state.start >= len else { throw BareRPCCodecError.truncated }
         let d = state.buffer.subdata(in: state.start..<(state.start + len))
@@ -371,20 +444,30 @@ public enum BareRPCCodec {
 /// Uses an explicit `consumed` offset instead of `Data.removeFirst()` because Data's
 /// subscript can be index-absolute after removeFirst, which silently crashes on
 /// multi-frame inputs. The buffer compacts when consumed > 64KB.
-public final class BareRPCFrameReader {
+final class BareRPCFrameReader {
     /// Upper bound on a single frame's declared length (the 4-byte length prefix on the
-    /// wire). Configurable per-instance for tests; defaults to 64 MiB which comfortably
-    /// holds the largest legitimate QVAC payload (a fully-decoded model file would be
-    /// downloaded out-of-band by the worker, not framed over this RPC). Anything bigger
-    /// is treated as a hostile or malformed peer and rejected as
+    /// wire). Configurable per-instance and shared with the high-level NDJSON ceiling.
+    /// The 256 MiB default accommodates 0.17 video/upscale responses while retaining a
+    /// finite memory bound. Anything bigger is treated as a hostile or malformed peer and rejected as
     /// `BareRPCCodecError.frameTooLarge`.
-    public static let defaultMaxFrameSize: Int = 64 * 1024 * 1024
+    static let defaultMaxFrameSize: Int = 256 * 1024 * 1024
 
-    public init(maxFrameSize: Int = BareRPCFrameReader.defaultMaxFrameSize) {
+    convenience init() {
+        self.init(validatedMaxFrameSize: Self.defaultMaxFrameSize)
+    }
+
+    convenience init(maxFrameSize: Int) throws {
+        guard maxFrameSize > 0, maxFrameSize <= Int(UInt32.max) else {
+            throw BareRPCInvalidArgument("maxFrameSize must be between 1 and UInt32.max")
+        }
+        self.init(validatedMaxFrameSize: maxFrameSize)
+    }
+
+    init(validatedMaxFrameSize maxFrameSize: Int) {
         self.maxFrameSize = maxFrameSize
     }
 
-    public let maxFrameSize: Int
+    let maxFrameSize: Int
 
     private enum State { case awaitingLength; case awaitingBody(needed: Int) }
 
@@ -392,27 +475,41 @@ public final class BareRPCFrameReader {
     private var consumed = 0
     private var state: State = .awaitingLength
     private var pending: [BareRPCFrame] = []
+    private var pendingIndex = 0
     private static let compactThreshold = 64 * 1024
 
     /// Feed bytes from the wire. Throws on protocol-level decode failures (truncation
     /// is NOT an error — the reader simply waits for more bytes).
-    public func append(_ data: Data) throws {
+    func append(_ data: Data) throws {
         if consumed > Self.compactThreshold {
             buffer = Data(buffer.suffix(from: buffer.startIndex + consumed))
             consumed = 0
         }
         buffer.append(data)
         try drain()
+        compactConsumedStorage()
     }
 
     /// Pull the next fully-decoded frame, or `nil` if none ready yet.
-    public func next() -> BareRPCFrame? {
-        guard !pending.isEmpty else { return nil }
-        return pending.removeFirst()
+    func next() -> BareRPCFrame? {
+        guard pendingIndex < pending.count else {
+            if !pending.isEmpty {
+                pending.removeAll(keepingCapacity: true)
+                pendingIndex = 0
+            }
+            return nil
+        }
+        let frame = pending[pendingIndex]
+        pendingIndex += 1
+        if pendingIndex >= 256, pendingIndex >= pending.count / 2 {
+            pending.removeFirst(pendingIndex)
+            pendingIndex = 0
+        }
+        return frame
     }
 
     /// Number of bytes buffered but not yet decoded (after consumed bytes).
-    public var bufferedBytes: Int { buffer.count - consumed }
+    var bufferedBytes: Int { buffer.count - consumed }
 
     private func drain() throws {
         while true {
@@ -428,9 +525,12 @@ public final class BareRPCFrameReader {
                 state = .awaitingBody(needed: Int(n))
             case .awaitingBody(let needed):
                 guard remaining >= needed else { return }
-                let body = sliceBytes(needed)
+                let start = buffer.startIndex + consumed
+                let frame = try BareRPCCodec.decodeFrameBody(
+                    buffer,
+                    in: start..<(start + needed)
+                )
                 consumed += needed
-                let frame = try BareRPCCodec.decodeFrameBody(body)
                 pending.append(frame)
                 state = .awaitingLength
             }
@@ -441,8 +541,17 @@ public final class BareRPCFrameReader {
     private func byte(at relative: Int) -> UInt8 {
         return buffer[buffer.startIndex + consumed + relative]
     }
-    private func sliceBytes(_ length: Int) -> Data {
-        let start = buffer.startIndex + consumed
-        return buffer.subdata(in: start..<(start + length))
+
+    private func compactConsumedStorage() {
+        guard consumed > 0 else { return }
+        if consumed == buffer.count {
+            // A single large completed media frame must not leave its full receive
+            // allocation retained until an unrelated future append.
+            buffer.removeAll(keepingCapacity: false)
+            consumed = 0
+        } else if consumed > Self.compactThreshold {
+            buffer = Data(buffer.suffix(from: buffer.startIndex + consumed))
+            consumed = 0
+        }
     }
 }

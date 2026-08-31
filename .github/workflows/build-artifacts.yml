@@ -1,0 +1,133 @@
+name: Build Immutable SDK 0.17 Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Monotonic artifact revision (creates artifacts-sdk-0.17.0-rN)
+        required: true
+        type: number
+      publish:
+        description: Publish a new immutable GitHub artifact release
+        required: true
+        default: false
+        type: boolean
+      license_reviewed:
+        description: Confirm legal review of notices and supplements before publication
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.22.0
+          cache: npm
+          cache-dependency-path: tools/runtime/package-lock.json
+      - name: Require main and a new artifact tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Immutable artifacts may only be built from main"
+            exit 1
+          fi
+          ARTIFACT_TAG="artifacts-sdk-0.17.0-r${{ inputs.revision }}"
+          echo "ARTIFACT_TAG=$ARTIFACT_TAG" >> "$GITHUB_ENV"
+          REMOTE_TAG="$(git ls-remote --tags origin "refs/tags/$ARTIFACT_TAG" "refs/tags/$ARTIFACT_TAG^{}")"
+          if [ -n "$REMOTE_TAG" ]; then
+            echo "::error::$ARTIFACT_TAG already exists as a Git tag and must never be replaced"
+            exit 1
+          fi
+          if gh release view "$ARTIFACT_TAG" >/dev/null 2>&1; then
+            echo "::error::$ARTIFACT_TAG already exists as a GitHub release and must never be replaced"
+            exit 1
+          fi
+      - name: Reproduce portable worker twice
+        run: |
+          tools/runtime/test-bundle-reproducibility.sh
+          cmp tools/runtime/.build/worker.repro-a.bundle \
+            Sources/QVACClient/Resources/worker.mobile.bundle
+      - name: Link exact native graph and compute closure
+        run: |
+          tools/runtime/link-ios-artifacts.sh
+          node tools/release/compute-manifest.mjs link-set \
+            tools/runtime/.build/artifacts \
+            tools/runtime/.build/worker.repro-a.bundle \
+            tools/runtime/.build/link-set.json
+      - name: Verify exact third-party attribution
+        run: node tools/release/generate-third-party-notices.mjs --check
+      - name: Package deterministic assets and manifest
+        run: |
+          tools/runtime/test-path-safety.sh
+          node tools/release/test-archive-reproducibility.mjs
+          node tools/release/package-artifacts.mjs \
+            tools/runtime/.build/artifacts \
+            tools/runtime/.build/link-set.json \
+            tools/runtime/.build/worker.repro-a.bundle \
+            tools/runtime/.build/release-assets
+          node tools/release/compute-manifest.mjs release \
+            tools/runtime/.build/link-set.json \
+            tools/runtime/.build/worker.repro-a.bundle \
+            tools/runtime/.build/release-assets \
+            tools/runtime/.build/release-assets/artifact-manifest.json \
+            --artifact-tag "$ARTIFACT_TAG" \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA"
+          node tools/release/verify-release.mjs \
+            tools/runtime/.build/release-assets/artifact-manifest.json \
+            --assets-dir tools/runtime/.build/release-assets
+      - name: Require reviewed attribution before publication
+        if: inputs.publish
+        run: |
+          if [ "${{ inputs.license_reviewed }}" != "true" ]; then
+            echo "::error::Binary publication requires maintainer/legal review of THIRD_PARTY_NOTICES.md, including pinned supplements, and license_reviewed=true"
+            exit 1
+          fi
+      - name: Require the final URL manifest before artifact publication
+        if: inputs.publish
+        run: |
+          node tools/release/verify-release.mjs \
+            tools/runtime/.build/release-assets/artifact-manifest.json \
+            --source-commit "$GITHUB_SHA" \
+            --assets-dir tools/runtime/.build/release-assets \
+            --package Package.swift \
+            --bundle Sources/QVACClient/Resources/worker.mobile.bundle
+          echo "Final publication gate: canonical Package.swift is URL-based and bound to $GITHUB_SHA"
+      - name: Upload immutable candidate evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.ARTIFACT_TAG }}
+          path: tools/runtime/.build/release-assets/
+          if-no-files-found: error
+      - name: Publish new artifact release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$ARTIFACT_TAG" tools/runtime/.build/release-assets/* \
+            --target "$GITHUB_SHA" \
+            --title "$ARTIFACT_TAG" \
+            --notes "Immutable iOS artifacts for exact @qvac/sdk 0.17.0. Provenance, checksums, and THIRD_PARTY_NOTICES.md are bound by artifact-manifest.json."
+          MANIFEST_SOURCE="$(node -p 'require("./tools/runtime/.build/release-assets/artifact-manifest.json").sourceCommit')"
+          REMOTE_REFS="$(git ls-remote --tags origin "refs/tags/$ARTIFACT_TAG" "refs/tags/$ARTIFACT_TAG^{}")"
+          TAG_TARGET="$(printf '%s\n' "$REMOTE_REFS" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')"
+          if [ -z "$TAG_TARGET" ]; then
+            TAG_TARGET="$(printf '%s\n' "$REMOTE_REFS" | awk 'NF == 2 { print $1; exit }')"
+          fi
+          RELEASE_TARGET="$(gh release view "$ARTIFACT_TAG" --json targetCommitish --jq .targetCommitish)"
+          if [ "$MANIFEST_SOURCE" != "$GITHUB_SHA" ] || [ "$TAG_TARGET" != "$MANIFEST_SOURCE" ] || [ "$RELEASE_TARGET" != "$MANIFEST_SOURCE" ]; then
+            echo "::error::Published release/tag target does not equal manifest.sourceCommit"
+            echo "manifest=$MANIFEST_SOURCE tag=$TAG_TARGET release=$RELEASE_TARGET"
+            exit 1
+          fi

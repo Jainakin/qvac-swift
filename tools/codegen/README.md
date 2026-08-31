@@ -1,97 +1,86 @@
-# QVAC Swift Codegen
+# QVAC Swift code generation
 
-This directory contains the **Node-side** code generator that produces every file under
-`Sources/QVACClient/Generated/`. The Swift package depends on the generator's output, not on
-the generator itself — Swift consumers don't need Node installed.
+Code generation is locked to the exact published QVAC SDK 0.17.0 release. Swift
+consumers use only the checked-in generated files; Node and the upstream checkout
+are development/CI inputs.
 
-## What it generates
+## Immutable inputs
 
-| Output | From | Generator |
-|---|---|---|
-| `Sources/QVACClient/Generated/QVACErrorCodes.generated.swift` | `packages/sdk/schemas/sdk-errors-{client,server}.ts` | `generate-errors.mjs` |
-| `Sources/QVACClient/Generated/QVACTypes.generated.swift` | `packages/sdk/schemas/common.ts` (request + response Zod unions) | `generate-types.mjs` |
+`tools/provenance/qvac-sdk.lock.json` independently identifies:
 
-The error generator extracts integer codes via regex (the upstream format is line-stable per
-QVAC's lint config). The type generator imports the *compiled* JS that ships in `@qvac/sdk`'s
-npm tarball, calls `z.toJSONSchema()` (Zod v4) with the options validated in Spike-A
-(see `docs/spike-validations.md`), then walks the resulting JSON Schema tree to emit Swift
-`Codable` structs for each discriminator + a discriminated-union enum (`QVACRequest`,
-`QVACResponse`).
+- authoritative source commit `e8b440665a053a9efe852f04c3601da44f0d55d8`;
+- the `@qvac/sdk@0.17.0` npm tarball SRI and shasum; and
+- SHA-256 values for every `packages/sdk/contract/*.json` input.
 
-## Running
+The current `sdk-v0.17.0` tag resolves to the later `3176cca…` commit, whose
+contract contains post-publication schema changes. It is recorded as a
+non-authoritative tag and rejected by provenance checks; there is no assertion
+that the tag was moved.
 
-```bash
-./run.sh
-```
+`bootstrap.sh` installs `package-lock.json` with `npm ci`, materializes the exact
+source commit in the tool-owned `.build/qvac-sdk`, verifies every locked input,
+and independently reconstructs the representable request/response schemas from
+the published `dist/schemas/common.js` with exact Zod 4.4.3. It also compares the
+published method-shape and error-code maps. Progress conditions, constants, model
+type maps, and model metadata are source-only and explicitly protected by their
+input hashes rather than falsely claimed as npm exports. A caller-set
+`QVAC_UPSTREAM_DIR` is read-only: its origin, HEAD and hashes must already match,
+and bootstrap never fetches, checks out or changes it. Tool-owned checkout paths
+reject symlink components before any Git mutation.
 
-`run.sh` `npm install`s once on a clean checkout, then runs both generators. Total wall-clock
-runtime is well under the grant's `KR-3: < 30s` budget (currently ~2s on M1 Mac).
+## Outputs
 
-Override the source-of-truth locations via env:
-
-```bash
-QVAC_SCHEMAS_DIR=/path/to/sdk/schemas \
-QVAC_COMMON_JS=/path/to/sdk/dist/schemas/common.js \
-./run.sh
-```
-
-## Freshness check (`AC-11`, `KR-4`)
-
-```bash
-./run.sh && git diff --exit-code Sources/QVACClient/Generated/
-```
-
-Exits non-zero if generated output drifts from checked-in. CI runs this on every PR —
-if a contributor edits a generated file by hand, this catches it.
-
-## Overrides (`overrides.json`)
-
-The overrides file is the **only** place where per-API customization lives. It is *configuration*,
-not Swift code — re-running `run.sh` still produces zero diff against the checked-in Swift
-sources, which satisfies AC-11.
-
-Currently overrides only strip "callback-shaped" fields (`onProgress`, `logger`) that the JS
-client carries in its function-call surface but never sends on the wire. The Swift client's
-public API replaces these with `AsyncSequence`-based progress streams (M2 work — wraps the
-generated low-level types).
-
-| Key | Effect |
+| Generated Swift file | Pinned source input |
 |---|---|
-| `omitFields["request/loadModel"]` | Strip `onProgress`, `logger` from the generated `LoadModelRequest` struct. |
-| `omitFields["request/downloadAsset"]` | Same, for `DownloadAssetRequest`. |
-| `omitFields["request/rag"]` | Same, for `RagRequest`. |
-| `omitFields["request/finetune"]` | Same, for `FinetuneRequest`. |
+| `QVACErrorCodes.generated.swift` | `contract/error-codes.json` (all 136 codes) |
+| `QVACTypes.generated.swift` | `contract/schema.json` |
+| `QVACModelTypeContract.generated.swift` | `contract/model-type-maps.json` |
+| `QVACSDKContract.generated.swift` | `contract/manifest.json` + `contract/schema.json` |
+| `QVACGeneratedRoundTripTests.generated.swift` | all concrete request/response leaves in `contract/schema.json` |
+| `QVACModelTypeContractTests.generated.swift` | all three maps in `contract/model-type-maps.json` |
 
-Wildcard `omitFields["*"]` applies across all generated structs.
+The API generator emits the full immutable method inventory, guarded generic
+routing by call shape, exact conditional-progress routing, and one collision-safe
+typed wire signature per method. Adding a method to a future pinned manifest
+mechanically adds a callable Swift signature without hand-editing Swift routing.
+Mapped public streams use a pull-driven adapter with no eager task or second
+element queue, preserving the byte-bounded transport's backpressure and consumer
+cancellation.
 
-## Why this approach (and why not others)
+Concrete request/response types own immutable literal discriminators. Their
+initializers do not accept `type`, direct decoding validates the literal, and the
+pinned unions reject unknown discriminators rather than hiding contract drift.
+The generated XCTest constructs, encodes, and decodes all 39 request and 43
+response leaves, both directly and through their strict unions; the generator
+verifier also proves every initializer assigns every stored property.
 
-We considered three approaches; documented at length in `docs/spike-validations.md` (Spike-A).
-Tl;dr:
+The model-type generator emits the exact 0.17 alias-to-canonical table used by
+`loadModel`, plus the source contract's engine/addon and legacy maps for complete
+drift evidence. The normalizer canonicalizes only built-in aliases and preserves
+canonical or custom plugin identifiers, matching the published SDK behavior.
 
-1. **Hand-write the wire types.** Rejected: too much surface (30 + 34 = 64 leaf types, plus their
-   nested object shapes). Drift inevitable.
-2. **Parse the TypeScript with `swc` / `tsc`.** Rejected: TS AST is unstable across versions
-   and we'd be re-implementing TS's type system. Brittle.
-3. **Use Zod's `toJSONSchema` and walk the JSON Schema (chosen).** Stable Zod-v4 surface, output
-   is plain-Schema, walk is straightforward. Validated end-to-end in Spike 2.
+`overrides.json` is a narrow wire-only escape hatch. The 0.17 source exporter
+retains `rag.onProgress`, a JavaScript callback that cannot cross JSON; that field
+is explicitly omitted. Production generators never import today's npm Zod build.
+The npm parity gate imports only the published schemas/maps and does not trust or
+invoke npm's contract exporter or `dist/contract` files.
 
-We considered `apple/swift-openapi-generator` to do the JSON-Schema → Swift step (and may
-adopt it in v0.2), but rolling our own emitter gives us tight control over the discriminated-
-union shape and lets us trivially apply the overrides registry. The current emitter is ~400
-LOC of JS.
+## Run and verify
 
-## Updating against a newer `@qvac/sdk`
+Use Node `22.22.0` (also recorded in `.node-version`):
 
 ```bash
-npm --prefix ../../spike-js install @qvac/sdk@latest
-./run.sh
-swift test            # confirm everything still round-trips
-git diff Sources/QVACClient/Generated/    # review what changed
+./tools/codegen/run.sh
+git diff --exit-code -- Sources/QVACClient/Generated
+git diff --exit-code -- 'Tests/QVACClientUnitTests/*.generated.swift'
 ```
 
-If a new discriminator type appears in the JS client, the generator picks it up automatically:
-both `QVACRequest` / `QVACResponse` enums grow a case, plus a new struct. No Swift edits.
+`QVAC_ALLOW_NODE_VERSION_MISMATCH=1` is available only for local diagnostics; CI
+and release workflows require the exact Node version. `test-bootstrap-safety.sh`
+is the regression check for caller-owned checkout safety.
 
-If a new field shape would require an override (a transform that maps to `JSONValue`), add an
-entry to `overrides.json` and re-run.
+Updating to another SDK is an explicit provenance change: select the published
+release commit and npm tarball independently, update every locked contract hash,
+regenerate the npm locks, pass semantic parity, review generated API changes, and
+run the complete Swift and live-worker suites. Never substitute `latest` or a tag
+name for these inputs.

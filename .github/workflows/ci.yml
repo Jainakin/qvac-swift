@@ -6,317 +6,297 @@ on:
   pull_request:
     branches: [main]
 
-# Cancel in-progress runs on the same branch when a new commit lands.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  QVAC_NODE_VERSION: 22.22.0
+
 jobs:
-  # ----------------------------------------------------------------------------
-  # Unit tests on macOS arm64. No Bare runtime needed.
-  # ----------------------------------------------------------------------------
-  unit-macos:
-    name: Unit · macOS-14 arm64
+  codegen:
+    name: Pinned contract, codegen freshness, and <30s generation
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - name: Show toolchain
-        run: |
-          swift --version
-          xcodebuild -version
-      - name: Build (debug)
-        run: swift build
-      - name: Unit tests
-        run: swift test --filter QVACClientUnitTests
-
-  # ----------------------------------------------------------------------------
-  # Codegen freshness — re-run generators, fail if any drift vs. checked-in output.
-  # Satisfies AC-11 (idempotent codegen) and KR-3 (<30s budget).
-  # ----------------------------------------------------------------------------
-  codegen-freshness:
-    name: Codegen freshness check · AC-11
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '22'
-      - name: Sparse-clone @qvac/sdk schemas (for generate-errors.mjs)
-        # generate-errors.mjs reads the upstream TypeScript files directly. The
-        # qvac-sparse/ dir is gitignored (it's a separate clone of tetherto/qvac).
-        # Recreate it here just deep enough to read packages/sdk/schemas/*.ts.
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/codegen/package-lock.json
+      - name: Bootstrap exact source and npm inputs
+        run: tools/codegen/bootstrap.sh
+      - name: Generate from immutable contract and enforce KR-3
         run: |
-          git clone --depth 1 --filter=blob:none --sparse https://github.com/tetherto/qvac.git qvac-sparse
-          cd qvac-sparse
-          git sparse-checkout set packages/sdk/schemas
-      - name: Install JS deps for type generator
+          SECONDS=0
+          tools/codegen/run.sh --generate-only
+          ELAPSED=$SECONDS
+          echo "Pinned generation time: ${ELAPSED}s"
+          if [ "$ELAPSED" -ge 30 ]; then
+            echo "::error::Code generation took ${ELAPSED}s; grant limit is <30s after bootstrap"
+            exit 1
+          fi
+      - name: Verify generated sources and tests are fresh
         run: |
-          (cd tools/codegen && npm install --no-fund --no-audit)
-          # generate-types.mjs needs the *built* @qvac/sdk JS. spike-js/ is gitignored
-          # — bootstrap a package.json on the fly and pull only @qvac/sdk into it.
-          mkdir -p spike-js
-          cd spike-js
-          if [ ! -f package.json ]; then npm init -y >/dev/null; fi
-          npm install --legacy-peer-deps --no-fund --no-audit @qvac/sdk
-      - name: Re-run codegen
-        run: tools/codegen/run.sh
-      - name: Verify no drift
-        run: |
-          git diff --exit-code Sources/QVACClient/Generated/ \
-            || (echo "::error::Generated files drift from checked-in. Run tools/codegen/run.sh and commit." && exit 1)
+          CHANGES="$(git status --porcelain -- \
+            Sources/QVACClient/Generated \
+            'Tests/QVACClientUnitTests/*.generated.swift')"
+          if [ -n "$CHANGES" ]; then
+            echo "$CHANGES"
+            git diff -- Sources/QVACClient/Generated \
+              'Tests/QVACClientUnitTests/*.generated.swift'
+            exit 1
+          fi
+          git diff --check
+      - name: Bootstrap safety regression
+        run: tools/codegen/test-bootstrap-safety.sh
 
-  # ----------------------------------------------------------------------------
-  # Live integration tests — spawn a real Bare worker on macOS, run against the
-  # currently installed @qvac/sdk.
-  # ----------------------------------------------------------------------------
-  integration-macos:
-    name: Integration · macOS-14 arm64 · live Bare worker
+  runtime-artifact:
+    name: Exact 0.17 portable worker reproducibility
     runs-on: macos-14
-    needs: [unit-macos]
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '22'
-      - name: Install Bare runtime + @qvac/sdk
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/runtime/package-lock.json
+      - name: Build twice from distinct roots
+        run: tools/runtime/test-bundle-reproducibility.sh
+      - name: Require committed worker to be the reproduced artifact
         run: |
-          npm install -g bare-runtime
-          mkdir -p spike-js
-          cd spike-js
-          npm init -y >/dev/null
-          npm install --legacy-peer-deps \
-            @qvac/sdk \
-            tar-stream hyperdrive hyperdb hyperswarm corestore pear-pipe llm-splitter \
-            bare-net bare-rpc bare-buffer bare-fs bare-os bare-path bare-process \
-            bare-stream bare-abort-controller bare-crypto bare-dns bare-fetch \
-            bare-http1 bare-https bare-link bare-runtime bare-subprocess bare-zlib \
-            compact-encoding events fast-safe-stringify which-runtime \
-            @modelcontextprotocol/sdk
-      - name: Locate bare binary + node_modules
+          cmp tools/runtime/.build/worker.repro-a.bundle \
+            Sources/QVACClient/Resources/worker.mobile.bundle
+          node tools/release/verify-bundle-provenance.mjs \
+            Sources/QVACClient/Resources/worker.mobile.bundle
+          node tools/release/generate-third-party-notices.mjs --check
+      - name: Destructive path and archive determinism regressions
         run: |
-          which bare
-          bare --version
-          echo "QVAC_BARE_BIN=$(which bare)" >> $GITHUB_ENV
-          echo "QVAC_WORKER_SCRIPT=$(pwd)/spike-js/node_modules/@qvac/sdk/dist/server/worker.js" >> $GITHUB_ENV
-          echo "QVAC_NODE_MODULES=$(pwd)/spike-js/node_modules" >> $GITHUB_ENV
-      - name: Integration tests (live worker, no model)
-        env:
-          QVAC_BARE_BIN: ${{ env.QVAC_BARE_BIN }}
-          QVAC_WORKER_SCRIPT: ${{ env.QVAC_WORKER_SCRIPT }}
-          QVAC_NODE_MODULES: ${{ env.QVAC_NODE_MODULES }}
-        # Runs LiveWorkerIntegrationTests + QVACClientIntegrationTests. RealModel +
-        # RAG suites are opt-in — see the two jobs below.
-        run: swift test --filter QVACClientIntegrationTests
+          tools/runtime/test-path-safety.sh
+          node tools/release/test-archive-reproducibility.mjs
+          node tools/release/test-release-source-binding.mjs
+          tools/ci/run-required-suite.sh --self-test
+          node tools/ci/package-manifest-mode.mjs --self-test
+          node tools/release/generate-third-party-notices.mjs --self-test
 
-  # ----------------------------------------------------------------------------
-  # Real-model integration — downloads a tiny public model and exercises the full
-  # load → completion → cancel → unload cycle. Validates AC-4, AC-6, AC-7 at
-  # runtime against a live worker.
-  # ----------------------------------------------------------------------------
-  integration-macos-real-model:
-    name: Integration · macOS-14 · live worker + tiny model
+  unit:
+    name: Unit tests · macOS arm64
     runs-on: macos-14
-    needs: [unit-macos]
-    timeout-minutes: 25
+    needs: [codegen]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '22'
-      - name: Install Bare runtime + @qvac/sdk + llamacpp addon
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/runtime/package-lock.json
+      - name: Materialize exact local development binary graph
+        run: tools/runtime/link-ios-artifacts.sh
+      - name: Verify exact development manifest freshness
         run: |
-          npm install -g bare-runtime
-          mkdir -p spike-js
-          cd spike-js
-          npm init -y >/dev/null
-          npm install --legacy-peer-deps \
-            @qvac/sdk @qvac/llm-llamacpp \
-            tar-stream hyperdrive hyperdb hyperswarm corestore pear-pipe llm-splitter \
-            bare-net bare-rpc bare-buffer bare-fs bare-os bare-path bare-process \
-            bare-stream bare-abort-controller bare-crypto bare-dns bare-fetch \
-            bare-http1 bare-https bare-link bare-runtime bare-subprocess bare-zlib \
-            compact-encoding events fast-safe-stringify which-runtime \
-            @modelcontextprotocol/sdk
-      - name: Configure env
+          node tools/release/compute-manifest.mjs development \
+            tools/runtime/.build/artifacts \
+            Sources/QVACClient/Resources/worker.mobile.bundle \
+            "$RUNNER_TEMP/artifacts.development.json"
+          cmp "$RUNNER_TEMP/artifacts.development.json" \
+            tools/release/artifacts.development.json
+          node tools/release/generate-package-manifest.mjs \
+            "$RUNNER_TEMP/artifacts.development.json" "$RUNNER_TEMP/Package.swift"
+          cmp "$RUNNER_TEMP/Package.swift" Package.swift.dev
+          node tools/ci/package-manifest-mode.mjs --activate-development
+      - name: Build and test
         run: |
-          echo "QVAC_BARE_BIN=$(which bare)" >> $GITHUB_ENV
-          echo "QVAC_NODE_MODULES=$(pwd)/spike-js/node_modules" >> $GITHUB_ENV
-      - name: Real-model tests
-        env:
-          QVAC_BARE_BIN: ${{ env.QVAC_BARE_BIN }}
-          QVAC_NODE_MODULES: ${{ env.QVAC_NODE_MODULES }}
-          QVAC_RUN_REAL_MODEL_TESTS: "1"
-          # Public 135M-parameter GGUF (~92 MB), no HF auth required.
-          QVAC_TEST_MODEL_URL: "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct-GGUF/resolve/main/smollm2-135m-instruct-q4_k_m.gguf"
-          QVAC_TEST_MODEL_TYPE: "llamacpp-completion"
-        run: swift test --filter RealModelIntegrationTests
+          swift package dump-package >/dev/null
+          swift build -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
+          swift test --filter QVACClientUnitTests
 
-  # ----------------------------------------------------------------------------
-  # RAG integration — exercises ingest/search/delete with a tiny embedding model.
-  # ----------------------------------------------------------------------------
-  integration-macos-rag:
-    name: Integration · macOS-14 · live RAG
+  documentation:
+    name: DocC · warnings are errors
     runs-on: macos-14
-    needs: [unit-macos]
-    timeout-minutes: 25
+    needs: [unit]
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '22'
-      - name: Install Bare runtime + @qvac/sdk + embed-llamacpp addon
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/runtime/package-lock.json
+      - name: Materialize exact local development binary graph
         run: |
-          npm install -g bare-runtime
-          mkdir -p spike-js
-          cd spike-js
-          npm init -y >/dev/null
-          npm install --legacy-peer-deps \
-            @qvac/sdk @qvac/embed-llamacpp \
-            tar-stream hyperdrive hyperdb hyperswarm corestore pear-pipe llm-splitter \
-            bare-net bare-rpc bare-buffer bare-fs bare-os bare-path bare-process \
-            bare-stream bare-abort-controller bare-crypto bare-dns bare-fetch \
-            bare-http1 bare-https bare-link bare-runtime bare-subprocess bare-zlib \
-            compact-encoding events fast-safe-stringify which-runtime \
-            @modelcontextprotocol/sdk
-      - name: Configure env
+          tools/runtime/link-ios-artifacts.sh
+          node tools/ci/package-manifest-mode.mjs --activate-development
+      - name: Build DocC from the package manifest
         run: |
-          echo "QVAC_BARE_BIN=$(which bare)" >> $GITHUB_ENV
-          echo "QVAC_NODE_MODULES=$(pwd)/spike-js/node_modules" >> $GITHUB_ENV
-      - name: RAG tests
-        env:
-          QVAC_BARE_BIN: ${{ env.QVAC_BARE_BIN }}
-          QVAC_NODE_MODULES: ${{ env.QVAC_NODE_MODULES }}
-          QVAC_RUN_RAG_TESTS: "1"
-          # Tiny public sentence-transformers GGUF embedding model (~22 MB).
-          QVAC_TEST_EMBEDDING_URL: "https://huggingface.co/leliuga/all-MiniLM-L6-v2-GGUF/resolve/main/all-MiniLM-L6-v2.Q4_K_M.gguf"
-        run: swift test --filter RAGIntegrationTests
-
-  # ----------------------------------------------------------------------------
-  # iOS Simulator build + hosted XCTest run. Builds QVACClient for the simulator
-  # AND boots a simulator + executes the BareKitProbeApp hosted XCTest target so
-  # iOS runtime regressions (BareKit linkage, worker handshake) are caught.
-  # ----------------------------------------------------------------------------
-  test-ios-sim:
-    name: Test · iOS Simulator
-    runs-on: macos-15
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-      - name: Show iOS simulator runtimes available
-        run: xcrun simctl list runtimes
-      - name: Install xcodegen
-        run: brew install xcodegen
-      - name: Generate BareKitProbeApp xcodeproj
-        # The .xcodeproj is gitignored — regenerate it from spike-swift/Examples/BareKitProbeApp/project.yml.
-        run: cd spike-swift/Examples/BareKitProbeApp && xcodegen generate
-      - name: Build QVACClient for iOS Simulator (generic)
-        run: |
-          xcodebuild \
-            -scheme QVACClient \
-            -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath /tmp/qvac-dd \
-            build
-      - name: Run hosted XCTest in iOS Simulator
-        # macos-15 ships iPhone 17 family + iPhone Air + iPhone SE. Pick the first
-        # iOS 26.x device available on the runner — the test only cares about ARM
-        # Simulator + a modern iOS, not the specific device model.
-        run: |
-          DEVICE=$(xcrun simctl list devices available --json | python3 -c "
-          import json,sys
-          d = json.load(sys.stdin)
-          for runtime, devs in d['devices'].items():
-              if 'iOS' not in runtime: continue
-              for dev in devs:
-                  if 'iPhone' in dev['name'] and dev['isAvailable']:
-                      print(dev['name']); sys.exit(0)
-          ")
-          echo "Selected device: $DEVICE"
-          xcodebuild test \
-            -project spike-swift/Examples/BareKitProbeApp/BareKitProbeApp.xcodeproj \
-            -scheme BareKitProbeApp \
-            -destination "platform=iOS Simulator,name=$DEVICE,OS=latest" \
-            -derivedDataPath /tmp/probe-dd
-
-  # ----------------------------------------------------------------------------
-  # Example app build — keeps Examples/QVACChat from rotting. Builds both iOS and
-  # macOS targets. Matches grant AC-3 / KR-5 surface area.
-  # ----------------------------------------------------------------------------
-  build-example-app:
-    name: Build · Examples/QVACChat
-    # Needs Xcode 16 — xcodegen 2.45 emits project format 77 which the default Xcode
-    # on macos-14 (Xcode 15) refuses to open. macos-15 ships with Xcode 16 by default.
-    runs-on: macos-15
-    needs: [unit-macos]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install xcodegen
-        run: brew install xcodegen
-      - name: Generate xcodeproj
-        run: cd Examples/QVACChat && xcodegen generate
-      - name: Build QVACChat-iOS (Simulator)
-        run: |
-          xcodebuild \
-            -project Examples/QVACChat/QVACChat.xcodeproj \
-            -scheme QVACChat-iOS \
-            -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath /tmp/chat-ios-dd \
-            build
-      - name: Build QVACChat-macOS
-        run: |
-          xcodebuild \
-            -project Examples/QVACChat/QVACChat.xcodeproj \
-            -scheme QVACChat-macOS \
+          swift package dump-package >/dev/null
+          xcodebuild docbuild -scheme QVACClient \
             -destination 'platform=macOS' \
-            -derivedDataPath /tmp/chat-mac-dd \
-            build
+            -derivedDataPath "$RUNNER_TEMP/qvac-docc-dd" \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
+            OTHER_DOCC_FLAGS='--warnings-as-errors'
 
-  # ----------------------------------------------------------------------------
-  # KR-2 benchmark — Swift heartbeat latency vs Node baseline. Fails the build
-  # if Swift overhead exceeds 5% of Node (configurable via QVAC_BENCH_MAX_OVERHEAD).
-  # ----------------------------------------------------------------------------
-  bench:
-    name: Benchmark · KR-2 (Swift vs Node)
+  integration-live:
+    name: Live worker · all no-model RPC suites
     runs-on: macos-14
-    needs: [unit-macos]
-    timeout-minutes: 15
+    needs: [unit, runtime-artifact]
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '22'
-      - name: Install Bare runtime + @qvac/sdk
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/runtime/package-lock.json
+      - name: Install exact runtime and local binary graph
         run: |
-          npm install -g bare-runtime
-          mkdir -p spike-js
-          cd spike-js
-          npm init -y >/dev/null
-          npm install --legacy-peer-deps \
-            @qvac/sdk \
-            tar-stream hyperdrive hyperdb hyperswarm corestore pear-pipe llm-splitter \
-            bare-net bare-rpc bare-buffer bare-fs bare-os bare-path bare-process \
-            bare-stream bare-abort-controller bare-crypto bare-dns bare-fetch \
-            bare-http1 bare-https bare-link bare-runtime bare-subprocess bare-zlib \
-            compact-encoding events fast-safe-stringify which-runtime \
-            @modelcontextprotocol/sdk
-      - name: Configure env
-        run: |
-          echo "QVAC_BARE_BIN=$(which bare)" >> $GITHUB_ENV
-          echo "QVAC_NODE_MODULES=$(pwd)/spike-js/node_modules" >> $GITHUB_ENV
-      - name: Run benchmark (1000 iters, 20% overhead budget for CI noise)
+          tools/runtime/link-ios-artifacts.sh
+          node tools/ci/package-manifest-mode.mjs --activate-development
+      - name: Run required live suites with zero skips
         env:
-          QVAC_BARE_BIN: ${{ env.QVAC_BARE_BIN }}
-          QVAC_NODE_MODULES: ${{ env.QVAC_NODE_MODULES }}
-          # CI gets a wider budget than the grant's 5% target — GitHub hosted runners
-          # have noisy neighbors that spike per-call latency. Local-machine runs
-          # (Apple Silicon M-series) measure ratio ~0.84 (Swift faster than Node);
-          # CI typically sees 1.05–1.15. Use 1.20 as the regression-detection
-          # threshold, while the README + grant submission cite the local number.
-          QVAC_BENCH_MAX_OVERHEAD: "1.20"
-        run: bench/run.sh 1000
-      - name: Upload bench result
-        if: always()
-        uses: actions/upload-artifact@v4
+          QVAC_BARE_BIN: ${{ github.workspace }}/tools/runtime/node_modules/.bin/bare
+          QVAC_NODE_MODULES: ${{ github.workspace }}/tools/runtime/node_modules
+          QVAC_WORKER_SCRIPT: ${{ github.workspace }}/tools/runtime/node_modules/@qvac/sdk/dist/server/worker.js
+        run: |
+          tools/ci/run-required-suite.sh QVACClientIntegrationTests 5
+          tools/ci/run-required-suite.sh LiveWorkerIntegrationTests 5
+          tools/ci/run-required-suite.sh AllRPCTypesRoundTripTests 1
+
+  integration-models:
+    name: First inference <10m; pinned LLM, RAG, and upscale · zero skips
+    runs-on: macos-14
+    needs: [unit, runtime-artifact]
+    timeout-minutes: 60
+    steps:
+      - name: Start clean-checkout-to-first-inference budget
+        run: date +%s > "$RUNNER_TEMP/qvac-first-inference-start"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          name: bench-results
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/runtime/package-lock.json
+      - name: Install exact runtime and local binary graph
+        run: |
+          tools/runtime/link-ios-artifacts.sh
+          node tools/ci/package-manifest-mode.mjs --activate-development
+      - name: Prove clean checkout through first real inference in under 10 minutes
+        env:
+          QVAC_BARE_BIN: ${{ github.workspace }}/tools/runtime/node_modules/.bin/bare
+          QVAC_NODE_MODULES: ${{ github.workspace }}/tools/runtime/node_modules
+          QVAC_MODEL_FIXTURE_CACHE: ${{ runner.temp }}/qvac-model-fixtures
+          QVAC_RUN_REAL_MODEL_TESTS: "1"
+          QVAC_RUN_RAG_TESTS: "1"
+          QVAC_RUN_UPSCALE_TESTS: "1"
+        run: |
+          START="$(cat "$RUNNER_TEMP/qvac-first-inference-start")"
+          ELAPSED="$(( $(date +%s) - START ))"
+          REMAINING="$(( 600 - ELAPSED ))"
+          if [ "$REMAINING" -le 0 ]; then
+            echo "::error::Setup exhausted the 600s clone/setup-to-first-inference budget"
+            exit 1
+          fi
+          set +e
+          perl -e 'alarm shift; exec @ARGV or die "exec failed: $!\n"' \
+            "$REMAINING" tools/ci/run-required-suite.sh RealModelIntegrationTests 3
+          STATUS="$?"
+          set -e
+          if [ "$STATUS" -eq 142 ]; then
+            echo "::error::First-inference gate exceeded 600s from clean checkout"
+            exit 1
+          elif [ "$STATUS" -ne 0 ]; then
+            exit "$STATUS"
+          fi
+          TOTAL="$(( $(date +%s) - START ))"
+          echo "Clean checkout/setup through pinned real-model inference: ${TOTAL}s"
+          if [ "$TOTAL" -ge 600 ]; then
+            echo "::error::First inference took ${TOTAL}s; grant limit is <600s"
+            exit 1
+          fi
+      - name: Run remaining checksum-pinned model suites
+        env:
+          QVAC_BARE_BIN: ${{ github.workspace }}/tools/runtime/node_modules/.bin/bare
+          QVAC_NODE_MODULES: ${{ github.workspace }}/tools/runtime/node_modules
+          QVAC_MODEL_FIXTURE_CACHE: ${{ runner.temp }}/qvac-model-fixtures
+          QVAC_RUN_RAG_TESTS: "1"
+          QVAC_RUN_UPSCALE_TESTS: "1"
+        run: |
+          tools/ci/run-required-suite.sh RAGIntegrationTests 2
+          tools/ci/run-required-suite.sh UpscaleIntegrationTests 1
+
+  ios-and-example:
+    name: iOS package and example builds
+    runs-on: macos-15
+    needs: [unit, runtime-artifact]
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/runtime/package-lock.json
+      - name: Materialize exact 0.17 iOS graph
+        run: |
+          tools/runtime/link-ios-artifacts.sh
+          node tools/ci/package-manifest-mode.mjs --activate-development
+      - name: Build clean-checkout package for iOS device and Simulator
+        run: |
+          swift package dump-package >/dev/null
+          git diff --exit-code -- Sources Tests
+          xcodebuild -scheme QVACClient \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/qvac-package-device-dd" \
+            CODE_SIGNING_ALLOWED=NO build
+          xcodebuild -scheme QVACClient \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/qvac-package-dd" build
+      - name: Run external-package smoke test on a hosted iOS Simulator
+        working-directory: Tests/QVACiOSSmokeHarness
+        run: |
+          swift package dump-package >/dev/null
+          xcodebuild -scheme QVACiOSSmokeHarness-Package \
+            -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
+            -derivedDataPath "$RUNNER_TEMP/qvac-ios-smoke-dd" \
+            CODE_SIGNING_ALLOWED=NO \
+            -only-testing:QVACiOSSmokeTests test
+      - name: Build QVACChat on iOS and macOS
+        run: |
+          brew install xcodegen
+          cd Examples/QVACChat
+          xcodegen generate
+          xcodebuild -project QVACChat.xcodeproj -scheme QVACChat-iOS \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/qvac-chat-ios-dd" build
+          xcodebuild -project QVACChat.xcodeproj -scheme QVACChat-macOS \
+            -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/qvac-chat-macos-dd" build
+
+  benchmark:
+    name: KR-2 public API benchmark · exact 5% gate
+    runs-on: macos-14
+    needs: [unit, runtime-artifact]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/runtime/package-lock.json
+      - name: Materialize exact local binary graph
+        run: |
+          tools/runtime/link-ios-artifacts.sh
+          node tools/ci/package-manifest-mode.mjs --activate-development
+      - name: Verify statistical analyzer and equal timeout-policy guard
+        run: node bench/test-analyzer.mjs
+      - name: Run ABBA benchmark with noise-aware 5% decision
+        run: bench/run.sh 1000
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-evidence
           path: bench/result.json
-          if-no-files-found: warn
+          if-no-files-found: error

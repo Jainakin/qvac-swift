@@ -1,0 +1,21 @@
+{
+  "name": "qvac-swift-runtime-toolchain",
+  "version": "0.17.0",
+  "private": true,
+  "description": "Exact, independently identified runtime graph used to test and build qvac-swift 0.17 artifacts.",
+  "engines": {
+    "node": "22.22.0"
+  },
+  "scripts": {
+    "inventory": "node generate-resolution-inventory.mjs",
+    "verify": "node verify-runtime-lock.mjs && node generate-resolution-inventory.mjs --check",
+    "bundle": "./bundle-worker.sh"
+  },
+  "dependencies": {
+    "@qvac/cli": "0.10.0",
+    "@qvac/sdk": "0.17.0",
+    "bare-link": "3.3.0",
+    "bare-runtime": "1.31.0",
+    "react-native-bare-kit": "0.15.0"
+  }
+}

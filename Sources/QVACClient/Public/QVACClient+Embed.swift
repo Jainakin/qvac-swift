@@ -8,32 +8,89 @@ import Foundation
 
 public extension QVACClient {
 
-    /// Embed a single text. Returns the vector as `[Double]`.
-    func embed(modelId: String, text: String) async throws -> [Double] {
-        let req = EmbedRequest(modelId: modelId, text: .string(text))
-        let response: QVACResponse = try await sendTyped(.embed(req))
-        guard case .embed(let r) = response else {
-            throw QVACError.protocolViolation("expected embed response, got \(response.discriminator)")
+    /// Embedding payload and optional worker performance statistics.
+    struct EmbeddingOutcome<Value: Sendable>: Sendable {
+        public let embedding: Value
+        public let stats: JSONValue?
+
+        init(embedding: Value, stats: JSONValue?) {
+            self.embedding = embedding
+            self.stats = stats
         }
-        return try Self.extractSingleEmbedding(from: r)
     }
 
-    /// Embed a batch of texts. Returns one vector per input, in input order.
-    func embed(modelId: String, texts: [String]) async throws -> [[Double]] {
-        let textsJSON: JSONValue = .array(texts.map(JSONValue.string))
-        let req = EmbedRequest(modelId: modelId, text: textsJSON)
-        let response: QVACResponse = try await sendTyped(.embed(req))
-        guard case .embed(let r) = response else {
-            throw QVACError.protocolViolation("expected embed response, got \(response.discriminator)")
+    /// A cancellable embedding operation matching the decorated promise returned by
+    /// the published 0.17 JavaScript client.
+    final class EmbeddingRun<Value: Sendable>: @unchecked Sendable {
+        public let requestId: String
+        public let result: Task<EmbeddingOutcome<Value>, Error>
+
+        init(requestId: String, result: Task<EmbeddingOutcome<Value>, Error>) {
+            self.requestId = requestId
+            self.result = result
         }
-        return try Self.extractBatchEmbedding(from: r)
+    }
+
+    /// Start embedding one text. The request id is available before the worker replies.
+    func embed(
+        modelId: String,
+        text: String,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws -> EmbeddingRun<[Double]> {
+        let requestId = UUID().uuidString
+        let req = EmbedRequest(
+            modelId: modelId,
+            text: .string(text),
+            requestId: requestId
+        )
+        let result = Task<EmbeddingOutcome<[Double]>, Error> {
+            let response: QVACResponse = try await self.sendTyped(
+                .embed(req), rpcOptions: rpcOptions
+            )
+            guard case .embed(let terminal) = response else {
+                throw QVACError.protocolViolation(
+                    "expected embed response, got \(response.discriminator)"
+                )
+            }
+            return .init(
+                embedding: try Self.extractSingleEmbedding(from: terminal),
+                stats: terminal.stats
+            )
+        }
+        return EmbeddingRun(requestId: requestId, result: result)
+    }
+
+    /// Start embedding multiple texts. The result preserves input order.
+    func embed(
+        modelId: String,
+        texts: [String],
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws -> EmbeddingRun<[[Double]]> {
+        let requestId = UUID().uuidString
+        let textsJSON: JSONValue = .array(texts.map(JSONValue.string))
+        let req = EmbedRequest(modelId: modelId, text: textsJSON, requestId: requestId)
+        let result = Task<EmbeddingOutcome<[[Double]]>, Error> {
+            let response: QVACResponse = try await self.sendTyped(
+                .embed(req), rpcOptions: rpcOptions
+            )
+            guard case .embed(let terminal) = response else {
+                throw QVACError.protocolViolation(
+                    "expected embed response, got \(response.discriminator)"
+                )
+            }
+            return .init(
+                embedding: try Self.extractBatchEmbedding(from: terminal),
+                stats: terminal.stats
+            )
+        }
+        return EmbeddingRun(requestId: requestId, result: result)
     }
 
     private static func extractSingleEmbedding(from response: EmbedResponse) throws -> [Double] {
         if response.success != true {
             throw QVACError.server(.embedFailed, message: response.error)
         }
-        guard let value = response.embedding, case .array(let arr) = value else {
+        guard case .array(let arr) = response.embedding else {
             throw QVACError.protocolViolation("embed: unexpected embedding shape")
         }
         var out: [Double] = []
@@ -51,7 +108,7 @@ public extension QVACClient {
         if response.success != true {
             throw QVACError.server(.embedFailed, message: response.error)
         }
-        guard let value = response.embedding, case .array(let outer) = value else {
+        guard case .array(let outer) = response.embedding else {
             throw QVACError.protocolViolation("embed: unexpected embedding shape")
         }
         var out: [[Double]] = []

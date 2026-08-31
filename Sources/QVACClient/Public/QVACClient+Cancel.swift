@@ -1,53 +1,60 @@
-// QVAC-216 — cancel
-//
-// Aborts an in-progress operation by routing key. Three operation types are supported,
-// each with its own keying scheme:
-//
-//   • `.inference(modelId:)`  — abort any in-flight inference on the named model
-//   • `.downloadAsset(downloadKey:, clearCache:)` — pause a download (optionally deleting partial file)
-//   • `.rag(workspace:)` — abort RAG ops on a workspace (defaults to "default")
-//
-// Returns normally on success (worker acked the cancel). Throws `QVACError.server` if the
-// operation wasn't found or couldn't be cancelled.
+// QVAC 0.17 — cancel
 
 import Foundation
 
 public extension QVACClient {
 
-    /// The kind of operation to cancel. Maps to the JS client's `cancel({operation, ...})`.
-    enum CancelOperation: Sendable {
-        case inference(modelId: String)
-        case downloadAsset(downloadKey: String, clearCache: Bool = false)
-        case rag(workspace: String? = nil)
+    /// Successful acknowledgement from the worker's request registry.
+    /// `cancelled` is the number of live contexts transitioned to cancelling;
+    /// zero can also mean the cancel-before-begin race guard recorded the target.
+    struct CancelAcknowledgement: Sendable, Equatable {
+        public let cancelled: Int?
     }
 
-    /// Cancel a previously-started operation.
+    /// A native QVAC 0.17 cancellation target.
     ///
-    /// Note: cancellation is itself an RPC — the worker has to ack it. If the operation
-    /// doesn't exist (already finished, wrong id, etc.) the worker returns
-    /// `success: false` with an error; we surface that as `QVACError.server`.
-    func cancel(_ operation: CancelOperation) async throws {
-        var req = CancelRequest(operation: "")
-        switch operation {
-        case .inference(let modelId):
-            req.operation = "inference"
-            req.modelId = modelId
-        case .downloadAsset(let downloadKey, let clearCache):
-            req.operation = "downloadAsset"
-            req.downloadKey = downloadKey
-            req.clearCache = clearCache
-        case .rag(let workspace):
-            req.operation = "rag"
-            if let w = workspace { req.workspace = w }
-        }
-        let response: QVACResponse = try await sendTyped(.cancel(req))
-        guard case .cancel(let r) = response else {
+    /// - `request` targets one in-flight request by the request id returned from a
+    ///   long-running operation. `clearCache` is meaningful for downloads only.
+    /// - `broad` cancels every in-flight request for a model, optionally narrowed
+    ///   to a worker-defined request kind.
+    enum CancelOperation: Sendable, Equatable {
+        case request(requestId: String, clearCache: Bool? = nil)
+        case broad(modelId: String, kind: String? = nil)
+    }
+
+    /// Cancel an in-flight request or a group of requests associated with a model.
+    /// Cancellation is itself an RPC and completes only after the worker replies.
+    @discardableResult
+    func cancel(
+        _ operation: CancelOperation,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws -> CancelAcknowledgement {
+        let request = Self.makeCancelRequest(operation)
+
+        let response: QVACResponse = try await sendTyped(.cancel(request), rpcOptions: rpcOptions)
+        guard case .cancel(let result) = response else {
             throw QVACError.protocolViolation("expected cancel response, got \(response.discriminator)")
         }
-        if r.success == false {
-            // Server reported the cancellation failed (most commonly "not found").
-            // Map to a generic server error preserving the message.
-            throw QVACError.server(.cancelFailed, message: r.error)
+        if result.success == false {
+            throw QVACError.server(.cancelFailed, message: result.error)
+        }
+        return CancelAcknowledgement(cancelled: result.cancelled)
+    }
+
+    internal static func makeCancelRequest(_ operation: CancelOperation) -> CancelRequest {
+        switch operation {
+        case .request(let requestId, let clearCache):
+            return CancelRequest(
+                operation: "request",
+                clearCache: clearCache,
+                requestId: requestId
+            )
+        case .broad(let modelId, let kind):
+            return CancelRequest(
+                operation: "broad",
+                kind: kind,
+                modelId: modelId
+            )
         }
     }
 }

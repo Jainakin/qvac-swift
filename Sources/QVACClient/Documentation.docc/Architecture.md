@@ -1,101 +1,107 @@
-#  Architecture
+# Architecture
 
-How QVACClient connects Swift code to QVAC's Bare worker.
+How the Swift actor, platform transports, bare-rpc multiplexer, and generated
+QVAC 0.17 contract fit together.
 
-## Two transport models
+## Platform boundary
 
-```
-┌──────────────────────────────────────────────────────────┐
-│ Consumer iOS / macOS app                                 │
-│  import QVACClient                                       │
-│  let client = try await QVACClient(...)                  │
-│  for try await tok in client.completion(...).tokenStream │
-└──────────────────────────────────────────────────────────┘
-                          │
-        ┌─────────────────┴────────────────┐
-        ▼                                  ▼
-   macOS path                          iOS path
-   subprocess                          in-process
-   ──────────                          ──────────
-   bare worker.js (child proc)         BareKit worklet (pthread)
-   UnixDomainSocketTransport            BareIPCTransport
-   `Process` API + AF_UNIX socket       BareKit.xcframework + BareIPC
+```text
+Application
+    |
+QVACClient actor
+    |
+Bare-rpc codec and operation table
+    |
+    +-- macOS: private AF_UNIX socket <-> spawned Bare worker
+    |
+    +-- iOS:   BareIPC socketpair <-> in-process BareKit worklet
 ```
 
-Both transports expose the same byte-stream contract (``BareTransport``), so the
-RPC client doesn't care which platform it's on.
+Both transports present the same ordered byte-stream abstraction to the RPC layer.
+Platform-specific startup and shutdown are contained behind the configuration
+factory; operation implementations share one path.
 
-## Wire protocol
+## Startup and shutdown
 
-Two stacked layers:
+Construction starts the transport and sends `__init_config` with the optional
+client config plus runtime context. The handshake has its own finite deadline and
+cancellation-safe pending state. A worker that crashes, starts in direct mode, or
+never replies cannot leave initialization waiting forever.
 
-### Outer — bare-rpc
+`close()` is serialized through one shared task. Concurrent callers join the same
+cleanup. macOS shuts down the socket, drains transport work, and waits for the child
+process. iOS first sends the SDK's bounded `__shutdown__` command so addon static
+references are released before the worklet ends.
 
-Length-prefixed binary framing. Each frame:
+## Wire stack
 
-```
-[uint32 LE frame_len]
-[varuint type]                     1=REQUEST, 2=RESPONSE, 3=STREAM
-[varuint id]                       message id (auto-allocated)
-[per-type fields]
-[varuint dataLen?][raw data bytes?]
-```
+The outer layer is Holepunch bare-rpc: a 32-bit little-endian body length followed
+by compact-encoded frame metadata and optional bytes. Unary, server-stream, and
+duplex operations share a monotonically allocated command ID space.
 
-Stream flags are a bitmask: `OPEN=0x1, CLOSE=0x2, PAUSE=0x4, RESUME=0x8, DATA=0x10,
-END=0x20, DESTROY=0x40, ERROR=0x80, REQUEST=0x100, RESPONSE=0x200`. Backpressure via
-`PAUSE`/`RESUME`. The Swift codec is wire-compatible with Holepunch's reference
-implementation, validated byte-for-byte against fixtures.
+The inner layer is JSON for unary responses and NDJSON for streams. A shared
+incremental decoder:
 
-### Inner — JSON / NDJSON
+- accepts arbitrary frame/record boundaries;
+- drains the final unterminated record at EOF;
+- enforces the configured maximum record size;
+- removes only a top-level `{"__profilingTrailer": true, ...}` metadata record;
+- preserves profiling metadata through the configured callback; and
+- rejects malformed ordinary records.
 
-Each frame's data payload carries one JSON object (for single-shot) or one JSON object
-per newline (for streaming responses). The `"type"` field discriminates between message
-shapes: `loadModel`, `completionStream`, `transcribe`, etc.
+## Generated contract
 
-## Init handshake
+The pinned 0.17 manifest generates:
 
-The first message on a new connection is `__init_config`. The Swift client sends it
-automatically as part of `init(configuration:...)`:
+1. all concrete request and response types;
+2. strict `QVACRequest` and `QVACResponse` discriminator unions;
+3. the complete 39-method call-shape inventory;
+4. generic and exact typed routing methods; and
+5. exhaustive construction/encode/decode tests for every concrete leaf.
 
-```
-{
-  "type": "__init_config",
-  "config": <opaque user config or null>,
-  "runtimeContext": { "runtime": "bare"|"node", "platform": "ios"|"darwin"|... }
-}
-```
+Conditional progress transports for model loading, asset download, finetuning,
+and selected RAG operations are generated from manifest metadata. This avoids a
+hand-maintained routing switch when the contract gains a method.
 
-The worker stores the config in memory; subsequent attempts to override it return
-``QVACErrorCode/configAlreadySet``.
+## Backpressure and memory
 
-## Three RPC primitives
+Frame size, NDJSON record size, transport buffering, and each raw operation queue
+have explicit byte ceilings. Public mapped streams are pull-driven, so a slow
+consumer does not create an unbounded eager decoding task. High-level fan-out views
+use a bounded element count and report overflow explicitly.
 
-QVACClient exposes three transport primitives that compose into every public method:
+Live server and duplex responses use `QVACResponseStream`, a single-consumer
+sequence whose iterator owns the RPC teardown lease. Leaving a `for try await`
+loop early, dropping its iterator, cancelling the consuming task, or calling
+`cancel()` destroys the remote response stream immediately even if the sequence
+value remains retained. Normal remote completion releases the same state without
+emitting a redundant destroy frame.
 
-| Primitive | Pattern | Used by |
-|---|---|---|
-| `send`   | 1 request → 1 response (JSON) | heartbeat, embed, cancel, unloadModel, downloadAsset (blocking) |
-| `stream` | 1 request → N responses (NDJSON) | completion, transcribe, translate, ocr, diffusion, textToSpeech, loadModelStreaming |
-| `duplex` | bidirectional (client writes audio, server streams transcripts) | transcribeStream, textToSpeechStream |
+The 256 MiB default wire ceiling accommodates current video/upscale records, but
+base64 JSON and `Data` conversion can temporarily multiply peak memory. Applications
+should select a lower limit when their supported models cannot legitimately emit
+large media.
 
-## Error model
+## Deadlines and cancellation
 
-Every wire-level error is decoded into ``QVACError``. The numeric code is preserved
-as ``QVACErrorCode`` (e.g. `52200` = `modelLoadFailed`), and the error is categorized
-by ``QVACErrorCategory`` (e.g. `.modelLoading`, `.rag`, `.download`).
+Request/reply deadlines cover the complete response. Server-stream deadlines reset
+on each inbound frame and therefore represent inactivity. Duplex deadlines cover
+session setup; callers end or destroy long-lived sessions explicitly.
 
-Server-side errors travel through the response stream as ordinary NDJSON frames with
-`"type": "error"` — not bare-rpc-level ERROR frames. The Swift client handles both.
+When a timeout or task cancellation wins, pending continuations are resumed exactly
+once and removed, the correct bare-rpc stream directions are closed/destroyed, and
+blocked transport writes force connection teardown instead of leaking tasks behind
+the socket's serial writer.
 
-## Multiplexing
+## Error boundary
 
-A single QVACClient instance can have many concurrent in-flight operations. Each gets
-a unique bare-rpc message id; responses route back via an `id`-keyed in-flight table
-inside the codec. There's no head-of-line blocking — a slow `completion` doesn't
-prevent a quick `heartbeat` from going through.
+Server error envelopes are decoded into typed `QVACError` values using all 136
+published numeric codes. Malformed frames and unexpected response variants become
+protocol violations; malformed JSON/NDJSON becomes an encoding error; operating
+system failures remain transport errors. Internal bare-rpc error types are not
+exposed through public async sequences.
 
 ## See also
 
 - <doc:GettingStarted>
-- ``QVACClient``
-- ``BareRPCClient``
+- <doc:Security>

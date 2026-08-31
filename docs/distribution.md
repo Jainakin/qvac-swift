@@ -1,208 +1,187 @@
-# Distribution
+# Distribution and release
 
-This document covers how releases are cut and how consumers discover the package.
+QVACClient targets exactly `@qvac/sdk` 0.17.0. Source generation is pinned to
+release commit `e8b440665a053a9efe852f04c3601da44f0d55d8`; runtime installation is pinned
+by `tools/runtime/package-lock.json`; and the committed worker records the same SDK
+version in its embedded package metadata.
 
-## Release process (`v*` tags)
+The release system intentionally has two manifest modes:
 
-This is a two-step flow because `Package.swift` is dual-mode:
+- `Package.swift.dev` is the reproducible development manifest. Its 38 local
+  binary targets come from `tools/runtime/.build/artifacts`, produced by
+  `tools/runtime/link-ios-artifacts.sh`.
+- An immutable `artifact-manifest.json` is published with the native GitHub
+  Release. A release `Package.swift` is generated from that schema; every binary
+  target then has the exact release URL and SHA-256 checksum. The external
+  manifest is bound to the final Swift source commit and is not copied back into
+  that commit (which would change the commit identity).
 
-- **dev mode** (the one checked in) uses `binaryTarget(path: "spike-swift/Vendor/BareKit.xcframework")`
-  so the monorepo `swift build` works.
-- **consumer mode** uses `binaryTarget(url:checksum:)` so external apps that do
-  `.package(url: "...", from: "0.1.0")` can resolve. Generated at release time.
+Until an unpublished artifact candidate has reproduced all final bytes, the
+canonical manifest remains the exact development manifest. Committing the URL
+manifest is a short, explicit release-candidate state: no source tag is allowed,
+and the artifact publication workflow must reproduce and publish those exact
+future URLs before the source-release workflow can run. Neither workflow invents
+URLs or reuses old 0.10 assets.
 
-### Step 1 — initial tag (uploads artifacts)
+## 1. Reproduce the exact development graph
 
-```bash
-# Codegen freshness — be sure nothing's drifted.
-./tools/codegen/run.sh
-git diff --exit-code Sources/QVACClient/Generated/
-
-# Tag + push.
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-`.github/workflows/release.yml` fires automatically:
-- Runs unit tests + codegen check
-- Generates `worker.mobile.bundle.js` via `@qvac/cli bundle sdk` for iOS targets
-- Runs `bare-link` against the addon set to produce ~40 iOS xcframeworks
-- Zips each xcframework + emits SHA-256 checksums
-- Creates a GitHub Release with all artifacts attached
-- Pings the Swift Package Index refresh endpoint
-- Prints a warning that the tagged commit's `Package.swift` is still dev-mode
-
-### Step 2 — rewrite Package.swift for consumers, move the tag
-
-**Wait for the GitHub Actions `release.yml` workflow to finish** before running this
-step — the prep script downloads the release's xcframework zips, so the assets must
-exist first. Check the run status:
+Use Node 22.22.0, then run:
 
 ```bash
-gh run watch --workflow=release.yml
-# or visit: https://github.com/<owner>/qvac-swift/actions/workflows/release.yml
+tools/codegen/bootstrap.sh
+tools/codegen/run.sh --generate-only
+git diff --exit-code -- Sources/QVACClient/Generated \
+  'Tests/QVACClientUnitTests/*.generated.swift'
+
+tools/runtime/test-bundle-reproducibility.sh
+cmp tools/runtime/.build/worker.repro-a.bundle \
+  Sources/QVACClient/Resources/worker.mobile.bundle
+tools/runtime/link-ios-artifacts.sh
+node tools/release/compute-manifest.mjs development \
+  tools/runtime/.build/artifacts \
+  Sources/QVACClient/Resources/worker.mobile.bundle \
+  tools/release/artifacts.development.json
+node tools/release/generate-package-manifest.mjs \
+  tools/release/artifacts.development.json Package.swift.dev
 ```
 
-Confirm `gh release view v0.1.0 --json assets` lists all expected `.xcframework.zip`
-entries (the full kitchen-sink build uploads ~48 of them — see `release.yml`).
+The worker verifier rejects a bundle unless it embeds SDK 0.17.0, has a complete
+non-overlapping file table, and contains no local checkout path or `file://` import.
+The reproducibility test builds it from two separate work roots and compares all
+bytes and the bundle content ID.
 
-Then:
+For this lock, `bare-link` stages 47 available XCFrameworks, while the computed
+runtime closure packages 38: the bundle's exact 37 addon targets plus BareKit.
+The nine staged-but-unreferenced targets are recorded in
+`artifacts.development.json.nativeClosure.excludedUnreferencedTargets`; they are
+excluded mechanically because neither the bundle addon table nor any required
+iOS Mach-O `@rpath` dependency references them.
+
+## 2. Produce an unpublished release candidate
+
+Run the **Build Immutable SDK 0.17 Artifacts** workflow on `main`. Choose a new,
+monotonically increasing revision such as `1` and leave `publish` disabled. The
+workflow uploads an Actions artifact named `artifacts-sdk-0.17.0-r1`; it does not
+create a Git tag or GitHub Release.
+
+The workflow:
+
+1. installs only `tools/runtime/package-lock.json` with Node 22.22.0;
+2. reproduces the worker twice and compares it with the committed worker;
+3. links the exact bundle addon closure plus BareKit;
+4. unions Mach-O dependencies across every iOS device and simulator slice and
+   requires arm64 device plus arm64/x86_64 simulator coverage for every target;
+5. rejects symlinks, path escapes, and input/output overlap before mutation,
+   then creates deterministic, UTC-normalized xcframework archives;
+6. verifies the generated `THIRD_PARTY_NOTICES.md`, packages it beside the binary
+   assets, and binds its size and checksum into `artifact-manifest.json`;
+7. verifies every staged byte and uploads the unpublished candidate evidence.
+
+Download that workflow artifact, verify it, and generate only the URL package
+manifest:
 
 ```bash
-# Rewrites Package.swift in place using checksums computed from the just-uploaded
-# artifacts. The previous dev-mode manifest is preserved as Package.swift.dev.
-tools/release/prepare-release.sh v0.1.0
-
-# Sanity check.
-diff Package.swift.dev Package.swift   # should show URL targets replacing path targets
-swift package describe                  # should resolve successfully
-
-# Commit + move the tag to the new commit.
-git add Package.swift Package.swift.dev
-git commit -m "release: pin v0.1.0 binary targets"
-git tag -fa v0.1.0 -m "v0.1.0"
-git push origin main
-git push origin v0.1.0 --force-with-lease
+CANDIDATE=/absolute/path/to/artifacts-sdk-0.17.0-r1
+node tools/release/verify-release.mjs \
+  "$CANDIDATE/artifact-manifest.json" \
+  --assets-dir "$CANDIDATE"
+node tools/release/generate-package-manifest.mjs \
+  "$CANDIDATE/artifact-manifest.json" Package.swift
+swift package dump-package >/dev/null
+cmp "$CANDIDATE/worker.mobile.bundle" \
+  Sources/QVACClient/Resources/worker.mobile.bundle
 ```
 
-Now `.package(url: "https://github.com/.../qvac-swift", from: "0.1.0")` resolves to the
-URL-based manifest in a clean checkout, and SPM consumers fetch the artifacts directly
-from the GitHub Release.
+Review and commit `Package.swift` on `main`. Do not commit the dry-run
+`artifact-manifest.json`: its `sourceCommit` identifies the pre-manifest candidate,
+not the new final commit.
 
-### Step 3 — Swift Package Index reindex
+Push the URL-manifest commit and require the complete `CI` workflow to pass for
+that new exact SHA before enabling publication. A green run for the earlier
+development-manifest candidate is useful evidence, but it cannot authorize the
+URL-manifest commit because the commit identity changed.
 
-SPI picks up the new tag within ~10 minutes. If you want to force a reindex, hit the
-SPI refresh endpoint manually (the release workflow already does this).
+The full CI workflow accepts exactly two canonical manifest states: the generated
+development manifest, or the strictly generated URL manifest for one immutable
+SDK 0.17 artifact tag. For a URL-manifest commit whose artifacts do not exist yet,
+CI first validates its target inventory, repository, tag, URLs, checksums, and
+generator formatting, then copies the verified `Package.swift.dev` only inside
+the ephemeral runner for compilation and tests. Artifact publication and source
+release still verify the canonical URL manifest and every remote byte; the local
+CI overlay is never committed or treated as release evidence.
 
-## Swift Package Index submission
+## 3. Publish artifacts from the final source commit
 
-First-time setup (one-shot, after the repo is public):
+Review `THIRD_PARTY_NOTICES.md`, including the three exact npm artifacts that
+declare a license but publish no license file and therefore use pinned
+supplemental texts. Confirm their source evidence and attribution before setting
+`license_reviewed=true`. Then run **Build Immutable SDK 0.17 Artifacts** again
+from that new exact `main` commit, with the same revision and `publish` enabled.
+The checkbox is a maintainer/legal attestation, not automated legal advice. The
+workflow reproduces all bytes, then hard-fails unless:
 
-1. Visit https://swiftpackageindex.com/add-a-package
-2. Paste the repo URL (`https://github.com/tetherto/qvac-swift`)
-3. SPI's `PackageList.json` PR-bot opens a PR against
-   https://github.com/SwiftPackageIndex/PackageList — review + merge it.
-4. SPI auto-builds against every tagged release after that.
+- canonical `Package.swift` exactly matches the newly computed URL manifest;
+- the committed worker matches the packaged worker;
+- generated third-party notices are fresh and the packaged notice checksum is
+  bound into the release manifest;
+- `artifact-manifest.json.sourceCommit` equals `GITHUB_SHA`; and
+- neither the artifact Git tag nor GitHub Release already exists.
 
-To bump the package and force a re-index, push a new tag — no other action needed.
+Only after those gates pass does it publish `artifacts-sdk-0.17.0-r1`. It then
+verifies that the created artifact tag, GitHub Release target, and manifest all
+resolve to the exact final source commit. Artifact tags and releases are
+immutable: if anything changes, use a new `rN`; never replace an existing release.
 
-## Versioning
-
-We follow [SemVer](https://semver.org/):
-
-- `0.x.y` — pre-1.0, breaking changes between minor versions allowed but rare.
-- `1.0.0` — first stable release. After this, major-version bumps are reserved for
-  breaking changes.
-
-The QVAC SDK version this Swift client targets is recorded in
-`tools/codegen/package.json`'s `@qvac/sdk` dependency. The Swift client's version
-moves independently — a Swift bugfix release does not require an SDK bump.
-
-## What ships in each release
-
-Artifact zips uploaded to each GitHub Release (consumed via `binaryTarget(url:checksum:)`):
-
-- `BareKit.xcframework.zip` — Holepunch's BareKit (iOS arm64 + iOS sim).
-- `qvac__llm-llamacpp.<v>.xcframework.zip` — LLM inference (llama.cpp).
-- `qvac__embed-llamacpp.<v>.xcframework.zip` — Embedding model support.
-- `qvac__transcription-whispercpp.<v>.xcframework.zip` — Whisper STT.
-- `qvac__transcription-parakeet.<v>.xcframework.zip` — Parakeet STT.
-- `qvac__translation-nmtcpp.<v>.xcframework.zip` — NMT translation.
-- `qvac__tts-onnx.<v>.xcframework.zip` — ONNX TTS.
-- `qvac__ocr-onnx.<v>.xcframework.zip` — ONNX OCR.
-- `qvac__diffusion-cpp.<v>.xcframework.zip` — sd.cpp image generation.
-- Plus all transitive `bare-*` and `@qvac/onnx`, `rocksdb-native`, `bare-ffmpeg`,
-  `sodium-native`, etc.
-
-Total per-release upload: ~440 MB (compressed). All three iOS slices in each
-xcframework. App Store thinning trims this to ~150 MB at install time per device.
-
-See [`docs/bundle-and-addons.md`](bundle-and-addons.md) for the rationale.
-
-## Updating the QVAC SDK version
-
-Edit `spike-js/package.json` (used by codegen + release CI) to pin a new version:
+The following command is a read-only independent check of the published release:
 
 ```bash
-npm --prefix spike-js install --save --legacy-peer-deps @qvac/sdk@0.11.0
-./tools/codegen/run.sh
-git diff Sources/QVACClient/Generated/   # review what changed
-git add Sources/QVACClient/Generated/
-git commit -m "regen against @qvac/sdk@0.11.0"
+tools/release/prepare-release.sh artifacts-sdk-0.17.0-r1
 ```
 
-The drift workflow (`.github/workflows/codegen-drift.yml`) auto-opens a tracking issue
-when upstream changes; you don't have to poll manually.
+It downloads and hashes every binary asset and the third-party notice, binds the
+manifest to the current Git commit, verifies the canonical URL `Package.swift`
+and embedded worker, and parses the package with SwiftPM. It never edits
+repository files. `Package.swift.dev` remains the local exact graph for the next
+development cycle.
 
-## Consumer app — App Store deployment notes
+## 4. Verify first, then create a new source version
 
-For iOS apps targeting the App Store that consume `QVACClient`:
+Do **not** create or push a SemVer tag by hand. Dispatch the **Source Release**
+workflow from the exact verified `main` commit with:
 
-### Network usage description
+- `version`: `0.1.0`
+- `artifact_tag`: `artifacts-sdk-0.17.0-r1`
 
-QVACClient loads models from arbitrary HTTPS URLs through the worker. If your app
-forwards untrusted URLs (e.g. from a user clipboard / QR scan / deep link) you must
-validate them — see the Security article in DocC.
+Before any source tag exists, the workflow binds the published artifact manifest
+and artifact tag to `GITHUB_SHA`, rejects a path-based/stale package, downloads and
+hashes every remote artifact, builds a clean external consumer from the public Git
+URL at that exact revision, and runs unit tests. It creates and pushes the immutable
+SemVer tag and GitHub source release only after every gate passes. A retry may use
+an already-created tag only when it resolves to the same verified commit; tags are
+never moved or force-updated. Pull-request CI separately requires strict-concurrency
+compilation with warnings as errors, DocC with warnings as errors, and generic iOS
+device and simulator builds.
 
-If the app advertises specific model sources only, declare them in `Info.plist`:
+Consumers can then use:
 
-```xml
-<key>NSAppTransportSecurity</key>
-<dict>
-  <key>NSAllowsArbitraryLoads</key>
-  <false/>
-  <key>NSExceptionDomains</key>
-  <dict>
-    <key>huggingface.co</key>
-    <dict>
-      <key>NSExceptionAllowsInsecureHTTPLoads</key>
-      <false/>
-      <key>NSIncludesSubdomains</key>
-      <true/>
-    </dict>
-  </dict>
-</dict>
+```swift
+.package(url: "https://github.com/Jainakin/qvac-swift.git", exact: "0.1.0")
 ```
 
-### Background fetch / long-running model loads
+## Updating the upstream SDK
 
-If your UX allows the user to keep model downloads running while the app is
-backgrounded:
+An SDK update is a deliberate migration, not a floating install. Update all of the
+following in one reviewed change:
 
-```xml
-<key>UIBackgroundModes</key>
-<array>
-  <string>processing</string>
-</array>
-```
+1. authoritative source commit and every contract input hash in
+   `tools/provenance/qvac-sdk.lock.json`;
+2. npm tarball URL, integrity, shasum, and independently verified source identity;
+3. exact codegen and runtime package locks;
+4. npm/source semantic parity and all generated Swift sources/tests;
+5. worker bundle, native addon closure, model fixtures, integration tests, and
+   benchmark evidence;
+6. a new immutable artifact revision and then a new source version.
 
-Models often run 100–500 MB so this is a real consideration.
-
-### Privacy manifest
-
-iOS 17+ Privacy Manifest entries you'll likely need (in your app's `PrivacyInfo.xcprivacy`):
-
-- `NSPrivacyAccessedAPICategoryFileTimestamp` — the worker reads cache file metadata.
-- `NSPrivacyAccessedAPICategoryDiskSpace` — the worker checks disk space before downloads.
-- `NSPrivacyAccessedAPICategorySystemBootTime` — used by the worker's logging timestamps.
-
-(QVACClient itself doesn't call these APIs directly, but the in-process BareKit
-worker may; Apple requires the app to declare them.)
-
-### macOS sandbox / App Store
-
-For sandboxed macOS apps spawning the worker subprocess via `.macOS(...)`, you need:
-
-```xml
-<key>com.apple.security.cs.allow-jit</key>
-<true/>
-<key>com.apple.security.cs.disable-library-validation</key>
-<true/>
-<key>com.apple.security.network.client</key>
-<true/>
-```
-
-The first two are required because `bare` JITs JavaScript and loads native addons.
-The third lets the worker fetch models. The `Examples/QVACChat/Sources/Info.plist`
-in this repo is a non-sandboxed dev configuration — replace it with the above
-entries for App Store submission.
+The similarly named `sdk-v0.17.0` tag is not authoritative for this release: it
+currently resolves to a later post-publication commit with schema drift. Generation
+therefore uses the npm release commit above, never a floating tag or `latest`.

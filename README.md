@@ -1,30 +1,40 @@
 # QVAC Swift Client
 
-A native Swift client for the [QVAC SDK](https://docs.qvac.tether.io/) — Tether's
-local-first on-device AI runtime. iOS 17+ and macOS 14+, arm64. Async/await throughout,
-streaming via `AsyncSequence`, zero JavaScript at the call site.
+Native Swift access to QVAC's local-first AI worker for iOS 17+ and macOS 14+
+(arm64), using Swift concurrency and bounded `AsyncSequence` streams.
 
-Built against [Tether grant 2885283454](https://tether.dev/grants/bounties/2885283454/).
-See [PLAN.md](PLAN.md) for the implementation roadmap.
+This submission candidate targets the exact published `@qvac/sdk@0.17.0`
+contract. It does not contain a 0.10 compatibility or migration layer.
 
-## Status
+## Release status
 
-| Phase | Scope | State |
-|---|---|---|
-| **M1** — IPC transport + codec + codegen | [`PLAN.md §3.1`](PLAN.md#phase-1--m1-code-gen--ipc-transport-800-usdt) | ✅ Shipped |
-| **M2** — Core API surface (loadModel, completion, embed, transcribe, etc.) | [`PLAN.md §3.2`](PLAN.md#phase-2--m2-core-api-surface-1000-usdt) | ✅ Shipped |
-| **M3** — RAG, plugins, docs, distribution | [`PLAN.md §3.3`](PLAN.md#phase-3--m3-rag-plugins-docs-distribution-1200-usdt) | ✅ Shipped |
+The source, generated API, worker bundle, native-addon closure, tests, and release
+automation are prepared for 0.17.0. A tagged SwiftPM release requires one external
+maintainer sequence: produce an unpublished deterministic artifact candidate,
+commit its checksum-pinned URL manifest, obtain green CI for that exact commit,
+and only then publish the immutable xcframework archives and source tag. Until
+that release exists, do not present the development `Package.swift` as a
+URL-installable tag. See
+[Submission evidence](SUBMISSION.md) for the reviewer-facing requirement matrix,
+[Distribution and release](docs/distribution.md) for the guarded process, and
+[Swift Package Index submission](docs/swift-package-index.md) for the post-release
+index checklist. The exact redistributed-package inventory, package-provided
+texts, and pinned supplements are in
+[Third-party notices](THIRD_PARTY_NOTICES.md); binary publication is gated on an
+explicit maintainer/legal review of that generated record.
 
-## Install
+Published source tags are designed to be consumed as follows:
 
 ```swift
-// Package.swift
 dependencies: [
-    .package(url: "https://github.com/tetherto/qvac-swift", from: "0.1.0"),
+    .package(
+        url: "https://github.com/Jainakin/qvac-swift.git",
+        exact: "0.1.0"
+    ),
 ],
 targets: [
     .target(
-        name: "App",
+        name: "MyApp",
         dependencies: [
             .product(name: "QVACClient", package: "qvac-swift"),
         ]
@@ -32,210 +42,307 @@ targets: [
 ]
 ```
 
-iOS 17+, macOS 14+, both arm64. The package vendors a pre-built
-`worker.mobile.bundle` as an SPM resource — no extra setup on iOS. The bundle
-is ~10 MB compressed; App Store thinning trims it further per device.
+Do not use that version requirement until `v0.1.0` (or a later reviewed source
+tag) has actually been published.
 
-### Monorepo developer setup (one-time, contributors only)
+## Exact upstream identity
 
-The dev-mode `Package.swift` references ~35 vendored xcframeworks under
-`spike-swift/Vendor/` (BareKit + every native addon the iOS bundle dlopens). They
-are NOT git-tracked — ~400 MB of binary artifacts. Run the vendor script once
-before your first `swift build`:
+- SDK: `@qvac/sdk@0.17.0`
+- Published npm `gitHead`: `e8b440665a053a9efe852f04c3601da44f0d55d8`
+- Wire methods: 39
+- Error codes: 136, including client, server, model-registry, and registry ranges
+- Node toolchain for codegen and artifacts: 22.22.0
+- Worker SHA-256: `3d17393e67b0ed6830a5dad2f575b9d8835589a4eed321629ff2f514066cd769`
 
-```bash
-./tools/dev/vendor-from-release.sh v0.0.1-rc1
-```
+The complete source/tarball hashes are recorded in
+[`tools/provenance/qvac-sdk.lock.json`](tools/provenance/qvac-sdk.lock.json).
+Generation consumes the committed 0.17 contract JSON at that release commit, not
+`latest`, a floating npm install, or the later drifting `sdk-v0.17.0` tag.
 
-This reads the committed bundle's `addons` table, computes the transitive
-`@rpath` closure, and downloads the matching `.xcframework`s from the GitHub
-Release into `spike-swift/Vendor/`. Subsequent `swift build` / `xcodebuild` calls
-will resolve cleanly.
-
-External SPM consumers (via `.package(url:)`) don't run this script — they get
-the URL-based release manifest where SPM fetches the xcframeworks transparently.
-
-## Quickstart
+## Quick start
 
 ### iOS
+
+An artifact-backed source release contains the verified worker bundle and its
+complete native xcframework closure. The application does not start Node or a
+subprocess.
 
 ```swift
 import QVACClient
 
-let client = try await QVACClient(configuration: try .iOSWithBundledResource())
-let modelId = try await client.loadModel(
-    modelSrc: "https://huggingface.co/.../model.gguf",
-    modelType: "llamacpp-completion"
+let client = try await QVACClient(
+    configuration: try .iOSWithBundledResource()
 )
-let run = try await client.completion(
-    modelId: modelId,
-    history: [.user("Say hi in one word.")]
-)
-for try await tok in run.tokenStream {
-    print(tok, terminator: "")
+
+do {
+    let load = try await client.loadModelStreaming(
+        modelSrc: "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/d255afaffd3441b95abca9b5cc4c819b93f66936/SmolLM2-135M-Instruct-Q4_K_M.gguf",
+        modelType: "llamacpp-completion",
+        rpcOptions: .init(timeout: .seconds(600))
+    )
+
+    async let loadedModelId = load.result.value
+    for try await event in load.progress {
+        print("download: \(event.percentage)%")
+    }
+    let modelId = try await loadedModelId
+
+    let completion = try await client.completion(
+        modelId: modelId,
+        history: [.user("Answer in one short sentence: what is QVAC?")],
+        rpcOptions: .init(timeout: .seconds(60))
+    )
+    for try await token in completion.tokenStream {
+        print(token, terminator: "")
+    }
+    _ = try await completion.final.value
+
+    try await client.unloadModel(
+        modelId: modelId,
+        rpcOptions: .init(timeout: .seconds(10))
+    )
+    await client.close()
+} catch {
+    await client.close()
+    throw error
 }
-try await client.unloadModel(modelId: modelId)
 ```
 
 ### macOS
 
-macOS spawns the worker as a subprocess. You need (one-time):
+macOS runs the QVAC worker in a Bare subprocess over a private Unix-domain socket.
+Install the exact Bare executable and SDK into one lockfile-pinned runtime, then
+pass that runtime's `node_modules` directory:
 
 ```bash
-# 1. bare runtime
-brew install holepunchto/tap/bare-runtime
-bare --version          # sanity check
-
-# 2. @qvac/sdk installed somewhere — anywhere works as long as the path is stable.
-#    `--legacy-peer-deps` is required because @qvac/sdk's peerDeps overlap with
-#    its own deps (npm 7+ would otherwise reject the install).
-mkdir my-app && cd my-app
+mkdir qvac-runtime
+cd qvac-runtime
 npm init -y
-npm install --legacy-peer-deps @qvac/sdk
-# `node_modules/@qvac/sdk/dist/server/worker.js` is now the path the Swift client
-# resolves to. Capture `$(pwd)/node_modules` and pass that to nodeModulesDir.
+npm install --save-exact @qvac/sdk@0.17.0 bare-runtime@1.31.0
+```
+
+Commit the resulting application lockfile. For release validation, use this
+repository's stronger, fully resolved runtime lock instead:
+
+```bash
+# Node must match tools/codegen/.node-version (22.22.0).
+tools/runtime/bootstrap.sh
 ```
 
 ```swift
-let client = try await QVACClient(configuration:
-    try .macOS(nodeModulesDir: URL(fileURLWithPath: "/path/to/my-app/node_modules"))
+let configuration = try QVACClient.Configuration.macOS(
+    nodeModulesDir: URL(fileURLWithPath: "/absolute/path/to/qvac-runtime/node_modules")
 )
-// … same API as iOS from here on
+let client = try await QVACClient(configuration: configuration)
 ```
 
-Tips:
-- The `nodeModulesDir` must contain `@qvac/sdk/dist/server/worker.js`. The path is
-  validated at `connect` time; you'll see `workerNotFound` immediately if it's wrong.
-- If `bare` isn't on `/opt/homebrew/bin` or `/usr/local/bin`, pass `bareExecutable:` to
-  `Configuration.macOS(...)` explicitly. The package also scans nvm versioned dirs and
-  falls back to `which bare`.
-- The `Examples/QVACChat` macOS target uses a `resolveNodeModulesDir()` helper that
-  checks (1) the `QVAC_NODE_MODULES` env var, (2) `./spike-js/node_modules` (monorepo
-  layout), then (3) `./node_modules` relative to cwd. Steal the pattern if your app
-  doesn't want to hard-code the path either — see [Examples/QVACChat/Sources/ContentView.swift](Examples/QVACChat/Sources/ContentView.swift).
+`Configuration.macOS` validates the worker path and first uses
+`node_modules/.bin/bare`, binding the executable to the same application lockfile.
+It falls back to PATH/common install locations only when that local binary is absent;
+pass `bareExecutable:` explicitly for a different controlled deployment.
 
-## Architecture
+## Request deadlines, cancellation, and profiling
 
-The Swift client speaks the [bare-rpc](https://github.com/holepunchto/bare-rpc) wire
-protocol on top of a byte-level [`BareTransport`](Sources/QVACClient/Internal/Transport/BareTransport.swift):
+Every operation accepts trailing `rpcOptions:`. A request/reply deadline covers
+the complete response; a server-stream deadline is an inactivity deadline between
+frames; a duplex deadline covers session setup. The minimum is 100 ms.
 
-- **macOS** → `UnixDomainSocketTransport`: spawns `bare worker.js` as a subprocess,
-  communicates over a Unix Domain Socket — same pattern as the JS client on Node.
-- **iOS** → `BareIPCTransport`: runs the worker *in-process* as a libuv thread via
-  Holepunch's BareKit, communicates over a socketpair. No subprocess (Apple forbids it).
+```swift
+let run = try await client.completion(
+    modelId: modelId,
+    history: [.user("Write a haiku")],
+    rpcOptions: .init(timeout: .seconds(30))
+)
 
-The codec, multiplexer, and high-level API are platform-agnostic and share the same
-codepaths on both platforms.
+try await client.cancel(
+    .request(requestId: run.requestId),
+    rpcOptions: .init(timeout: .seconds(2))
+)
+```
 
-Wire types are **generated** from the QVAC SDK's Zod schemas — see
-[`tools/codegen/`](tools/codegen/). Re-running the generator against the latest
-`@qvac/sdk` produces no diff against the checked-in output for an unchanged version
-(satisfies grant criterion **AC-11**); a daily CI job opens an issue automatically when
-upstream shapes change.
+`QVACRPCOptions()` deliberately leaves `timeout` unset, matching the executable
+0.17 JavaScript contract. Production applications should set an operation-specific
+deadline based on model size and expected output. Timeouts and task cancellation
+tear down pending RPC state and stream directions; they do not leave a permanently
+blocked request in the client multiplexer.
 
-More: [`docs/spike-validations.md`](docs/spike-validations.md) for protocol validation
-history, [`docs/bundle-and-addons.md`](docs/bundle-and-addons.md) for iOS bundle and
-native-addon strategy.
+Profiling can be enabled per call. Metadata-only profiling trailer records are
+consumed separately and never decoded as ordinary response types:
 
-## Full API surface
+```swift
+let options = QVACRPCOptions(
+    timeout: .seconds(30),
+    profiling: .init(enabled: true, includeServerBreakdown: true)
+)
+```
 
-| Group | Methods |
+Provide `profilingMetadataHandler:` when constructing `QVACClient` to receive the
+returned profiling object.
+
+## API coverage
+
+Generated request/response types and exact `wire…` entry points cover all 39
+methods in the 0.17.0 manifest:
+
+| Shape | Methods |
 |---|---|
-| Lifecycle | `init(configuration:)`, `heartbeat()`, `close()`, `cancel(_:)` |
-| Model lifecycle | `loadModel`, `loadModelStreaming`, `unloadModel`, `downloadAsset`, `downloadAssetStreaming` |
-| LLM | `completion` (with `events` / `tokenStream` / `final`) |
-| Embeddings | `embed` (single + batch) |
-| Audio | `transcribe`, `transcribeStream` (duplex), `textToSpeech`, `textToSpeechStream` (duplex) |
-| Translation | `translate` (LLM + NMT modes) |
-| Vision | `ocr`, `diffusion` |
-| RAG | `ragIngest`, `ragSearch`, `ragChunk`, `ragSaveEmbeddings`, `ragDeleteEmbeddings`, `ragListWorkspaces`, `ragCloseWorkspace`, `ragDeleteWorkspace`, `ragReindex` |
-| Plugins | `invokePlugin`, `invokePluginStream` (Codable generics) |
+| Request/reply | `cancel`, `deleteCache`, `downloadAsset`, `embed`, `finetune`, `getLoadedModelInfo`, `getModelInfo`, `getSystemResources`, `heartbeat`, `loadModel`, `modelRegistryGetModel`, `modelRegistryList`, `modelRegistrySearch`, `pluginInvoke`, `provide`, `rag`, `resume`, `state`, `stopProvide`, `suspend`, `unloadModel` |
+| Server stream | `audioGenStream`, `batchCompletionStream`, `bciTranscribe`, `classify`, `completionStream`, `diffusionStream`, `loggingStream`, `ocrStream`, `pluginInvokeStream`, `textToSpeech`, `transcribe`, `translate`, `upscaleStream`, `videoStream` |
+| Duplex | `bciTranscribeStream`, `completionOrchestrate`, `textToSpeechStream`, `transcribeStream` |
 
-Reference docs: build the DocC catalog (`xcodebuild docbuild -scheme QVACClient`) or
-read [`Sources/QVACClient/Documentation.docc/`](Sources/QVACClient/Documentation.docc/).
+Rich Swift wrappers add request IDs, typed progress/events, binary `Data`
+conversion, terminal-result tasks, and targeted cancellation for common model,
+completion, embedding, transcription, TTS, translation, OCR, diffusion, audio,
+video, upscaling, classification, RAG, plugin, VLA, and batch workflows. The
+generated wire methods remain available when an application needs every optional
+contract field directly.
 
-## Example app
+`QVACSDKContract.methods` is the generated runtime inventory. CI requires both the
+generated type round trips and the live public-API exercise set to equal that
+inventory exactly, so an upstream method cannot be silently omitted.
 
-`Examples/QVACChat/` is a complete SwiftUI demo — type a prompt, load a model, watch
-tokens stream. Builds for both iOS Simulator and macOS:
+### Upscale example
+
+QVAC 0.17 documents the public `diffusion` model-type alias; the Swift client
+normalizes it to the canonical `sdcpp-generation` wire value from the pinned
+`model-type-maps.json` contract:
+
+```swift
+let load = try await client.loadModel(
+    modelSrc: "/absolute/path/to/RealESRGAN_x4plus.pth",
+    modelType: "diffusion",
+    modelConfig: .object(["mode": .string("upscale")]),
+    rpcOptions: .init(timeout: .seconds(600))
+)
+let upscalerId = try await load.result.value
+
+let inputPNG = try Data(contentsOf: inputURL)
+let upscale = try await client.upscale(
+    modelId: upscalerId,
+    image: inputPNG,
+    rpcOptions: .init(timeout: .seconds(120))
+)
+let outputPNGs = try await upscale.outputs.value
+
+try await client.unloadModel(
+    modelId: upscalerId,
+    rpcOptions: .init(timeout: .seconds(10))
+)
+```
+
+## Bounded streaming and large media
+
+Inbound bare-rpc frames, NDJSON records, transport buffers, and per-operation raw
+stream queues are bounded. The default maximum wire message is 256 MiB because
+0.17 video and upscaling return complete base64 media values in one JSON record.
+
+Tune `maximumWireMessageBytes:` and `maximumBufferedStreamBytes:` in the client
+initializer for the deployment. A lower value reduces worst-case memory exposure
+but rejects larger valid outputs. Base64 decoding and `Data` ownership can
+temporarily require several times the encoded payload size, which matters on
+memory-constrained iOS devices.
+
+Public fan-out streams are bounded to 64 elements. A slow observer fails with
+`QVACStreamBufferOverflow`; terminal result tasks continue independently when the
+progress view is observational.
+
+## Reproducible development setup
+
+The checked-in development manifest points at generated local xcframeworks. From a
+clean clone, select Node 22.22.0 and materialize the exact graph before building:
+
+```bash
+tools/codegen/bootstrap.sh
+tools/codegen/run.sh --generate-only
+tools/runtime/link-ios-artifacts.sh
+swift package dump-package >/dev/null
+swift build
+swift test
+```
+
+The committed bundle is reproduced twice in distinct work roots and must be
+byte-identical:
+
+```bash
+tools/runtime/test-bundle-reproducibility.sh
+cmp tools/runtime/.build/worker.repro-a.bundle \
+    Sources/QVACClient/Resources/worker.mobile.bundle
+```
+
+See [`tools/codegen/README.md`](tools/codegen/README.md) for the zero-manual-Swift
+generation guarantee and [`docs/distribution.md`](docs/distribution.md) for the
+artifact-first release procedure.
+
+## Verification matrix
+
+The required CI pipeline contains independent gates for:
+
+- exact contract provenance, npm/source semantic parity, generated-file freshness,
+  and generation time below 30 seconds after bootstrap;
+- warning-free strict-concurrency build and all unit/semantic tests;
+- byte-reproducible 0.17 worker and deterministic native archives;
+- all 39 public operations against a live 0.17 worker with zero skips;
+- checksum-pinned real LLM, RAG embedding, and ESRGAN upscale models;
+- macOS, generic iOS-device, iOS Simulator, DocC, and example-app builds;
+- a release-mode Swift-versus-JavaScript public API benchmark with the grant's 5%
+  overhead gate; and
+- a clean external Swift package that resolves the published Git URL and immutable
+  binary artifacts.
+
+Useful local entry points:
+
+```bash
+swift test --filter QVACClientUnitTests
+
+QVAC_BARE_BIN="$PWD/tools/runtime/node_modules/.bin/bare" \
+QVAC_NODE_MODULES="$PWD/tools/runtime/node_modules" \
+QVAC_WORKER_SCRIPT="$PWD/tools/runtime/node_modules/@qvac/sdk/dist/server/worker.js" \
+tools/ci/run-required-suite.sh AllRPCTypesRoundTripTests 1
+
+bench/run.sh 1000
+```
+
+Model-bearing suites download artifacts from immutable revisions and verify byte
+size plus SHA-256 before use. Required CI invokes them through
+`run-required-suite.sh`, which fails on any skip or unexpected test count; a broken
+or unavailable fixture is never reported as success.
+
+## Example application
+
+[`Examples/QVACChat`](Examples/QVACChat) is a SwiftUI load → completion → unload
+application for iOS and macOS. Generate its Xcode project with XcodeGen after the
+development artifact graph has been materialized:
 
 ```bash
 cd Examples/QVACChat
 xcodegen generate
-xcodebuild -scheme QVACChat-iOS  -destination 'platform=iOS Simulator,name=iPhone 17'
-xcodebuild -scheme QVACChat-macOS -destination 'platform=macOS'
+xcodebuild -project QVACChat.xcodeproj -scheme QVACChat-iOS \
+  -destination 'generic/platform=iOS Simulator' build
+xcodebuild -project QVACChat.xcodeproj -scheme QVACChat-macOS \
+  -destination 'platform=macOS' build
 ```
 
-On macOS the example needs to know where your `@qvac/sdk` `node_modules` live. The
-app's `resolveNodeModulesDir()` helper checks in this order:
+On macOS, set `QVAC_NODE_MODULES` to the exact runtime `node_modules` directory.
+iOS loads the packaged worker resource directly.
 
-1. `QVAC_NODE_MODULES` env var (explicit override — set this when running the macOS
-   target from Xcode via the scheme's Environment Variables)
-2. `./spike-js/node_modules` relative to the cwd (works when launching from the
-   monorepo root)
-3. `./node_modules` relative to the cwd (works when the example is run from a sibling
-   directory that has `@qvac/sdk` installed)
+## Security and lifecycle
 
-If none match, the app throws a clear error with instructions; iOS doesn't need this
-because the worker bundle is shipped as an SPM resource.
+- macOS sockets live in an atomically created `0700` directory and use `0600`
+  permissions; inherited descriptors are closed and writes cannot terminate the
+  host process with `SIGPIPE`.
+- dynamic-loader and diagnostic injection variables are removed from the spawned
+  worker environment overlay.
+- `close()` is idempotent and joinable. iOS performs the SDK's bounded
+  `__shutdown__` handshake before worklet termination; macOS waits for socket and
+  child-process cleanup.
+- Unknown discriminators, malformed numeric error codes, invalid base64, truncated
+  NDJSON, unexpected response variants, and oversized records fail explicitly.
+- Model and asset URLs are caller-controlled. Applications accepting untrusted URLs
+  must enforce their own HTTPS and host allowlist policy.
 
-## Tests
-
-```bash
-swift test --filter QVACClientUnitTests            # 70 unit tests, no Bare worker required
-swift test --filter QVACClientIntegrationTests     # live-worker integration tests on macOS
-xcodebuild test \
-    -project spike-swift/Examples/BareKitProbeApp/BareKitProbeApp.xcodeproj \
-    -scheme BareKitProbeApp \
-    -destination 'platform=iOS Simulator,name=iPhone 17'   # iOS hosted XCTest
-```
-
-Integration tests are env-gated so a default `swift test` is fast and offline:
-
-| Env var | Suite that runs | What it covers |
-|---|---|---|
-| `QVAC_BARE_BIN` + `QVAC_WORKER_SCRIPT` | `LiveWorkerIntegrationTests` | init, heartbeat, downloadAsset streaming, cancel envelope, close |
-| `QVAC_BARE_BIN` + `QVAC_NODE_MODULES` | `QVACClientIntegrationTests` | full client lifecycle via public `QVACClient` API |
-| `QVAC_RUN_REAL_MODEL_TESTS=1` + above | `RealModelIntegrationTests` | full `load → completion → cancel → unload` cycle (requires `HF_TOKEN` or a public model) |
-| `QVAC_RUN_RAG_TESTS=1` + above | `RAGIntegrationTests` | full RAG ingest/search/delete vs a live worker |
-
-CI runs the first two by default; the model-bearing suites are opt-in (they download
-weights and take minutes). See `.github/workflows/ci.yml` for the wiring.
-
-## Benchmark (KR-2)
-
-```bash
-./bench/run.sh 500       # 500 heartbeat iters Swift vs Node, prints ratio
-```
-
-The script runs both the Swift and the Node clients against the same Bare worker, then
-compares mean round-trip latency. KR-2 requires Swift overhead < 5% of Node. The script
-exits non-zero if the ratio exceeds `QVAC_BENCH_MAX_OVERHEAD` (default `1.05`). No
-results are committed to the repo — every reviewer regenerates them locally so the
-numbers reflect *their* hardware.
-
-## Security model
-
-The Swift client is the consumer half of a client/worker split. Threat model and the
-guarantees you should expect from this library:
-
-| Boundary | Trust assumption | What the library does |
-|---|---|---|
-| **macOS UDS socket** between client + spawned worker | only the spawning user can connect | socket sits inside a 0700 `mkdtemp` dir; socket file itself is `chmod 0600`; ~36-bit random path |
-| **`environmentOverlay` passed to `.macOS(...)`** | caller is responsible for the values | client strips `DYLD_*`/`LD_PRELOAD`/`LD_LIBRARY_PATH`/`LD_AUDIT` before exec so untrusted overlay can't inject a dylib |
-| **Inbound frames from the worker** | bounded size | `BareRPCFrameReader` caps frame size at 64 MiB; oversize frames throw `BareRPCCodecError.frameTooLarge` rather than allocating |
-| **`modelSrc`/`assetSrc` URLs** | caller-supplied, library forwards verbatim | URLs are not validated. If your app accepts these from untrusted users, **you must validate them yourself** — the worker will fetch any URL you pass |
-| **iOS bundled `worker.mobile.bundle.js`** | release-time vendored from `@qvac/sdk` | inherent supply-chain trust on upstream SDK; releases pin a specific `@qvac/sdk` version via `package-lock.json` |
+The full threat model is in
+[`Sources/QVACClient/Documentation.docc/Security.md`](Sources/QVACClient/Documentation.docc/Security.md).
 
 ## License
 
-Apache-2.0 — matches upstream QVAC SDK.
-
-## References
-
-- [PLAN.md](PLAN.md) — full grant traceability + implementation plan
-- [ISSUES.md](ISSUES.md) — issue tracker
-- [docs/spike-validations.md](docs/spike-validations.md) — protocol validation evidence
-- [docs/bundle-and-addons.md](docs/bundle-and-addons.md) — iOS bundle + addon strategy
-- [tools/codegen/README.md](tools/codegen/README.md) — codegen pipeline
-- [QVAC SDK docs](https://docs.qvac.tether.io/)
+Apache-2.0.

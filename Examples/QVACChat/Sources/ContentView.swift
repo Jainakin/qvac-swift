@@ -10,12 +10,10 @@ final class ChatViewModel: ObservableObject {
     @Published var modelId: String? = nil
     @Published var prompt: String = "What is QVAC in one sentence?"
     @Published var output: String = ""
-    // The official HuggingFaceTB/SmolLM2-135M-Instruct-GGUF repo flipped its
-    // /resolve/ endpoint to require auth ("Invalid username or password") even
-    // for anonymous public-model downloads. We default to bartowski's mirror of
-    // the same model, which still serves 302 → CDN to anonymous clients.
+    // Same immutable model revision, byte size, and SHA-256 as the required real-
+    // model integration fixture. Do not use a mutable `/resolve/main/` URL here.
     @Published var modelURL: String =
-        "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf"
+        "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/d255afaffd3441b95abca9b5cc4c819b93f66936/SmolLM2-135M-Instruct-Q4_K_M.gguf"
     @Published var loadPercent: Double = 0
     @Published var isBusy: Bool = false
 
@@ -23,27 +21,54 @@ final class ChatViewModel: ObservableObject {
 
     func loadModel() async {
         guard !isBusy else { return }
+        guard modelId == nil else {
+            status = "Unload the current model before loading another"
+            return
+        }
         isBusy = true; defer { isBusy = false }
         status = "Connecting to worker…"
         output = ""
+        loadPercent = 0
         do {
+            // `unload()` closes its worker, but also defend against an idle client
+            // left by an interrupted UI flow before replacing the reference.
+            if let existingClient = client {
+                await existingClient.close()
+                client = nil
+            }
             let config = try Self.makeDefaultConfig()
             let client = try await QVACClient(configuration: config)
             self.client = client
             status = "Loading model…"
-            let (progress, idTask) = try await client.loadModelStreaming(
+            let load = try await client.loadModelStreaming(
                 modelSrc: modelURL,
-                modelType: "llamacpp-completion"
+                modelType: "llamacpp-completion",
+                rpcOptions: .init(timeout: .seconds(600))
             )
-            Task {
-                for try await tick in progress {
-                    await MainActor.run { self.loadPercent = tick.percentage }
+            let progressTask = Task { @MainActor in
+                for try await tick in load.progress {
+                    self.loadPercent = tick.percentage
                 }
             }
-            let id = try await idTask.value
+            let id: String
+            do {
+                id = try await load.result.value
+                try await progressTask.value
+            } catch {
+                progressTask.cancel()
+                _ = try? await progressTask.value
+                throw error
+            }
             modelId = id
+            loadPercent = 100
             status = "Loaded: \(id)"
         } catch {
+            // Covers failures before a progress task exists as well as failures
+            // after it starts. Never leave a worker hidden behind a failed load.
+            if let failedClient = client, modelId == nil {
+                await failedClient.close()
+                client = nil
+            }
             status = "Error: \(error)"
         }
     }
@@ -63,11 +88,13 @@ final class ChatViewModel: ObservableObject {
             let run = try await client.completion(
                 modelId: modelId,
                 history: [.user(prompt)],
-                generationParams: .object(["predict": .number(120)])
+                generationParams: .object(["predict": .number(120)]),
+                rpcOptions: .init(timeout: .seconds(60))
             )
             for try await tok in run.tokenStream {
-                await MainActor.run { self.output += tok }
+                output += tok
             }
+            _ = try await run.final.value
             status = "Done"
         } catch {
             status = "Error: \(error)"
@@ -79,12 +106,32 @@ final class ChatViewModel: ObservableObject {
         isBusy = true; defer { isBusy = false }
         status = "Unloading…"
         do {
-            try await client.unloadModel(modelId: modelId)
+            try await client.unloadModel(
+                modelId: modelId,
+                rpcOptions: .init(timeout: .seconds(10))
+            )
+            await client.close()
+            self.client = nil
             self.modelId = nil
+            loadPercent = 0
             status = "Unloaded"
         } catch {
             status = "Unload error: \(error)"
         }
+    }
+
+    func close() async {
+        guard let client else { return }
+        if let modelId {
+            _ = try? await client.unloadModel(
+                modelId: modelId,
+                rpcOptions: .init(timeout: .seconds(10))
+            )
+        }
+        await client.close()
+        self.client = nil
+        self.modelId = nil
+        loadPercent = 0
     }
 
     private static func makeDefaultConfig() throws -> QVACClient.Configuration {
@@ -94,7 +141,7 @@ final class ChatViewModel: ObservableObject {
         guard let nodeModulesDir = resolveNodeModulesDir() else {
             throw QVACError.transport(reason:
                 "macOS demo needs an @qvac/sdk install. Set QVAC_NODE_MODULES to your " +
-                "node_modules dir, or run from the repo root (we'll find spike-js/node_modules)."
+                "node_modules dir, or materialize tools/runtime/node_modules from the repo."
             )
         }
         return try .macOS(nodeModulesDir: nodeModulesDir)
@@ -104,23 +151,34 @@ final class ChatViewModel: ObservableObject {
     }
 
     #if os(macOS)
-    /// Resolve the node_modules dir, in order:
-    ///   1. QVAC_NODE_MODULES env var (explicit override).
-    ///   2. ./spike-js/node_modules under the current working directory (repo monorepo dev).
-    ///   3. nil — caller must configure.
+    /// Resolve an exact SDK runtime from an explicit environment override or a
+    /// nearby repository checkout. Every candidate must contain the 0.17 worker.
     private static func resolveNodeModulesDir() -> URL? {
         if let env = ProcessInfo.processInfo.environment["QVAC_NODE_MODULES"], !env.isEmpty {
-            return URL(fileURLWithPath: env)
+            let candidate = URL(fileURLWithPath: env)
+            if containsWorker(candidate) { return candidate }
         }
-        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        let candidates = [
-            cwd.appendingPathComponent("spike-js/node_modules"),
-            cwd.appendingPathComponent("node_modules"),
-        ]
-        for c in candidates where FileManager.default.fileExists(atPath: c.path) {
-            return c
+
+        var directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        for _ in 0..<6 {
+            let candidates = [
+                directory.appendingPathComponent("tools/runtime/node_modules"),
+                directory.appendingPathComponent("node_modules"),
+            ]
+            if let match = candidates.first(where: containsWorker) { return match }
+            let parent = directory.deletingLastPathComponent()
+            if parent.path == directory.path { break }
+            directory = parent
         }
         return nil
+    }
+
+    private static func containsWorker(_ nodeModules: URL) -> Bool {
+        FileManager.default.fileExists(
+            atPath: nodeModules
+                .appendingPathComponent("@qvac/sdk/dist/server/worker.js")
+                .path
+        )
     }
     #endif
 }
@@ -144,6 +202,9 @@ struct ContentView: View {
         }
         .scrollDismissesKeyboard(.interactively)
         .dynamicTypeSize(...DynamicTypeSize.xLarge)
+        .onDisappear {
+            Task { await vm.close() }
+        }
     }
 
     // MARK: - Sections
@@ -190,8 +251,7 @@ struct ContentView: View {
                 TextField("https://.../model.gguf", text: $vm.modelURL, axis: .vertical)
                     .lineLimit(2...5)
                     .font(.system(.caption2, design: .monospaced))
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
+                    .qvacURLInputBehavior()
                     .padding(10)
                     .background(softBackground)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -206,7 +266,7 @@ struct ContentView: View {
                             .frame(maxWidth: .infinity, minHeight: 32)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(vm.isBusy)
+                    .disabled(vm.isBusy || vm.modelId != nil)
 
                     Button {
                         Task { await vm.unload() }
@@ -284,6 +344,18 @@ struct ContentView: View {
         return Color(.secondarySystemBackground)
         #else
         return Color.gray.opacity(0.12)
+        #endif
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func qvacURLInputBehavior() -> some View {
+        #if os(iOS)
+        autocorrectionDisabled()
+            .textInputAutocapitalization(.never)
+        #else
+        self
         #endif
     }
 }

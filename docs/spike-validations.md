@@ -1,5 +1,9 @@
 # Phase 0 Spike Validations — Findings
 
+> **Historical 0.10.2 spike record.** These findings explain early design choices
+> but do not describe the current 0.17.0 release candidate. For current contract,
+> artifact, and validation details, use the root README and `distribution.md`.
+
 > **Status:** All 5 outstanding validations resolved. Plan unchanged at the milestone level; several risks downgraded; two protocol details previously fuzzy in PLAN.md §2 are now firm.
 
 Date: 2026-05-11

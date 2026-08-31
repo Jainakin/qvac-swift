@@ -1,149 +1,104 @@
-// generate-errors.mjs — emit Sources/QVACClient/Generated/QVACErrorCodes.generated.swift
-//
-// Reads:
-//   <qvac-sdk-root>/schemas/sdk-errors-client.ts
-//   <qvac-sdk-root>/schemas/sdk-errors-server.ts
-// Extracts every `NAME: <integer>,` from the `SDK_*_ERROR_CODES` object literals and emits
-// a Swift `enum QVACErrorCode: Int` covering every code.
-//
-// Idempotent: re-running produces no diff against the checked-in output when the upstream
-// hasn't changed (verified by tools/codegen-freshness.sh).
+#!/usr/bin/env node
+// Generate the complete Swift error enum from the pinned, exported SDK contract.
+// The contract is a release artifact at the authoritative source commit; codegen
+// never scrapes a moving branch or reparses TypeScript source.
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const __dirname = dirname(fileURLToPath(import.meta.url))
-const REPO_ROOT = resolve(__dirname, '..', '..')
+const scriptDir = dirname(fileURLToPath(import.meta.url))
+const repoRoot = resolve(scriptDir, '..', '..')
+const provenance = JSON.parse(readFileSync(resolve(repoRoot, 'tools/provenance/qvac-sdk.lock.json'), 'utf8'))
+const upstreamDir = resolve(process.env.QVAC_UPSTREAM_DIR ?? resolve(scriptDir, '.build/qvac-sdk'))
+const contractPath = resolve(upstreamDir, 'packages/sdk/contract/error-codes.json')
+const generatedDir = resolve(process.env.QVAC_GENERATED_DIR
+  ?? resolve(repoRoot, 'Sources/QVACClient/Generated'))
+const output = resolve(generatedDir, 'QVACErrorCodes.generated.swift')
 
-// Default location — sparse-checkout of tetherto/qvac (see tools/codegen/README.md §1).
-// Overridable via env to support running against a different checkout.
-const SDK_SCHEMAS_DIR = process.env.QVAC_SCHEMAS_DIR
-  ?? resolve(REPO_ROOT, 'qvac-sparse/packages/sdk/schemas')
+const contract = JSON.parse(readFileSync(contractPath, 'utf8'))
+const expectedGroups = ['registry', 'client', 'server']
+if (JSON.stringify(Object.keys(contract).sort()) !== JSON.stringify([...expectedGroups].sort())) {
+  throw new Error(`Unexpected error-code groups in ${contractPath}: ${Object.keys(contract).join(', ')}`)
+}
 
-const CLIENT_TS = resolve(SDK_SCHEMAS_DIR, 'sdk-errors-client.ts')
-const SERVER_TS = resolve(SDK_SCHEMAS_DIR, 'sdk-errors-server.ts')
-const OUTPUT = resolve(REPO_ROOT, 'Sources/QVACClient/Generated/QVACErrorCodes.generated.swift')
+function lowerCamel(name) {
+  const [head, ...tail] = name.toLowerCase().split('_')
+  return head + tail.map(part => part[0].toUpperCase() + part.slice(1)).join('')
+}
 
-// ----------------------------------------------------------------------------------
-// Parsing
-// ----------------------------------------------------------------------------------
+function upperFirst(value) {
+  return value[0].toUpperCase() + value.slice(1)
+}
 
-/**
- * Extract codes from an `SDK_*_ERROR_CODES = { ... } as const;` block.
- * We rely on the structure of these files (committed format, one entry per line) rather
- * than a full TS parser; the QVAC repo's lint/format rules keep this stable.
- */
-function extractCodes(filePath, expectedSymbol) {
-  const src = readFileSync(filePath, 'utf8')
-  const startMarker = `export const ${expectedSymbol} = {`
-  const startIdx = src.indexOf(startMarker)
-  if (startIdx === -1) throw new Error(`Couldn't find ${startMarker} in ${filePath}`)
-  let depth = 0, i = startIdx + startMarker.length
-  while (i < src.length) {
-    if (src[i] === '{') depth++
-    else if (src[i] === '}') {
-      if (depth === 0) break
-      depth--
-    }
-    i++
+const namesByGroup = Object.fromEntries(expectedGroups.map(group => [group, new Set(Object.keys(contract[group]))]))
+const entries = []
+for (const group of expectedGroups) {
+  for (const [name, code] of Object.entries(contract[group])) {
+    let swiftName = lowerCamel(name)
+    if (group === 'registry') swiftName = `registry${upperFirst(swiftName)}`
+    if (group === 'server' && namesByGroup.client.has(name)) swiftName += 'Server'
+    entries.push({ group, name, code, swiftName })
   }
-  const block = src.slice(startIdx + startMarker.length, i)
+}
+entries.sort((a, b) => a.code - b.code)
 
-  // Match `NAME: 12345,` lines, allowing inline /* comments */.
-  const out = []
-  for (const line of block.split('\n')) {
-    const trimmed = line.split('//')[0].trim()
-    if (!trimmed) continue
-    const m = trimmed.match(/^([A-Z][A-Z0-9_]*)\s*:\s*([0-9]+)\s*,?$/)
-    if (!m) continue
-    const [, name, code] = m
-    out.push({ name, code: Number(code) })
+const seenCodes = new Map()
+const seenSwiftNames = new Map()
+for (const entry of entries) {
+  if (!Number.isSafeInteger(entry.code)) throw new Error(`Invalid code for ${entry.group}.${entry.name}`)
+  if (seenCodes.has(entry.code)) {
+    throw new Error(`Duplicate error code ${entry.code}: ${seenCodes.get(entry.code)} and ${entry.group}.${entry.name}`)
   }
-  return out
+  if (seenSwiftNames.has(entry.swiftName)) {
+    throw new Error(`Swift identifier collision ${entry.swiftName}: ${seenSwiftNames.get(entry.swiftName)} and ${entry.group}.${entry.name}`)
+  }
+  seenCodes.set(entry.code, `${entry.group}.${entry.name}`)
+  seenSwiftNames.set(entry.swiftName, `${entry.group}.${entry.name}`)
 }
 
-const clientCodes = extractCodes(CLIENT_TS, 'SDK_CLIENT_ERROR_CODES')
-const serverCodes = extractCodes(SERVER_TS, 'SDK_SERVER_ERROR_CODES')
+const counts = Object.fromEntries(expectedGroups.map(group => [group, Object.keys(contract[group]).length]))
+const ranges = [
+  [19001, 19003, 'registry'],
+  [50001, 50199, 'responseValidation'],
+  [50200, 50399, 'rpcCommunication'],
+  [50400, 50599, 'providerDelegation'],
+  [50600, 50799, 'buildBundle'],
+  [50800, 50899, 'profiler'],
+  [52001, 52199, 'modelRegistry'],
+  [52200, 52399, 'modelLoading'],
+  [52400, 52799, 'modelOperation'],
+  [52800, 52999, 'rag'],
+  [53000, 53199, 'download'],
+  [53200, 53349, 'cache'],
+  [53350, 53499, 'config'],
+  [53500, 53599, 'systemRuntime'],
+  [53600, 53699, 'lifecycle'],
+  [53700, 53849, 'serverRpcDelegation'],
+  [53850, 53899, 'plugin'],
+  [53900, 53949, 'security'],
+  [53950, 54000, 'modelRegistry'],
+]
 
-// Some names exist in BOTH files with different numeric codes (e.g. DELEGATE_NO_FINAL_RESPONSE
-// is 50402 on the client and 53700 on the server — they're genuinely distinct concepts,
-// just labelled identically). Disambiguate by tagging the server-side variant.
-const clientNames = new Set(clientCodes.map(e => e.name))
-const serverCodesDisambiguated = serverCodes.map(e =>
-  clientNames.has(e.name) ? { ...e, name: e.name + '_SERVER' } : e
-)
-const all = [...clientCodes, ...serverCodesDisambiguated].sort((a, b) => a.code - b.code)
-
-// Sanity: no duplicates on either code or name.
-const seenCode = new Map(), seenName = new Map()
-for (const e of all) {
-  if (seenCode.has(e.code)) throw new Error(`Duplicate error code ${e.code}: ${seenCode.get(e.code)} vs ${e.name}`)
-  if (seenName.has(e.name)) throw new Error(`Duplicate error name ${e.name}: codes ${seenName.get(e.name)} and ${e.code}`)
-  seenCode.set(e.code, e.name)
-  seenName.set(e.name, e.code)
-}
-
-// ----------------------------------------------------------------------------------
-// Categorization (matches Public/QVACError.swift's QVACErrorCategory)
-// ----------------------------------------------------------------------------------
-
-function categorize(code) {
-  // Mirrors the comment-section ranges in the upstream TS files.
-  if (code >= 50001 && code <= 50199) return 'responseValidation'
-  if (code >= 50200 && code <= 50399) return 'rpcCommunication'
-  if (code >= 50400 && code <= 50599) return 'providerDelegation'
-  if (code >= 50600 && code <= 50799) return 'buildBundle'
-  if (code >= 50800 && code <= 50899) return 'profiler'
-  if (code >= 52001 && code <= 52199) return 'modelRegistry'
-  if (code >= 52200 && code <= 52399) return 'modelLoading'
-  if (code >= 52400 && code <= 52799) return 'modelOperation'
-  if (code >= 52800 && code <= 52999) return 'rag'
-  if (code >= 53000 && code <= 53199) return 'download'
-  if (code >= 53200 && code <= 53349) return 'cache'
-  if (code >= 53350 && code <= 53499) return 'config'
-  if (code >= 53500 && code <= 53599) return 'systemRuntime'
-  if (code >= 53600 && code <= 53699) return 'lifecycle'
-  if (code >= 53700 && code <= 53849) return 'serverRpcDelegation'
-  if (code >= 53850 && code <= 53899) return 'plugin'
-  if (code >= 53900 && code <= 53949) return 'security'
-  return 'other'
-}
-
-// ----------------------------------------------------------------------------------
-// Emit Swift
-// ----------------------------------------------------------------------------------
-
-function swiftIdentifier(name) {
-  // Codes are already SCREAMING_SNAKE_CASE; Swift convention is camelCase for enum cases.
-  // Lowercase first letter, the rest follows underscore→PascalCase folding.
-  const parts = name.toLowerCase().split('_')
-  const head = parts[0]
-  const tail = parts.slice(1).map(p => p[0].toUpperCase() + p.slice(1)).join('')
-  return head + tail
-}
-
-const header = `\
-// QVACErrorCodes.generated.swift
+const swift = `// QVACErrorCodes.generated.swift
 //
-// AUTO-GENERATED by tools/codegen/generate-errors.mjs from:
-//   ${CLIENT_TS.replace(REPO_ROOT + '/', '')}
-//   ${SERVER_TS.replace(REPO_ROOT + '/', '')}
+// AUTO-GENERATED from @qvac/sdk@${provenance.sdkVersion} contract/error-codes.json
+// gitHead: ${provenance.source.commit}
 // DO NOT EDIT BY HAND. Re-run \`node tools/codegen/generate-errors.mjs\` to update.
 //
-// ${all.length} total codes: ${clientCodes.length} client (50001-52000), ${serverCodes.length} server (52001+).
+// ${entries.length} total codes: ${counts.registry} registry + ${counts.client} client + ${counts.server} server.
 
 import Foundation
 
 /// Every numeric error code defined by the QVAC SDK.
 /// See \`Public/QVACError.swift\` for the throwing surface.
 public enum QVACErrorCode: Int, Sendable, Equatable, CaseIterable {
-${all.map(e => `    case ${swiftIdentifier(e.name)} = ${e.code}`).join('\n')}
+${entries.map(entry => `    case ${entry.swiftName} = ${entry.code}`).join('\n')}
 
     /// SCREAMING_SNAKE_CASE name as defined in the QVAC SDK source.
     public var name: String {
         switch self {
-${all.map(e => `        case .${swiftIdentifier(e.name)}: return "${e.name}"`).join('\n')}
+${entries.map(entry => `        case .${entry.swiftName}: return "${entry.name}"`).join('\n')}
         }
     }
 
@@ -151,36 +106,13 @@ ${all.map(e => `        case .${swiftIdentifier(e.name)}: return "${e.name}"`).j
     /// error-handling code without enumerating every individual case.
     public var category: QVACErrorCategory {
         switch rawValue {
-${(() => {
-  // Emit one ranged case per category. Cleaner than per-code mapping for big lists.
-  const ranges = [
-    [50001, 50199, 'responseValidation'],
-    [50200, 50399, 'rpcCommunication'],
-    [50400, 50599, 'providerDelegation'],
-    [50600, 50799, 'buildBundle'],
-    [50800, 50899, 'profiler'],
-    [52001, 52199, 'modelRegistry'],
-    [52200, 52399, 'modelLoading'],
-    [52400, 52799, 'modelOperation'],
-    [52800, 52999, 'rag'],
-    [53000, 53199, 'download'],
-    [53200, 53349, 'cache'],
-    [53350, 53499, 'config'],
-    [53500, 53599, 'systemRuntime'],
-    [53600, 53699, 'lifecycle'],
-    [53700, 53849, 'serverRpcDelegation'],
-    [53850, 53899, 'plugin'],
-    [53900, 53949, 'security'],
-  ]
-  return ranges.map(([lo, hi, cat]) =>
-    `        case ${lo}...${hi}: return .${cat}`).join('\n')
-})()}
+${ranges.map(([low, high, category]) => `        case ${low}...${high}: return .${category}`).join('\n')}
         default: return .other
         }
     }
 }
 `
 
-mkdirSync(dirname(OUTPUT), { recursive: true })
-writeFileSync(OUTPUT, header)
-console.log(`Wrote ${all.length} codes (${clientCodes.length} client + ${serverCodes.length} server) → ${OUTPUT.replace(REPO_ROOT + '/', '')}`)
+mkdirSync(dirname(output), { recursive: true })
+writeFileSync(output, swift)
+console.log(`Wrote ${entries.length} error codes from pinned contract -> ${output}`)

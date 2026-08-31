@@ -1,182 +1,190 @@
-name: Release
-
-# Fires on tag pushes matching `v*` (e.g. v0.1.0, v0.2.0-rc.1).
-# Validates the package, generates iOS bundle/xcframeworks, creates a GitHub Release
-# with the artifacts uploaded as binaryTarget-consumable zips.
+name: Source Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New source SemVer without the v prefix (first stable release: 0.1.0)'
+        required: true
+        type: string
+      artifact_tag:
+        description: Published immutable artifact tag built from this exact commit
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: source-release-${{ inputs.version }}
+  cancel-in-progress: false
 
 jobs:
-  validate:
-    name: Validate package
+  verify-and-release:
     runs-on: macos-14
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - name: Build (debug, macOS arm64)
-        run: swift build
-      - name: Test (unit only — keeps CI fast)
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.22.0
+      - name: Resolve and lock the untagged release candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_ARTIFACT_TAG: ${{ inputs.artifact_tag }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Source releases may only be dispatched from main"
+            exit 1
+          fi
+          if [[ ! "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version must be a SemVer without the v prefix"
+            exit 1
+          fi
+          if [[ ! "$INPUT_ARTIFACT_TAG" =~ ^artifacts-sdk-0\.17\.0-r[1-9][0-9]*$ ]]; then
+            echo "::error::artifact_tag must be artifacts-sdk-0.17.0-rN"
+            exit 1
+          fi
+          VERSION_TAG="v$INPUT_VERSION"
+          echo "VERSION_TAG=$VERSION_TAG" >> "$GITHUB_ENV"
+          echo "ARTIFACT_TAG=$INPUT_ARTIFACT_TAG" >> "$GITHUB_ENV"
+
+          CHECKED_OUT="$(git rev-parse HEAD)"
+          EVENT_COMMIT="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          REMOTE_MAIN="$(git ls-remote origin refs/heads/main | awk 'NF == 2 { print $1; exit }')"
+          if [ "$CHECKED_OUT" != "$EVENT_COMMIT" ] || [ "$REMOTE_MAIN" != "$EVENT_COMMIT" ]; then
+            echo "::error::Checked-out commit, GITHUB_SHA, and current remote main must be identical"
+            echo "checkout=$CHECKED_OUT event=$EVENT_COMMIT remote-main=$REMOTE_MAIN"
+            exit 1
+          fi
+
+          ARTIFACT_REFS="$(git ls-remote --tags origin \
+            "refs/tags/$INPUT_ARTIFACT_TAG" "refs/tags/$INPUT_ARTIFACT_TAG^{}")"
+          ARTIFACT_COMMIT="$(printf '%s\n' "$ARTIFACT_REFS" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')"
+          if [ -z "$ARTIFACT_COMMIT" ]; then
+            ARTIFACT_COMMIT="$(printf '%s\n' "$ARTIFACT_REFS" | awk 'NF == 2 { print $1; exit }')"
+          fi
+          if [ "$ARTIFACT_COMMIT" != "$EVENT_COMMIT" ]; then
+            echo "::error::Artifact tag must resolve to the exact source release commit"
+            echo "artifact=$ARTIFACT_COMMIT release=$EVENT_COMMIT"
+            exit 1
+          fi
+          if ! gh release view "$INPUT_ARTIFACT_TAG" >/dev/null 2>&1; then
+            echo "::error::Immutable artifact release $INPUT_ARTIFACT_TAG does not exist"
+            exit 1
+          fi
+          if gh release view "$VERSION_TAG" >/dev/null 2>&1; then
+            echo "::error::Source release $VERSION_TAG already exists; releases are immutable"
+            exit 1
+          fi
+
+          SOURCE_REFS="$(git ls-remote --tags origin \
+            "refs/tags/$VERSION_TAG" "refs/tags/$VERSION_TAG^{}")"
+          SOURCE_COMMIT="$(printf '%s\n' "$SOURCE_REFS" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')"
+          if [ -z "$SOURCE_COMMIT" ]; then
+            SOURCE_COMMIT="$(printf '%s\n' "$SOURCE_REFS" | awk 'NF == 2 { print $1; exit }')"
+          fi
+          if [ -n "$SOURCE_COMMIT" ] && [ "$SOURCE_COMMIT" != "$EVENT_COMMIT" ]; then
+            echo "::error::Existing $VERSION_TAG points at a different commit and must never be moved"
+            exit 1
+          fi
+      - name: Require the complete CI workflow to have passed for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CI_RUN_ID="$(gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f head_sha="$GITHUB_SHA" \
+            -f status=completed \
+            -f per_page=100 \
+            --jq '[.workflow_runs[] | select(
+              .conclusion == "success" and
+              .event == "push" and
+              .head_branch == "main" and
+              .head_sha == env.GITHUB_SHA
+            )][0].id // empty')"
+          if [ -z "$CI_RUN_ID" ]; then
+            echo "::error::No successful CI push run exists for exact release commit $GITHUB_SHA"
+            echo "Run .github/workflows/ci.yml to completion on this main commit before releasing."
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID" \
+            --jq '"Verified CI run \(.html_url): sha=\(.head_sha) conclusion=\(.conclusion)"'
+      - name: Download the immutable artifact manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          MANIFEST_DIR="$RUNNER_TEMP/qvac-source-release"
+          mkdir -p "$MANIFEST_DIR"
+          gh release download "$ARTIFACT_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern artifact-manifest.json \
+            --dir "$MANIFEST_DIR"
+          MANIFEST="$MANIFEST_DIR/artifact-manifest.json"
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::error::$ARTIFACT_TAG has no artifact-manifest.json"
+            exit 1
+          fi
+          echo "RELEASE_ARTIFACT_MANIFEST=$MANIFEST" >> "$GITHUB_ENV"
+      - name: Bind source, URL manifest, and every remote artifact byte
+        run: |
+          node tools/release/verify-release.mjs \
+            "$RELEASE_ARTIFACT_MANIFEST" \
+            --source-commit "$GITHUB_SHA" \
+            --package Package.swift \
+            --bundle Sources/QVACClient/Resources/worker.mobile.bundle \
+            --remote
+          swift package dump-package >/dev/null
+      - name: Prove clean Git-URL consumer resolution before creating a tag
+        run: |
+          tools/ci/test-external-consumer.sh \
+            "https://github.com/${GITHUB_REPOSITORY}.git" \
+            --revision "$GITHUB_SHA"
+      - name: Unit tests through the verified URL manifest
         run: swift test --filter QVACClientUnitTests
-      # Codegen freshness is enforced on every push by .github/workflows/ci.yml; we
-      # don't repeat it here so the release flow doesn't have to install spike-js.
-
-  generate-ios-artifacts:
-    name: Generate iOS worker bundle + addon xcframeworks
-    runs-on: macos-14
-    needs: [validate]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Install @qvac/sdk + addons + bare deps
-        # Match the integration jobs' install list so bare-pack / bare-link see all
-        # the transitive bare-* / hyper* packages they need to resolve.
+      - name: Create the immutable source tag and release only after all gates pass
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p spike-js && cd spike-js
-          npm init -y >/dev/null
-          npm install --legacy-peer-deps \
-            @qvac/sdk @qvac/cli \
-            @qvac/llm-llamacpp @qvac/embed-llamacpp \
-            @qvac/transcription-whispercpp @qvac/transcription-parakeet \
-            @qvac/translation-nmtcpp @qvac/tts-onnx \
-            @qvac/ocr-onnx @qvac/diffusion-cpp \
-            tar-stream hyperdrive hyperdb hyperswarm corestore pear-pipe llm-splitter \
-            bare-net bare-rpc bare-buffer bare-fs bare-os bare-path bare-process \
-            bare-stream bare-abort-controller bare-crypto bare-dns bare-fetch \
-            bare-http1 bare-https bare-link bare-runtime bare-subprocess bare-zlib \
-            bare-pack \
-            compact-encoding events fast-safe-stringify which-runtime \
-            @modelcontextprotocol/sdk
-      - name: Regenerate + unwrap worker.mobile.bundle (best effort)
-        # Drops --quiet so bare-pack's stderr is visible. The committed
-        # Sources/QVACClient/Resources/worker.mobile.bundle is the source of
-        # truth; if regen succeeds we update it (after stripping the JS wrapper
-        # via tools/bundle/unwrap-bundle.mjs), if it fails we keep the committed
-        # bundle (continue-on-error: true). For a real consumer-facing release we
-        # want regen to succeed — this step's failure is a soft warning until then.
-        continue-on-error: true
-        run: |
-          cd spike-js
-          node node_modules/@qvac/cli/dist/index.js bundle sdk \
-            --host ios-arm64 \
-            --host ios-arm64-simulator \
-            --host ios-x64-simulator \
-            --defer expo-file-system --defer react-native-bare-kit
-          if [ -f qvac/worker.bundle.js ]; then
-              node ../tools/bundle/unwrap-bundle.mjs \
-                  qvac/worker.bundle.js \
-                  ../Sources/QVACClient/Resources/worker.mobile.bundle
-              echo "[release] regenerated + unwrapped worker.mobile.bundle"
-          else
-              echo "::warning::bundle regen produced no qvac/worker.bundle.js — using committed bundle"
-          fi
-      - name: Run bare-link to produce iOS xcframeworks
-        run: |
-          mkdir -p artifacts
-          cd spike-js
-          node -e "
-            const link = require('bare-link');
-            (async () => {
-              for await (const r of link('.', { hosts: ['ios-arm64', 'ios-arm64-simulator', 'ios-x64-simulator'], out: '../artifacts' })) {
-                if (r.endsWith('.xcframework')) console.log(r);
-              }
-            })();
-          "
-      - name: Copy BareKit.xcframework
-        # bare-link only emits xcframeworks for native addons. BareKit (the
-        # libuv/V8 host runtime) ships prebuilt inside react-native-bare-kit
-        # and must be uploaded separately — otherwise consumer-mode
-        # Package.swift has a dangling `.target(name: "BareKit")` dependency
-        # that SPM rejects with "Source files for target BareKit should be
-        # located under 'Sources/BareKit'".
-        run: |
-          BAREKIT_SRC="spike-js/node_modules/react-native-bare-kit/ios/BareKit.xcframework"
-          if [ ! -d "$BAREKIT_SRC" ]; then
-            echo "::error::BareKit.xcframework missing at $BAREKIT_SRC"
+          REMOTE_MAIN="$(git ls-remote origin refs/heads/main | awk 'NF == 2 { print $1; exit }')"
+          if [ "$REMOTE_MAIN" != "$GITHUB_SHA" ]; then
+            echo "::error::main advanced during verification; dispatch again from the new commit"
             exit 1
           fi
-          cp -R "$BAREKIT_SRC" artifacts/BareKit.xcframework
-      - name: Package + checksum each xcframework
-        run: |
-          mkdir -p release-assets
-          cd artifacts
-          for fw in *.xcframework; do
-              zip -r -q "../release-assets/${fw}.zip" "$fw"
-              shasum -a 256 "../release-assets/${fw}.zip" > "../release-assets/${fw}.zip.sha256"
-          done
-      - name: Stage worker.mobile.bundle as release asset
-        # The bundle is version-locked to the addon set bare-link just built —
-        # consumers fetching xcframeworks from this release MUST also use this
-        # exact bundle, otherwise the bundle's `addons[X]` references won't
-        # match what's linked. Upload both so prepare-release.sh can pin them.
-        run: |
-          BUNDLE_SRC="Sources/QVACClient/Resources/worker.mobile.bundle"
-          if [ ! -f "$BUNDLE_SRC" ]; then
-            echo "::error::worker.mobile.bundle missing at $BUNDLE_SRC"
+          if gh release view "$VERSION_TAG" >/dev/null 2>&1; then
+            echo "::error::Source release $VERSION_TAG appeared during verification"
             exit 1
           fi
-          cp "$BUNDLE_SRC" release-assets/worker.mobile.bundle
-          shasum -a 256 "release-assets/worker.mobile.bundle" > "release-assets/worker.mobile.bundle.sha256"
-      - name: Compute addon manifest (bundle needs + transitive @rpath closure)
-        # bare-link emits one xcframework per addon found in node_modules, which
-        # includes duplicates (multiple versions of the same package because of
-        # peer-dep resolution) and addons the bundle never references. The
-        # actual LINK SET needed by consumer apps is: the bundle's `addons`
-        # table PLUS the transitive @rpath closure of those frameworks (one
-        # framework's binary can dlopen another at runtime). We compute that
-        # here and emit it as a release asset so prepare-release.sh doesn't
-        # have to redo the closure walk every time.
-        run: |
-          node tools/release/compute-manifest.mjs \
-            artifacts \
-            Sources/QVACClient/Resources/worker.mobile.bundle \
-            release-assets/manifest.json
-          cat release-assets/manifest.json | head -50
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-assets
-          path: release-assets/
 
-  create-release:
-    name: Create GitHub Release
-    runs-on: macos-14
-    needs: [generate-ios-artifacts]
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-assets
-          path: release-assets/
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release-assets/*
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-      - name: Notify Swift Package Index
-        # SPI auto-detects new tags within a few minutes; this is a courtesy ping.
-        # `${GITHUB_REPOSITORY,,}` is bash 4+ lowercase substitution and breaks on
-        # macos runners (bash 3.2). Use tr instead.
-        run: |
-          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          curl -sf "https://swiftpackageindex.com/api/packages/${REPO_LOWER}/refresh" || true
-
-      - name: Verify Package.swift is consumer-mode for a tagged release
-        # Tagged releases must use binaryTarget(url:checksum:) so external SPM
-        # consumers (`.package(url:, from:)`) can resolve. If the tagged commit
-        # still has dev-mode local paths, surface a clear warning here so the
-        # maintainer remembers to run tools/release/prepare-release.sh and move
-        # the tag. We don't fail the workflow — the artifacts upload is still
-        # useful — but we make the regression visible.
-        run: |
-          if grep -q 'path: "spike-swift/Vendor/BareKit.xcframework"' Package.swift; then
-            echo "::warning::Package.swift at this tag is in DEV MODE (path-based BareKit). SPM consumers using \`.package(url:, from:)\` cannot resolve. Run tools/release/prepare-release.sh ${GITHUB_REF_NAME} locally, commit, and re-tag."
-          else
-            echo "Package.swift looks consumer-ready (URL-based binaryTargets)."
+          SOURCE_REFS="$(git ls-remote --tags origin \
+            "refs/tags/$VERSION_TAG" "refs/tags/$VERSION_TAG^{}")"
+          SOURCE_COMMIT="$(printf '%s\n' "$SOURCE_REFS" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')"
+          if [ -z "$SOURCE_COMMIT" ]; then
+            SOURCE_COMMIT="$(printf '%s\n' "$SOURCE_REFS" | awk 'NF == 2 { print $1; exit }')"
           fi
+          if [ -n "$SOURCE_COMMIT" ] && [ "$SOURCE_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "::error::$VERSION_TAG appeared at a different commit; refusing to replace it"
+            exit 1
+          fi
+          if [ -z "$SOURCE_COMMIT" ]; then
+            git config user.name github-actions
+            git config user.email github-actions@github.com
+            git tag -a "$VERSION_TAG" "$GITHUB_SHA" -m "QVACClient $VERSION_TAG"
+            git push origin "refs/tags/$VERSION_TAG"
+          fi
+
+          REMOTE_REFS="$(git ls-remote --tags origin \
+            "refs/tags/$VERSION_TAG" "refs/tags/$VERSION_TAG^{}")"
+          REMOTE_COMMIT="$(printf '%s\n' "$REMOTE_REFS" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')"
+          if [ -z "$REMOTE_COMMIT" ]; then
+            REMOTE_COMMIT="$(printf '%s\n' "$REMOTE_REFS" | awk 'NF == 2 { print $1; exit }')"
+          fi
+          if [ "$REMOTE_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "::error::Published source tag does not resolve to the verified commit"
+            exit 1
+          fi
+          gh release create "$VERSION_TAG" --verify-tag --generate-notes

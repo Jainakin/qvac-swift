@@ -31,13 +31,22 @@ public struct QVACRuntimeContext: Codable, Equatable, Sendable {
     /// Sensible defaults for the runtime the calling Swift code is on.
     public static var current: QVACRuntimeContext {
         #if os(iOS)
-        return QVACRuntimeContext(runtime: "bare", platform: "ios", deviceModel: nil, deviceBrand: "Apple")
+        return iOSDefault
         #elseif os(macOS)
         return QVACRuntimeContext(runtime: "node", platform: "darwin")
         #else
         return QVACRuntimeContext(runtime: "node", platform: "unknown")
         #endif
     }
+
+    /// Kept platform-independent so the exact mobile handshake contract can be
+    /// regression-tested by the macOS SwiftPM suite.
+    static let iOSDefault = QVACRuntimeContext(
+        runtime: "react-native",
+        platform: "ios",
+        deviceModel: nil,
+        deviceBrand: "Apple"
+    )
 }
 
 /// Body of the first message the client sends on a new connection.
@@ -61,25 +70,26 @@ struct InitConfigReply: Decodable {
     let error: String?
 }
 
-public struct QVACInitConfigFailed: Error, Sendable, CustomStringConvertible {
-    public let message: String
-    public var description: String { "init_config rejected by worker: \(message)" }
+struct QVACInitConfigFailed: Error, Sendable, CustomStringConvertible {
+    let message: String
+    var description: String { "init_config rejected by worker: \(message)" }
 }
 
-// MARK: - Public handshake helpers
+// MARK: - Handshake helpers
 
-public enum QVACHandshake {
+enum QVACHandshake {
 
     /// First message on a new connection. Sends `__init_config` and blocks for the worker's reply.
     /// Per the JS reference, the command id MUST be 1 (`init-hooks.ts:41 — rpc.request(1)`).
-    public static func sendInitConfig(
+    static func sendInitConfig(
         on rpc: BareRPCClient,
         config: JSONValue? = nil,
-        runtimeContext: QVACRuntimeContext? = .current
+        runtimeContext: QVACRuntimeContext? = .current,
+        timeout: Duration? = .seconds(60)
     ) async throws {
         let envelope = InitConfigEnvelope(config: config, runtimeContext: runtimeContext)
         let payload = try JSONEncoder.qvac.encode(envelope)
-        guard let respData = try await rpc.send(command: 1, data: payload) else {
+        guard let respData = try await rpc.send(command: 1, data: payload, timeout: timeout) else {
             throw QVACInitConfigFailed(message: "empty reply")
         }
         let reply = try JSONDecoder().decode(InitConfigReply.self, from: respData)
@@ -88,14 +98,23 @@ public enum QVACHandshake {
         }
     }
 
-    /// Optional clean-shutdown hint. The worker uses this on Expo paths to torn down
+    /// Optional clean-shutdown hint. The worker uses this on Expo paths to tear down
     /// the V8 isolate gracefully (see `client/rpc/expo-rpc-client.ts:145-160`). On macOS
     /// the JS SDK skips it and simply lets the parent terminate the subprocess; we mirror
     /// that and expose `sendShutdown` as opt-in.
-    public static func sendShutdown(on rpc: BareRPCClient) async throws {
+    static func sendShutdown(
+        on rpc: BareRPCClient,
+        timeout: Duration? = .seconds(10)
+    ) async throws {
         let envelope: [String: String] = ["type": "__shutdown__"]
         let payload = try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
-        _ = try await rpc.send(command: 1, data: payload)
+        guard let response = try await rpc.send(command: 1, data: payload, timeout: timeout) else {
+            throw QVACInitConfigFailed(message: "empty shutdown reply")
+        }
+        let reply = try JSONDecoder().decode(InitConfigReply.self, from: response)
+        guard reply.success else {
+            throw QVACInitConfigFailed(message: reply.error ?? "shutdown rejected")
+        }
     }
 }
 
@@ -141,9 +160,9 @@ public enum JSONValue: Codable, Sendable, Equatable {
 extension JSONEncoder {
     /// QVAC's preferred JSON encoder: sorted keys for deterministic wire output.
     /// Sorted keys matter for fixture-based testing (the JS encoder also sorts).
-    static let qvac: JSONEncoder = {
+    static var qvac: JSONEncoder {
         let e = JSONEncoder()
         e.outputFormatting = [.sortedKeys]
         return e
-    }()
+    }
 }

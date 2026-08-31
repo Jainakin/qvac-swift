@@ -5,9 +5,9 @@
 // or 24000 Hz — call `client.getLoadedModelInfo(…)` to confirm).
 //
 // Three views are exposed:
-//   • `audioStream`: live AsyncThrowingStream of `[Double]` chunks for low-latency playback
-//   • `audio`:       Task that resolves with the full concatenated audio when done
-//   • `sentenceChunks`: per-sentence boundary updates (only emitted if `sentenceStream: true`)
+//   • `bufferStream`: live sample stream for low-latency playback
+//   • `buffer`: full concatenated samples in non-streaming mode
+//   • `chunkUpdates`: per-sentence updates (only when `sentenceStream: true`)
 
 import Foundation
 
@@ -16,26 +16,27 @@ public extension QVACClient {
     /// Per-sentence update emitted when `sentenceStream: true` is requested.
     /// Contains the chunk index and the text being synthesized in that chunk.
     struct TtsSentenceChunkUpdate: Sendable, Equatable {
-        public let chunkIndex: Int
-        public let sentence: String
+        public let buffer: [Double]
+        public let chunkIndex: Int?
+        public let sentenceChunk: String?
     }
 
     /// Outcome of a `textToSpeech(…)` call.
     final class TextToSpeechRun: @unchecked Sendable {
-        public let audioStream: AsyncThrowingStream<[Double], Error>
-        public let sentenceChunks: AsyncThrowingStream<TtsSentenceChunkUpdate, Error>
-        public let audio: Task<[Double], Error>
-        public let stats: Task<JSONValue?, Error>
+        public let bufferStream: AsyncThrowingStream<Double, Error>
+        public let chunkUpdates: AsyncThrowingStream<TtsSentenceChunkUpdate, Error>?
+        public let buffer: Task<[Double], Error>
+        public let done: Task<Bool, Error>
         init(
-            audioStream: AsyncThrowingStream<[Double], Error>,
-            sentenceChunks: AsyncThrowingStream<TtsSentenceChunkUpdate, Error>,
-            audio: Task<[Double], Error>,
-            stats: Task<JSONValue?, Error>
+            bufferStream: AsyncThrowingStream<Double, Error>,
+            chunkUpdates: AsyncThrowingStream<TtsSentenceChunkUpdate, Error>?,
+            buffer: Task<[Double], Error>,
+            done: Task<Bool, Error>
         ) {
-            self.audioStream = audioStream
-            self.sentenceChunks = sentenceChunks
-            self.audio = audio
-            self.stats = stats
+            self.bufferStream = bufferStream
+            self.chunkUpdates = chunkUpdates
+            self.buffer = buffer
+            self.done = done
         }
     }
 
@@ -47,55 +48,145 @@ public extension QVACClient {
     func textToSpeech(
         modelId: String,
         text: String,
+        stream: Bool = true,
         sentenceStream: Bool = false,
         sentenceStreamLocale: String? = nil,
         sentenceStreamMaxChunkScalars: Double? = nil,
-        inputType: String? = nil
+        inputType: String? = nil,
+        description: String? = nil,
+        voiceDescription: String? = nil,
+        voice: String? = nil,
+        emotion: String? = nil,
+        pitch: String? = nil,
+        pace: String? = nil,
+        expressivity: String? = nil,
+        noise: String? = nil,
+        reverb: String? = nil,
+        quality: String? = nil,
+        rpcOptions: QVACRPCOptions = .init()
     ) async throws -> TextToSpeechRun {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw QVACError.invalidArgument("textToSpeech text must not be empty")
+        }
+        if sentenceStream, !stream {
+            throw QVACError.invalidArgument(
+                "textToSpeech sentenceStream requires stream"
+            )
+        }
+        if let maximum = sentenceStreamMaxChunkScalars, maximum <= 0 {
+            throw QVACError.invalidArgument(
+                "textToSpeech sentenceStreamMaxChunkScalars must be positive"
+            )
+        }
+        if description != nil, voiceDescription != nil {
+            throw QVACError.invalidArgument(
+                "textToSpeech description and voiceDescription are mutually exclusive"
+            )
+        }
+        let hasDescription = description != nil || voiceDescription != nil
+        if hasDescription,
+           [voice, emotion, pitch, pace, expressivity, noise, reverb, quality]
+            .contains(where: { $0 != nil }) {
+            throw QVACError.invalidArgument(
+                "textToSpeech description fields and voice-template fields are mutually exclusive"
+            )
+        }
         var req = TextToSpeechRequest(modelId: modelId, text: text)
-        req.stream = true
+        req.stream = stream
+        req.sentenceStream = sentenceStream
         if sentenceStream {
-            req.sentenceStream = true
             req.sentenceStreamLocale = sentenceStreamLocale
             req.sentenceStreamMaxChunkScalars = sentenceStreamMaxChunkScalars
         }
-        req.inputType = inputType
+        req.inputType = inputType ?? "text"
+        req.description = description
+        req.voiceDescription = voiceDescription
+        req.voice = voice
+        req.emotion = emotion
+        req.pitch = pitch
+        req.pace = pace
+        req.expressivity = expressivity
+        req.noise = noise
+        req.reverb = reverb
+        req.quality = quality
 
-        let stream: AsyncThrowingStream<QVACResponse, Error> = try await streamTyped(.textToSpeech(req))
-        let (audio, audioCont) = Self.makeStream(of: [Double].self)
-        let (sentences, sentencesCont) = Self.makeStream(of: TtsSentenceChunkUpdate.self)
-        let statsBox = ResultBox<JSONValue?>()
+        let responseStream: QVACResponseStream<QVACResponse> = try await streamTyped(
+            .textToSpeech(req),
+            rpcOptions: rpcOptions
+        )
+        let (bufferStream, bufferSink) = Self.makeStream(
+            of: Double.self,
+            name: "textToSpeech.bufferStream"
+        )
+        if !stream { bufferSink.finish() }
+        let chunkUpdates: AsyncThrowingStream<TtsSentenceChunkUpdate, Error>?
+        let chunkSink: QVACStreamSink<TtsSentenceChunkUpdate>?
+        if sentenceStream {
+            let pair = Self.makeStream(
+                of: TtsSentenceChunkUpdate.self,
+                name: "textToSpeech.chunkUpdates"
+            )
+            chunkUpdates = pair.0
+            chunkSink = pair.1
+        } else {
+            chunkUpdates = nil
+            chunkSink = nil
+        }
+        let collectedBuffer = ResultBox<[Double]>()
 
-        let audioTask = Task<[Double], Error> {
+        let done = Task<Bool, Error> {
             var full: [Double] = []
+            var receivedTerminalFrame = false
             do {
-                for try await response in stream {
+                for try await response in responseStream {
                     guard case .textToSpeech(let r) = response else {
-                        if case .error(let e) = response {
-                            throw QVACError.fromWire(code: Int(e.code ?? 0), message: e.message)
-                        }
-                        continue
+                        try Self.rejectUnexpectedResponse(response, expected: "textToSpeech")
                     }
                     if !r.buffer.isEmpty {
-                        full.append(contentsOf: r.buffer)
-                        audioCont.yield(r.buffer)
+                        if stream {
+                            for sample in r.buffer { bufferSink.yield(sample) }
+                        } else {
+                            full.append(contentsOf: r.buffer)
+                        }
                     }
-                    if let chunk = r.sentenceChunk, let idx = r.chunkIndex {
-                        sentencesCont.yield(TtsSentenceChunkUpdate(chunkIndex: idx, sentence: chunk))
+                    if sentenceStream,
+                       !r.buffer.isEmpty || r.chunkIndex != nil || r.sentenceChunk?.isEmpty == false {
+                        chunkSink?.yield(.init(
+                            buffer: r.buffer,
+                            chunkIndex: r.chunkIndex,
+                            sentenceChunk: r.sentenceChunk
+                        ))
                     }
-                    if let s = r.stats { statsBox.set(s) }
-                    if r.done == true { break }
+                    if r.done == true {
+                        receivedTerminalFrame = true
+                        break
+                    }
                 }
-                audioCont.finish()
-                sentencesCont.finish()
-                return full
+                guard receivedTerminalFrame else {
+                    throw QVACError.client(
+                        .streamEndedWithoutResponse,
+                        message: "textToSpeech ended without a terminal done frame"
+                    )
+                }
+                collectedBuffer.set(stream ? [] : full)
+                bufferSink.finish()
+                chunkSink?.finish()
+                return true
             } catch {
-                audioCont.finish(throwing: error)
-                sentencesCont.finish(throwing: error)
+                bufferSink.finish(throwing: error)
+                chunkSink?.finish(throwing: error)
                 throw error
             }
         }
-        let statsTask = Task<JSONValue?, Error> { _ = try await audioTask.value; return statsBox.get() ?? nil }
-        return TextToSpeechRun(audioStream: audio, sentenceChunks: sentences, audio: audioTask, stats: statsTask)
+        let buffer = Task<[Double], Error> {
+            _ = try await done.value
+            return collectedBuffer.get() ?? []
+        }
+        return TextToSpeechRun(
+            bufferStream: bufferStream,
+            chunkUpdates: chunkUpdates,
+            buffer: buffer,
+            done: done
+        )
     }
 }

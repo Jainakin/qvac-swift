@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "reviewStatus": "maintainer-review-required",
+  "supplements": [
+    {
+      "identity": "corestore@7.12.2",
+      "declaredLicense": "MIT",
+      "packageArtifact": {
+        "resolved": "https://registry.npmjs.org/corestore/-/corestore-7.12.2.tgz",
+        "integrity": "sha512-MPcNfKX8WCGbagcDHgsQ3+Oxn1JD3Kc2qpVqauU56s7r7+QHLC9NxW9OEdQL7R+wqhThyusYSZgFvpjXSpvAFA=="
+      },
+      "text": {
+        "file": "corestore-7.12.2-MIT.txt",
+        "sha256": "f27ea33b98e72cb2b557adc6bbdde50fba88b575e3a52b1a5f917e6694a511e4"
+      },
+      "evidence": {
+        "kind": "historical-upstream-license",
+        "repository": "https://github.com/holepunchto/corestore",
+        "publishedGitHead": "27ce13bf5fb6e7cfa8f4e21d4069a73b2cfb9abb",
+        "evidenceRevision": "1cca652289b3be5bdf3d5da258865e0d3eff6bf6",
+        "note": "The exact 7.12.2 package declares MIT but omits LICENSE. This text is the repository's last MIT LICENSE payload before that file was removed."
+      }
+    },
+    {
+      "identity": "noise-curve-ed@2.1.0",
+      "declaredLicense": "ISC",
+      "packageArtifact": {
+        "resolved": "https://registry.npmjs.org/noise-curve-ed/-/noise-curve-ed-2.1.0.tgz",
+        "integrity": "sha512-zAzJx+VwZM3w6EA1hTmDhJfvAnCeBQn/1FAeZ0LtGxCcCtlAK/uJXQVF/eDVUOaAZ286lHlx77WJ+qj9SmsRRg=="
+      },
+      "text": {
+        "file": "noise-curve-ed-2.1.0-ISC.txt",
+        "sha256": "55cba201810221959c6afd2c72b22983068138fca8f2804ce680a12d94f57539"
+      },
+      "evidence": {
+        "kind": "spdx-and-repository-authorship",
+        "repository": "https://github.com/holepunchto/noise-curve-ed",
+        "publishedGitHead": "759e631531bb64e32428b5684fc615758ae806f5",
+        "evidenceRevision": "c58b822af403fd1966d46c6f5e116932cba3c1eb",
+        "note": "The exact npm payload declares ISC and is byte-identical to the reachable v2.1.0 tag payload, but neither contains a license file. The supplemental ISC text uses the repository creator's authorship and original publication year."
+      }
+    },
+    {
+      "identity": "varint@5.0.0",
+      "declaredLicense": "MIT",
+      "packageArtifact": {
+        "resolved": "https://registry.npmjs.org/varint/-/varint-5.0.0.tgz",
+        "integrity": "sha512-gC13b/bWrqQoKY2EmROCZ+AR0jitc6DnDGaQ6Ls9QpKmuSgJB1eQ7H3KETtQm7qSdMWMKCmsshyCmUwMLh3OAA=="
+      },
+      "text": {
+        "file": "varint-5.0.0-MIT.txt",
+        "sha256": "b16f3aa2e9f8978a74a9579ebcb6e5230c9ec23232361baea13d2ca2443702c4"
+      },
+      "evidence": {
+        "kind": "spdx-and-repository-authorship",
+        "repository": "https://github.com/chrisdickinson/varint",
+        "publishedGitHead": "30e24d424c278a4d4ee33d4a00910fc12af95e2b",
+        "evidenceRevision": "30e24d424c278a4d4ee33d4a00910fc12af95e2b",
+        "note": "The exact npm payload and its source revision declare MIT but contain no license file. The supplemental MIT text uses the package author's repository identity and original publication year."
+      }
+    }
+  ]
+}

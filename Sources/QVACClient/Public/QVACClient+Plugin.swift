@@ -23,11 +23,12 @@ public extension QVACClient {
         modelId: String,
         handler: String,
         params: Params,
-        as resultType: Result.Type = Result.self
+        as resultType: Result.Type = Result.self,
+        rpcOptions: QVACRPCOptions = .init()
     ) async throws -> Result {
         let paramsJSON = try Self.encodeAsJSONValue(params)
         let req = PluginInvokeRequest(handler: handler, modelId: modelId, params: paramsJSON)
-        let response: QVACResponse = try await sendTyped(.pluginInvoke(req))
+        let response: QVACResponse = try await sendTyped(.pluginInvoke(req), rpcOptions: rpcOptions)
         guard case .pluginInvoke(let r) = response else {
             throw QVACError.protocolViolation("expected pluginInvoke response, got \(response.discriminator)")
         }
@@ -38,50 +39,56 @@ public extension QVACClient {
     func invokePlugin<Params: Encodable & Sendable>(
         modelId: String,
         handler: String,
-        params: Params
+        params: Params,
+        rpcOptions: QVACRPCOptions = .init()
     ) async throws -> JSONValue {
         let paramsJSON = try Self.encodeAsJSONValue(params)
         let req = PluginInvokeRequest(handler: handler, modelId: modelId, params: paramsJSON)
-        let response: QVACResponse = try await sendTyped(.pluginInvoke(req))
+        let response: QVACResponse = try await sendTyped(.pluginInvoke(req), rpcOptions: rpcOptions)
         guard case .pluginInvoke(let r) = response else {
             throw QVACError.protocolViolation("expected pluginInvoke response, got \(response.discriminator)")
         }
         return r.result
     }
 
-    /// Invoke a streaming plugin handler. Returns an `AsyncThrowingStream` of decoded chunks.
-    /// The stream terminates when the worker emits `done: true`.
+    /// Invoke a streaming plugin handler. Returns a single-consumer
+    /// ``QVACResponseStream`` of decoded chunks. The stream terminates when the
+    /// worker emits `done: true`; breaking iteration tears down the remote stream.
     func invokePluginStream<Params: Encodable & Sendable, Chunk: Decodable & Sendable>(
         modelId: String,
         handler: String,
         params: Params,
-        as chunkType: Chunk.Type = Chunk.self
-    ) async throws -> AsyncThrowingStream<Chunk, Error> {
+        as chunkType: Chunk.Type = Chunk.self,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws -> QVACResponseStream<Chunk> {
         let paramsJSON = try Self.encodeAsJSONValue(params)
         let req = PluginInvokeStreamRequest(handler: handler, modelId: modelId, params: paramsJSON)
-        let rawStream: AsyncThrowingStream<QVACResponse, Error> = try await streamTyped(.pluginInvokeStream(req))
+        let rawStream: QVACResponseStream<QVACResponse> = try await streamTyped(
+            .pluginInvokeStream(req),
+            rpcOptions: rpcOptions
+        )
 
-        return AsyncThrowingStream<Chunk, Error> { continuation in
-            let task = Task<Void, Never> {
-                do {
-                    for try await response in rawStream {
-                        switch response {
-                        case .pluginInvokeStream(let r):
-                            if r.done == true { continuation.finish(); return }
-                            let chunk = try QVACClient.decodeFromJSONValue(r.result, as: Chunk.self)
-                            continuation.yield(chunk)
-                        case .error(let e):
-                            throw QVACError.fromWire(code: Int(e.code ?? 0), message: e.message)
-                        default:
-                            continue   // forward-compat
-                        }
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
+        return Self.pullMap(
+            rawStream,
+            endOfSourceError: {
+                QVACError.client(
+                    .streamEndedWithoutResponse,
+                    message: "pluginInvokeStream ended without a terminal done frame"
+                )
             }
-            continuation.onTermination = { _ in task.cancel() }
+        ) { response in
+            switch response {
+            case .pluginInvokeStream(let frame):
+                if frame.done == true { return .finish }
+                return .emit(try Self.decodeFromJSONValue(frame.result, as: Chunk.self))
+            case .error(let error):
+                throw QVACError.fromWire(
+                    code: try Self.checkedWireErrorCode(error.code),
+                    message: error.message
+                )
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "pluginInvokeStream")
+            }
         }
     }
 

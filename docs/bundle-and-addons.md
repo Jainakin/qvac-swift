@@ -1,5 +1,10 @@
 # QVAC Mobile Bundle + Native Addons — How It Works on iOS, and How the Swift Package Should Ship Them
 
+> **Historical prototype record (QVAC SDK 0.10.2).** Retained for architectural
+> provenance only. The release candidate uses the exact 0.17.0 artifact-first
+> pipeline documented in `distribution.md`; commands and asset references below
+> must not be used to prepare a release.
+
 **Status:** validated against the live tooling on 2026-05-11.
 **Spike artifacts:** `spike-js/node_modules/{bare-link,bare-pack,@qvac/*}`, `/tmp/qvac-frameworks/*.xcframework`.
 **Sources of truth:**
