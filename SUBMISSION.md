@@ -74,7 +74,7 @@ still requires an explicit maintainer/legal review attestation.
 
 The following results were obtained on 2026-08-31 on the final candidate tree.
 The streaming benchmark was run from clean source commit
-`4da0693e83281c567c0faa0eb7714e05f762282e`; the release workflow requires the
+`893079f30805e95abbc065cc8ab0f17acb77b967`; the release workflow requires the
 same full matrix to pass again for the exact final URL-manifest commit before it
 can publish any immutable binary or source release.
 
@@ -87,7 +87,7 @@ can publish any immutable binary or source release.
 | Pinned real LLM | 3/3 passed, zero skips |
 | Pinned real RAG | 2/2 passed, zero skips |
 | Pinned real upscale | 1/1 passed, zero skips, using public `diffusion` alias normalization |
-| Performance KR | Real public streaming completion, 10 adjacent order-balanced process pairs and 1,000 content events per process: mean inter-token Swift/JS ratio 0.988014, 95% CI [0.972110, 1.004448]; p99 ratio 0.994116, 95% CI [0.993208, 0.995020]. Both strict upper bounds are <1.05, with identical final/output SHA-256 across clients |
+| Performance KR | Real public streaming completion across 20 isolated processes in 10 adjacent order-balanced pairs. Every process performed exactly two 1,000-token preconditioning completions followed by three retained 1,000-token measurements (2,997 inter-token intervals per process), with zero retries or exclusions. Mean inter-token Swift/JS ratio: 0.985142, 95% CI [0.973110, 0.996906]; p99 ratio: 0.992376, 95% CI [0.991406, 0.993350]. Both strict upper bounds are <1.05. All runs used GPU and produced identical final/output SHA-256 `fd703254198e4ad90b15fb8bdcd785911f71c2ac2695d4acb362dfb48f2ec234` across clients. |
 | iOS compile/smoke | Clean generic device and simulator builds passed; an external-package hosted-simulator smoke test passed 1/1 and loaded the bundled worker resource |
 | DocC | Final build passed with DocC warnings as errors, Swift warnings as errors, and strict concurrency enabled |
 | SwiftUI example | Final source builds passed for macOS and generic iOS Simulator after lifecycle and cross-platform input hardening |
@@ -95,6 +95,13 @@ can publish any immutable binary or source release.
 | Third-party attribution | 146/146 shipped identities have full text: 143 package-provided and 3 exact-artifact-bound supplements; 0 unresolved. The final generated notice SHA-256 is `e8f71b72dfc9ac532f2a4f27c3c147bb920e202ef8ed323e0e6a4352652abb4c` |
 | Release/tool safety | Bootstrap, path safety, archive reproducibility, source binding, required-suite self-test, bundle provenance, runtime-lock verification, manifest regeneration, deterministic third-party attribution, and all YAML/shell/JavaScript/JSON syntax checks passed |
 | Diff hygiene | Final preflight requires `git diff --check`, an explicit file-boundary review, and a clean committed source candidate before publication |
+
+The benchmark keeps model load bounded at 180 seconds and applies no
+per-completion RPC timeout to either client, because the pinned JavaScript
+0.17.0 stream helper does not enforce that deadline symmetrically. Both clients
+instead run under the same owned 240-second process watchdog. Per-request timeout
+behavior remains independently covered by the Swift unit and live contract
+tests.
 
 The CI workflow repeats these checks from a clean checkout. It additionally times
 checkout/setup through first real inference and hard-fails at 600 seconds, proves
