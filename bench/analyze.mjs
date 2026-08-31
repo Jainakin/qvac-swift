@@ -69,7 +69,7 @@ const WORKLOAD_CONTRACT = {
   },
   timeouts: {
     model_load_ms: 180_000,
-    completion_idle_ms: 30_000,
+    completion_rpc_timeout: 'none',
     process_watchdog_seconds: 240,
   },
 }
@@ -288,7 +288,7 @@ function validateWorkload(workload) {
     'workload.measurement.bootstrap_iterations')
 
   requireExactKeys(workload.timeouts,
-    ['model_load_ms', 'completion_idle_ms', 'process_watchdog_seconds'], 'workload.timeouts')
+    ['model_load_ms', 'completion_rpc_timeout', 'process_watchdog_seconds'], 'workload.timeouts')
   for (const [key, value] of Object.entries(WORKLOAD_CONTRACT.timeouts)) {
     requireExactValue(workload.timeouts[key], value, `workload.timeouts.${key}`)
   }
@@ -312,9 +312,13 @@ function validateToolchain(toolchain, runNumber) {
 function validateTimeoutPolicy(policy, workload, runNumber) {
   const name = `run ${runNumber} timeout_policy`
   requireExactKeys(policy,
-    ['model_load_ms', 'completion_idle_ms', 'process_watchdog_seconds'], name)
+    ['model_load_ms', 'completion_rpc_timeout', 'process_watchdog_seconds'], name)
   for (const [key, expected] of Object.entries(workload.timeouts)) {
-    validateNumber(policy[key], `${name}.${key}`, { integer: true })
+    if (key === 'completion_rpc_timeout') {
+      requireCondition(typeof policy[key] === 'string', `${name}.${key} must be a string`)
+    } else {
+      validateNumber(policy[key], `${name}.${key}`, { integer: true })
+    }
     requireExactValue(policy[key], expected, `${name}.${key}`)
   }
 }

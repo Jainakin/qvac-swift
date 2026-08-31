@@ -38,10 +38,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 RUNTIME_DIR="$REPO_ROOT/tools/runtime"
 NODE_MODULES="$RUNTIME_DIR/node_modules"
 BARE_BIN="$NODE_MODULES/bare-runtime/bin/bare"
+WORKER_SCRIPT="$NODE_MODULES/@qvac/sdk/dist/server/worker.js"
 WORKLOAD="$SCRIPT_DIR/workload.json"
 RESULT_FILE="$SCRIPT_DIR/result.json"
 EVIDENCE_DIR="$SCRIPT_DIR/evidence"
-STAGED="$RUNTIME_DIR/_qvac_streaming_completion_bench.mjs"
+STAGED_RELATIVE="tools/runtime/_qvac_streaming_completion_bench.mjs"
+STAGED="$REPO_ROOT/$STAGED_RELATIVE"
 STAGED_SOURCE="$SCRIPT_DIR/js/streaming-completion-bench.mjs"
 LOCK_DIR="$SCRIPT_DIR/.streaming-benchmark.lock"
 
@@ -52,6 +54,8 @@ LOCK_DIR="$SCRIPT_DIR/.streaming-benchmark.lock"
 verify_source_tree() {
     local tracked_changes=""
     local untracked_inputs=""
+    local unexpected_untracked=""
+    local input=""
     local allow_ci_manifest_overlay=0
     if ! git -C "$REPO_ROOT" diff --cached --quiet; then
         fail "benchmark evidence requires a clean Git index"
@@ -72,11 +76,36 @@ verify_source_tree() {
             fail "benchmark evidence requires a clean tracked Git tree"
         fi
     fi
+    # Validate the owned resolver-local stage independently of Git ignore
+    # configuration. Global excludes must not be able to bypass this invariant.
+    if [[ "${STAGED_CREATED:-0}" == "1" ]]; then
+        if [[ ! -f "$STAGED" || -L "$STAGED" \
+            || ! -f "$STAGED_SOURCE" || -L "$STAGED_SOURCE" ]] \
+            || ! cmp -s "$STAGED_SOURCE" "$STAGED"; then
+            fail "owned runtime benchmark stage is missing, unsafe, or byte-modified"
+        fi
+    fi
     untracked_inputs="$(git -C "$REPO_ROOT" ls-files --others --exclude-standard -- \
         .github Sources Tests bench tools Package.swift Package.swift.dev)"
     if [[ -n "$untracked_inputs" ]]; then
-        echo "$untracked_inputs" >&2
-        fail "benchmark evidence refuses untracked build, harness, or workflow inputs"
+        while IFS= read -r input; do
+            [[ -n "$input" ]] || continue
+            if [[ "$input" == "$STAGED_RELATIVE" ]]; then
+                # The Node harness must live beside the exact runtime graph for
+                # package resolution. Permit only the file this invocation
+                # created, and only while it remains byte-identical to the
+                # committed source harness. A stale/pre-existing path therefore
+                # still fails the initial source-tree check.
+                [[ "${STAGED_CREATED:-0}" == "1" ]] \
+                    || fail "unowned runtime benchmark stage is present"
+                continue
+            fi
+            unexpected_untracked+="${unexpected_untracked:+$'\n'}$input"
+        done <<<"$untracked_inputs"
+        if [[ -n "$unexpected_untracked" ]]; then
+            echo "$unexpected_untracked" >&2
+            fail "benchmark evidence refuses untracked build, harness, or workflow inputs"
+        fi
     fi
 }
 
@@ -172,6 +201,9 @@ fi
 if [[ ! -x "$BARE_BIN" ]]; then
     fail "exact package-owned Bare launcher is missing: $BARE_BIN"
 fi
+if [[ ! -f "$WORKER_SCRIPT" || -L "$WORKER_SCRIPT" ]]; then
+    fail "exact packaged QVAC worker is missing or unsafe: $WORKER_SCRIPT"
+fi
 
 SDK_VERSION="$("$NODE_BIN" -e '
 const { readFileSync } = require("node:fs")
@@ -202,6 +234,7 @@ if (workload.measurement?.bootstrap_iterations !== 20000) {
   throw new Error("KR-2 requires exactly 20,000 bootstrap iterations")
 }
 if (workload.timeouts?.process_watchdog_seconds !== 240) throw new Error("KR-2 process watchdog must be exactly 240 seconds")
+if (workload.timeouts?.completion_rpc_timeout !== "none") throw new Error("KR-2 completion RPC timeout must be disabled symmetrically")
 process.stdout.write(`${workload.measurement.process_pairs}\t${workload.timeouts.process_watchdog_seconds}`
   + `\t${workload.preconditioning.completions}\t${workload.measurement.completions_per_process}`)
 ' "$WORKLOAD")"
@@ -284,19 +317,22 @@ run_one() {
         "QVAC_BENCH_POSITION=$position"
         "QVAC_BENCH_PAIR=$pair"
         "QVAC_BENCH_PAIR_ORDER=$pair_order"
+        "QVAC_WORKER_PATH=$WORKER_SCRIPT"
     )
 
     echo "[bench] position=$position pair=$pair order=$pair_order client=$client_kind"
     if [[ "$client_kind" == "swift" ]]; then
         (
             cd "$REPO_ROOT"
-            exec env "${run_environment[@]}" "$SWIFT_BIN" test -c release --skip-build \
+            exec env -u QVAC_CONFIG_PATH -u QVAC_IPC_SOCKET_PATH -u QVAC_HYPERSWARM_SEED \
+                "${run_environment[@]}" "$SWIFT_BIN" test -c release --skip-build \
                 --filter BenchmarkTests.test_streaming_completion_latency
         ) >"$log" 2>&1 &
     else
         (
             cd "$RUNTIME_DIR"
-            exec env "${run_environment[@]}" "$NODE_BIN" "$(basename "$STAGED")" \
+            exec env -u QVAC_CONFIG_PATH -u QVAC_IPC_SOCKET_PATH -u QVAC_HYPERSWARM_SEED \
+                "${run_environment[@]}" "$NODE_BIN" "$(basename "$STAGED")" \
                 "$WORKLOAD" "$MODEL_PATH" "$result"
         ) >"$log" 2>&1 &
     fi

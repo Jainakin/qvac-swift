@@ -109,12 +109,12 @@ final class BenchmarkTests: XCTestCase {
 
         struct Timeouts: Decodable {
             let modelLoadMS: Int64
-            let completionIdleMS: Int64
+            let completionRPCTimeout: String
             let processWatchdogSeconds: Int
 
             enum CodingKeys: String, CodingKey {
                 case modelLoadMS = "model_load_ms"
-                case completionIdleMS = "completion_idle_ms"
+                case completionRPCTimeout = "completion_rpc_timeout"
                 case processWatchdogSeconds = "process_watchdog_seconds"
             }
         }
@@ -269,7 +269,7 @@ final class BenchmarkTests: XCTestCase {
 
         let timeoutPolicy: [String: Any] = [
             "model_load_ms": workload.timeouts.modelLoadMS,
-            "completion_idle_ms": workload.timeouts.completionIdleMS,
+            "completion_rpc_timeout": workload.timeouts.completionRPCTimeout,
             "process_watchdog_seconds": workload.timeouts.processWatchdogSeconds,
         ]
         let toolchain: [String: Any] = [
@@ -415,8 +415,7 @@ final class BenchmarkTests: XCTestCase {
             ]),
             kvCache: .bool(workload.completion.kvCache),
             captureThinking: workload.completion.captureThinking,
-            emitRawDeltas: workload.completion.emitRawDeltas,
-            rpcOptions: .init(timeout: .milliseconds(workload.timeouts.completionIdleMS))
+            emitRawDeltas: workload.completion.emitRawDeltas
         )
 
         var arrivals: [Double] = []
@@ -519,7 +518,7 @@ final class BenchmarkTests: XCTestCase {
               workload.measurement.bootstrapIterations == 20_000,
               workload.measurement.maximumOverheadRatio == 1.05,
               workload.timeouts.modelLoadMS == 180_000,
-              workload.timeouts.completionIdleMS == 30_000,
+              workload.timeouts.completionRPCTimeout == "none",
               workload.timeouts.processWatchdogSeconds == 240 else {
             throw IntegrationPrerequisiteError("bench/workload.json violates the fixed KR-2 protocol")
         }

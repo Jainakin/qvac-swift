@@ -96,7 +96,7 @@ function validateWorkload() {
     && workload.measurement.maximum_overhead_ratio === 1.05,
   'workload measurement policy violates the fixed KR-2 protocol')
   requireCondition(workload.timeouts.model_load_ms === 180000
-    && workload.timeouts.completion_idle_ms === 30000
+    && workload.timeouts.completion_rpc_timeout === 'none'
     && workload.timeouts.process_watchdog_seconds === 240,
   'workload timeout policy violates the fixed KR-2 protocol')
 }
@@ -111,7 +111,6 @@ async function runCompletion(modelId, predict) {
     captureThinking: workload.completion.capture_thinking,
     kvCache: workload.completion.kv_cache,
     generationParams: generationParams(predict),
-    rpcOptions: { timeout: workload.timeouts.completion_idle_ms },
   })
 
   const arrivals = []
@@ -205,7 +204,7 @@ const toolchain = {
 }
 const timeoutPolicy = {
   model_load_ms: workload.timeouts.model_load_ms,
-  completion_idle_ms: workload.timeouts.completion_idle_ms,
+  completion_rpc_timeout: workload.timeouts.completion_rpc_timeout,
   process_watchdog_seconds: workload.timeouts.process_watchdog_seconds,
 }
 

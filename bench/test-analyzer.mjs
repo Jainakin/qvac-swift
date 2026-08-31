@@ -21,6 +21,10 @@ const analyzerPath = join(scriptDir, 'analyze.mjs')
 const canonicalWorkloadPath = join(scriptDir, 'workload.json')
 const canonicalWorkload = JSON.parse(readFileSync(canonicalWorkloadPath, 'utf8'))
 const orchestratorSource = readFileSync(join(scriptDir, 'run.sh'), 'utf8')
+const nodeHarnessSource = readFileSync(
+  join(scriptDir, 'js', 'streaming-completion-bench.mjs'), 'utf8')
+const swiftHarnessSource = readFileSync(
+  join(repositoryRoot, 'Tests', 'QVACClientIntegrationTests', 'BenchmarkTests.swift'), 'utf8')
 const order = Array.from({ length: 10 }, (_, pair) =>
   pair % 2 === 0 ? ['swift', 'node'] : ['node', 'swift']).flat()
 const root = mkdtempSync(join(tmpdir(), 'qvac-bench-analyzer-'))
@@ -146,7 +150,7 @@ function sampleFor(client, positionIndex, workloadSha256, scenario) {
     ),
     timeout_policy: {
       model_load_ms: 180000,
-      completion_idle_ms: 30000,
+      completion_rpc_timeout: 'none',
       process_watchdog_seconds: 240,
     },
     toolchain: {
@@ -224,6 +228,43 @@ try {
     'orchestrator must verify source provenance before setup, before analysis, and after analysis')
   assert.ok(sourceTreeChecks[2].index > orchestratorSource.indexOf('ANALYSIS_STATUS=$?'),
     'orchestrator post-analysis provenance check is not after analyzer execution')
+  assert.match(orchestratorSource,
+    /STAGED_RELATIVE="tools\/runtime\/_qvac_streaming_completion_bench\.mjs"/,
+    'orchestrator must name exactly one resolver-local staged harness')
+  assert.match(orchestratorSource,
+    /if \[\[ "\$\{STAGED_CREATED:-0\}" == "1" \]\]; then[\s\S]*cmp -s "\$STAGED_SOURCE" "\$STAGED"/,
+    'owned staged harness must be byte-validated independently of Git ignore rules')
+  assert.match(orchestratorSource,
+    /"\$\{STAGED_CREATED:-0\}" == "1" \]\][\s\\]*\|\| fail "unowned runtime benchmark stage is present"/,
+    'the sole untracked staged-path exception must require invocation ownership')
+  assert.match(orchestratorSource,
+    /WORKER_SCRIPT="\$NODE_MODULES\/@qvac\/sdk\/dist\/server\/worker\.js"[\s\S]*! -f "\$WORKER_SCRIPT" \|\| -L "\$WORKER_SCRIPT"/,
+    'orchestrator must validate the exact packaged QVAC worker')
+  assert.match(orchestratorSource,
+    /"QVAC_WORKER_PATH=\$WORKER_SCRIPT"/,
+    'every process must pin the packaged QVAC worker instead of ambient resolution')
+  assert.equal(
+    [...orchestratorSource.matchAll(/env -u QVAC_CONFIG_PATH -u QVAC_IPC_SOCKET_PATH -u QVAC_HYPERSWARM_SEED/g)].length,
+    2,
+    'Swift and Node benchmark processes must both clear ambient QVAC overrides',
+  )
+  const nodeCompletionBody = nodeHarnessSource.slice(
+    nodeHarnessSource.indexOf('async function runCompletion('),
+    nodeHarnessSource.indexOf('\nconst modelStat =', nodeHarnessSource.indexOf('async function runCompletion(')),
+  )
+  const swiftCompletionBody = swiftHarnessSource.slice(
+    swiftHarnessSource.indexOf('    private static func runCompletion('),
+    swiftHarnessSource.indexOf('    private static func validate(',
+      swiftHarnessSource.indexOf('    private static func runCompletion(')),
+  )
+  assert.match(canonicalWorkload.timeouts.completion_rpc_timeout, /^none$/,
+    'canonical workload must disable the completion RPC timeout symmetrically')
+  assert.ok(nodeCompletionBody.includes('const run = completion({')
+      && !nodeCompletionBody.includes('rpcOptions'),
+  'Node measured completion must rely solely on the common process watchdog')
+  assert.ok(swiftCompletionBody.includes('let run = try await client.completion(')
+      && !swiftCompletionBody.includes('rpcOptions:'),
+  'Swift measured completion must rely solely on the common process watchdog')
 
   const passCase = makeCase('pass')
   const pass = runAnalyzer(passCase)
@@ -383,8 +424,8 @@ try {
   })), /toolchain\.node/)
 
   assertInvalid(runAnalyzer(makeCase('timeouts', {
-    mutateSamples: samples => { samples[4].timeout_policy.completion_idle_ms += 1 },
-  })), /timeout_policy\.completion_idle_ms/)
+    mutateSamples: samples => { samples[4].timeout_policy.completion_rpc_timeout = '30s' },
+  })), /timeout_policy\.completion_rpc_timeout/)
 
   assertInvalid(runAnalyzer(makeCase('count', {
     mutateSamples: samples => { samples[5].measurements[1].token_intervals_ms.pop() },
