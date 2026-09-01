@@ -3,33 +3,50 @@
 Native Swift access to QVAC's local-first AI worker for iOS 17+ and macOS 14+
 (arm64), using Swift concurrency and bounded `AsyncSequence` streams.
 
-This submission candidate targets the exact published `@qvac/sdk@0.17.0`
-contract. It does not contain a 0.10 compatibility or migration layer.
+Published `0.1.x` releases target the exact `@qvac/sdk@0.17.0` contract. They do
+not contain a 0.10 compatibility or migration layer.
 
 ## Release status
 
-The source, generated API, worker bundle, native-addon closure, tests, and release
-automation are prepared for 0.17.0. A tagged SwiftPM release requires one external
-maintainer sequence: produce an unpublished deterministic artifact candidate,
-commit its checksum-pinned URL manifest, obtain green CI for that exact commit,
-and only then publish the immutable xcframework archives and source tag. Until
-that release exists, do not present the development `Package.swift` as a
-URL-installable tag. See
+The first exact production release is
+[`v0.1.0`](https://github.com/Jainakin/qvac-swift/releases/tag/v0.1.0) from exact
+source commit `85ac16212e43ec4572c96f04bf278cd67e52eb7f`. Its 38 checksum-pinned
+XCFramework archives and provenance records are published in
+[`artifacts-sdk-0.17.0-r1`](https://github.com/Jainakin/qvac-swift/releases/tag/artifacts-sdk-0.17.0-r1)
+from the same commit. These prior releases are immutable by project policy and
+checksum/source binding; their GitHub REST records predate repository-native
+release immutability and therefore do not report `immutable: true`. GitHub-native
+release immutability is enabled for subsequent publications. Every new artifact
+revision and source version remains additive: existing tags and assets are never
+moved or replaced.
+
+For each release, canonical `Package.swift` is the public URL-backed manifest for
+that release's artifact revision; `Package.swift.dev` retains the exact local
+development graph.
+
+The exact release commit passed the complete
+[`CI`](https://github.com/Jainakin/qvac-swift/actions/runs/33424863638),
+[`Build Immutable SDK 0.17 Artifacts`](https://github.com/Jainakin/qvac-swift/actions/runs/33468513722),
+and [`Source Release`](https://github.com/Jainakin/qvac-swift/actions/runs/33468871258)
+workflows. Before artifact publication, a maintainer reviewed the generated
+third-party notices and three pinned supplements and explicitly authorized the
+`license_reviewed=true` attestation.
+
+See
 [Submission evidence](SUBMISSION.md) for the reviewer-facing requirement matrix,
 [Distribution and release](docs/distribution.md) for the guarded process, and
 [Swift Package Index submission](docs/swift-package-index.md) for the post-release
 index checklist. The exact redistributed-package inventory, package-provided
 texts, and pinned supplements are in
-[Third-party notices](THIRD_PARTY_NOTICES.md); binary publication is gated on an
-explicit maintainer/legal review of that generated record.
+[Third-party notices](THIRD_PARTY_NOTICES.md).
 
-Published source tags are designed to be consumed as follows:
+Consume the latest reviewed `0.1.x` patch as follows:
 
 ```swift
 dependencies: [
     .package(
         url: "https://github.com/Jainakin/qvac-swift.git",
-        exact: "0.1.0"
+        .upToNextMinor(from: "0.1.0")
     ),
 ],
 targets: [
@@ -42,8 +59,14 @@ targets: [
 ]
 ```
 
-Do not use that version requirement until `v0.1.0` (or a later reviewed source
-tag) has actually been published.
+Commit the application's `Package.resolved`. For deployments that require an
+explicit source-version pin, use `exact:` with the desired reviewed tag from the
+[`Releases`](https://github.com/Jainakin/qvac-swift/releases) page.
+
+Swift Package Index submission, indexing/hosted-documentation verification, and a
+current SDK 0.17.0 run of the SwiftUI example on a physical iPhone remain external
+submission evidence. They do not affect the integrity or URL installability of
+the published package.
 
 ## Exact upstream identity
 
@@ -287,8 +310,8 @@ The required CI pipeline contains independent gates for:
 - macOS, generic iOS-device, iOS Simulator, DocC, and example-app builds;
 - a release-mode Swift-versus-JavaScript public API benchmark with the grant's 5%
   overhead gate; and
-- a clean external Swift package that resolves the published Git URL and immutable
-  binary artifacts.
+- a clean external Swift package that resolves the published Git URL and
+  checksum-pinned binary artifacts.
 
 Useful local entry points:
 

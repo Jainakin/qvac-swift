@@ -38,6 +38,11 @@ fi
 
 echo "[prepare-release] downloading immutable artifact release $REPOSITORY@$ARTIFACT_TAG"
 gh release download "$ARTIFACT_TAG" --repo "$REPOSITORY" --dir "$DOWNLOAD_DIR"
+gh release verify "$ARTIFACT_TAG" --repo "$REPOSITORY" >/dev/null
+for ASSET in "$DOWNLOAD_DIR"/*; do
+    gh release verify-asset "$ARTIFACT_TAG" "$ASSET" \
+        --repo "$REPOSITORY" >/dev/null
+done
 MANIFEST="$DOWNLOAD_DIR/artifact-manifest.json"
 if [[ ! -f "$MANIFEST" ]]; then
     echo "[prepare-release] error: $ARTIFACT_TAG has no artifact-manifest.json" >&2

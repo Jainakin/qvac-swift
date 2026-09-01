@@ -14,10 +14,11 @@ on:
 
 permissions:
   actions: read
+  attestations: read
   contents: write
 
 concurrency:
-  group: source-release-${{ inputs.version }}
+  group: source-release
   cancel-in-progress: false
 
 jobs:
@@ -25,13 +26,13 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.22.0
-      - name: Resolve and lock the untagged release candidate
+      - name: Resolve and lock the release candidate
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_VERSION: ${{ inputs.version }}
@@ -52,13 +53,14 @@ jobs:
           VERSION_TAG="v$INPUT_VERSION"
           echo "VERSION_TAG=$VERSION_TAG" >> "$GITHUB_ENV"
           echo "ARTIFACT_TAG=$INPUT_ARTIFACT_TAG" >> "$GITHUB_ENV"
+          gh release verify --help >/dev/null
 
           CHECKED_OUT="$(git rev-parse HEAD)"
           EVENT_COMMIT="$(git rev-parse "$GITHUB_SHA^{commit}")"
           REMOTE_MAIN="$(git ls-remote origin refs/heads/main | awk 'NF == 2 { print $1; exit }')"
-          if [ "$CHECKED_OUT" != "$EVENT_COMMIT" ] || [ "$REMOTE_MAIN" != "$EVENT_COMMIT" ]; then
-            echo "::error::Checked-out commit, GITHUB_SHA, and current remote main must be identical"
-            echo "checkout=$CHECKED_OUT event=$EVENT_COMMIT remote-main=$REMOTE_MAIN"
+          if [ "$CHECKED_OUT" != "$EVENT_COMMIT" ]; then
+            echo "::error::Checked-out commit and GITHUB_SHA must be identical"
+            echo "checkout=$CHECKED_OUT event=$EVENT_COMMIT"
             exit 1
           fi
 
@@ -77,11 +79,6 @@ jobs:
             echo "::error::Immutable artifact release $INPUT_ARTIFACT_TAG does not exist"
             exit 1
           fi
-          if gh release view "$VERSION_TAG" >/dev/null 2>&1; then
-            echo "::error::Source release $VERSION_TAG already exists; releases are immutable"
-            exit 1
-          fi
-
           SOURCE_REFS="$(git ls-remote --tags origin \
             "refs/tags/$VERSION_TAG" "refs/tags/$VERSION_TAG^{}")"
           SOURCE_COMMIT="$(printf '%s\n' "$SOURCE_REFS" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')"
@@ -92,6 +89,37 @@ jobs:
             echo "::error::Existing $VERSION_TAG points at a different commit and must never be moved"
             exit 1
           fi
+          SOURCE_TAG_EXISTS=false
+          if [ -n "$SOURCE_COMMIT" ]; then
+            SOURCE_TAG_EXISTS=true
+          fi
+
+          SOURCE_RELEASE_EXISTS=false
+          if gh release view "$VERSION_TAG" >/dev/null 2>&1; then
+            if [ -z "$SOURCE_COMMIT" ]; then
+              echo "::error::Source release $VERSION_TAG exists without a resolvable Git tag"
+              exit 1
+            fi
+            RELEASE_STATE="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$VERSION_TAG" \
+              --jq '[.draft, .prerelease, .immutable] | @tsv')"
+            IFS=$'\t' read -r IS_DRAFT IS_PRERELEASE IS_IMMUTABLE <<< "$RELEASE_STATE"
+            if [ "$IS_DRAFT" != false ] || \
+               [ "$IS_PRERELEASE" != false ] || \
+               [ "$IS_IMMUTABLE" != true ]; then
+              echo "::error::Existing $VERSION_TAG is not a published immutable source release"
+              echo "draft=$IS_DRAFT prerelease=$IS_PRERELEASE immutable=$IS_IMMUTABLE"
+              exit 1
+            fi
+            SOURCE_RELEASE_EXISTS=true
+            echo "Resuming verification of existing immutable source release $VERSION_TAG"
+          fi
+          if [ "$REMOTE_MAIN" != "$EVENT_COMMIT" ] && [ "$SOURCE_TAG_EXISTS" != true ]; then
+            echo "::error::Current remote main must equal the release commit before the source tag is created"
+            echo "release=$EVENT_COMMIT remote-main=$REMOTE_MAIN"
+            exit 1
+          fi
+          echo "SOURCE_TAG_EXISTS=$SOURCE_TAG_EXISTS" >> "$GITHUB_ENV"
+          echo "SOURCE_RELEASE_EXISTS=$SOURCE_RELEASE_EXISTS" >> "$GITHUB_ENV"
       - name: Require the complete CI workflow to have passed for this exact commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -118,6 +146,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          gh release verify "$ARTIFACT_TAG"
           MANIFEST_DIR="$RUNNER_TEMP/qvac-source-release"
           mkdir -p "$MANIFEST_DIR"
           gh release download "$ARTIFACT_TAG" \
@@ -151,11 +180,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           REMOTE_MAIN="$(git ls-remote origin refs/heads/main | awk 'NF == 2 { print $1; exit }')"
-          if [ "$REMOTE_MAIN" != "$GITHUB_SHA" ]; then
+          if [ "$SOURCE_TAG_EXISTS" != true ] && [ "$REMOTE_MAIN" != "$GITHUB_SHA" ]; then
             echo "::error::main advanced during verification; dispatch again from the new commit"
             exit 1
           fi
-          if gh release view "$VERSION_TAG" >/dev/null 2>&1; then
+          if [ "$SOURCE_RELEASE_EXISTS" != true ] && \
+             gh release view "$VERSION_TAG" >/dev/null 2>&1; then
             echo "::error::Source release $VERSION_TAG appeared during verification"
             exit 1
           fi
@@ -187,4 +217,45 @@ jobs:
             echo "::error::Published source tag does not resolve to the verified commit"
             exit 1
           fi
-          gh release create "$VERSION_TAG" --verify-tag --generate-notes
+          if [ "$SOURCE_RELEASE_EXISTS" != true ]; then
+            RELEASE_NOTES="Production SwiftPM release for exact @qvac/sdk 0.17.0. Immutable binary artifacts and provenance: https://github.com/$GITHUB_REPOSITORY/releases/tag/$ARTIFACT_TAG"
+            gh release create "$VERSION_TAG" \
+              --verify-tag \
+              --latest \
+              --title "QVACClient $VERSION_TAG" \
+              --notes "$RELEASE_NOTES" \
+              --generate-notes
+          fi
+
+          verify_published_source() {
+            gh release verify "$VERSION_TAG" >/dev/null || return 1
+            REMOTE_REFS="$(git ls-remote --tags origin \
+              "refs/tags/$VERSION_TAG" "refs/tags/$VERSION_TAG^{}")" || return 1
+            VERIFIED_COMMIT="$(printf '%s\n' "$REMOTE_REFS" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')"
+            if [ -z "$VERIFIED_COMMIT" ]; then
+              VERIFIED_COMMIT="$(printf '%s\n' "$REMOTE_REFS" | awk 'NF == 2 { print $1; exit }')"
+            fi
+            RELEASE_STATE="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$VERSION_TAG" \
+              --jq '[.draft, .prerelease, .immutable] | @tsv')" || return 1
+            IFS=$'\t' read -r IS_DRAFT IS_PRERELEASE IS_IMMUTABLE <<< "$RELEASE_STATE"
+            [ "$VERIFIED_COMMIT" = "$GITHUB_SHA" ] && \
+              [ "$IS_DRAFT" = false ] && \
+              [ "$IS_PRERELEASE" = false ] && \
+              [ "$IS_IMMUTABLE" = true ]
+          }
+
+          PUBLICATION_VERIFIED=false
+          for ATTEMPT in {1..12}; do
+            if verify_published_source; then
+              PUBLICATION_VERIFIED=true
+              break
+            fi
+            if [ "$ATTEMPT" -lt 12 ]; then
+              sleep 5
+            fi
+          done
+          if [ "$PUBLICATION_VERIFIED" != true ]; then
+            echo "::error::Could not verify the complete immutable $VERSION_TAG publication within 60 seconds; rerun this version to resume its non-mutating audit"
+            exit 1
+          fi
+          echo "Verified immutable source release, attestation, and exact tag binding for $VERSION_TAG"

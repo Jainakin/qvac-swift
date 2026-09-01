@@ -18,8 +18,8 @@ jobs:
     name: Pinned contract, codegen freshness, and <30s generation
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm
@@ -56,8 +56,8 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm
@@ -85,8 +85,8 @@ jobs:
     runs-on: macos-14
     needs: [codegen]
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm
@@ -120,8 +120,8 @@ jobs:
     needs: [unit]
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm
@@ -130,6 +130,22 @@ jobs:
         run: |
           tools/runtime/link-ios-artifacts.sh
           node tools/ci/package-manifest-mode.mjs --activate-development
+      - name: Validate Swift Package Index documentation configuration
+        run: |
+          SPI_TARGETS="$(ruby -ryaml -e '
+            manifest = YAML.safe_load_file(".spi.yml", aliases: false)
+            abort "SPI manifest version must be 1" unless manifest["version"] == 1
+            configs = manifest.dig("builder", "configs")
+            abort "SPI builder.configs must contain exactly one configuration" unless configs.is_a?(Array) && configs.length == 1
+            targets = configs.first["documentation_targets"]
+            abort "SPI documentation_targets must be a non-empty string array" unless targets.is_a?(Array) && !targets.empty? && targets.all? { |target| target.is_a?(String) && !target.empty? }
+            puts targets
+          ')"
+          PACKAGE_JSON="$(swift package dump-package)"
+          while IFS= read -r TARGET; do
+            printf '%s' "$PACKAGE_JSON" | jq -e --arg target "$TARGET" \
+              'any(.targets[]; .name == $target)' >/dev/null
+          done <<< "$SPI_TARGETS"
       - name: Build DocC from the package manifest
         run: |
           swift package dump-package >/dev/null
@@ -146,8 +162,8 @@ jobs:
     needs: [unit, runtime-artifact]
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm
@@ -174,8 +190,8 @@ jobs:
     steps:
       - name: Start clean-checkout-to-first-inference budget
         run: date +%s > "$RUNNER_TEMP/qvac-first-inference-start"
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm
@@ -236,7 +252,7 @@ jobs:
         run: bench/run.sh
       - name: Upload KR-2 benchmark evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: benchmark-evidence
           path: |
@@ -251,8 +267,8 @@ jobs:
     needs: [unit, runtime-artifact]
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm

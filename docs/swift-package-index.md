@@ -1,7 +1,34 @@
 # Swift Package Index submission
 
 Swift Package Index submission is a post-release operation. It must not be used to
-paper over an unpublished binary closure or an unverified source tag.
+paper over an unpublished binary closure or an unverified source tag. The first
+exact release pair, `artifacts-sdk-0.17.0-r1` and `v0.1.0`, is public and remains
+valid URL-installation evidence.
+
+## Index build configuration
+
+The repository-root `.spi.yml` opts `QVACClient` into Swift Package Index-hosted
+DocC:
+
+```yaml
+version: 1
+builder:
+  configs:
+    - documentation_targets: [QVACClient]
+```
+
+Keep this configuration minimal. Platform compatibility comes from
+`Package.swift`, where every binary-target dependency of `QVACClient` is explicitly
+conditioned on iOS; repository CI separately builds the target's DocC archive on
+macOS. Validate any future change with the Index's
+[SPI manifest validator](https://swiftpackageindex.com/validate-spi-manifest)
+before publishing it.
+
+Swift Package Index analyzes `.spi.yml` from each checked-out version. The
+immutable-by-policy `v0.1.0` tag predates this file, so it must never be moved merely
+to add hosted documentation. A subsequent patch release created from a commit that
+contains `.spi.yml` can become the first stable tag with configured versioned DocC.
+Existing release evidence remains additive and unchanged.
 
 ## Preconditions
 
@@ -9,13 +36,15 @@ Before submitting `qvac-swift`, verify all of the following:
 
 - the repository is publicly readable at
   `https://github.com/Jainakin/qvac-swift.git`;
-- the root `Package.swift` contains immutable HTTPS binary-target URLs and checksums,
-  not development `path:` targets;
-- the Source Release workflow has created the first stable SemVer tag (`v0.1.0`)
-  from the exact commit whose full required CI run passed;
+- the root `Package.swift` contains release-asset HTTPS binary-target URLs and
+  checksums, not development `path:` targets;
+- the Source Release workflow has created the selected stable SemVer tag from the
+  exact commit whose full required CI run passed;
+- the selected tag contains `.spi.yml` when versioned hosted DocC is part of the
+  acceptance evidence;
 - `swift package dump-package` succeeds with the latest supported Swift toolchain;
-- an anonymous external consumer resolves the Git URL at `exact: "0.1.0"`, builds,
-  and imports `QVACClient`; and
+- an anonymous external consumer resolves the Git URL at the selected exact
+  SemVer, builds, and imports `QVACClient`; and
 - the macOS 14, iOS 17 device/simulator, DocC, live-worker, pinned-model, and
   performance gates are green for that source commit.
 
@@ -31,11 +60,14 @@ a valid root manifest, Swift 5 or later, a SemVer release, a protocol-qualified
 2. Wait for the package-list validation and index build to complete. Do not create
    a replacement tag to work around a failure; fix the source and publish a new
    SemVer patch release through the guarded release workflow.
-3. On the indexed package page, verify that `v0.1.0`, iOS 17, macOS 14, the
-   `QVACClient` library product, and hosted DocC documentation are detected.
+3. On the indexed package page, verify the latest reviewed stable version, iOS 17,
+   macOS 14, the `QVACClient` library product, successful compatibility builds,
+   and hosted DocC documentation for `QVACClient`.
 4. Use the page's maintainer-claim flow and add its generated compatibility badges
    to the README only after the package is actually indexed.
+5. Record the indexed package/documentation URLs and successful build evidence in
+   `SUBMISSION.md`; do not infer completion merely from submitting the form.
 
-Submission and maintainer claiming require external account actions, so they are
-intentionally not automated by this repository and remain incomplete until the
-artifact and source releases exist.
+Artifact/source publication is complete. Index submission, build verification,
+maintainer claiming, and badges require external account/service actions and are
+intentionally not represented as complete until that evidence exists.

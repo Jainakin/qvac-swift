@@ -20,39 +20,80 @@ on:
 
 permissions:
   actions: read
+  attestations: read
   contents: write
+
+concurrency:
+  group: artifact-release-${{ inputs.revision }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: macos-14
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.22.0
           cache: npm
           cache-dependency-path: tools/runtime/package-lock.json
-      - name: Require main and a new artifact tag
+      - name: Require main and lock the artifact revision
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_REVISION: ${{ inputs.revision }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
         run: |
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
             echo "::error::Immutable artifacts may only be built from main"
             exit 1
           fi
-          ARTIFACT_TAG="artifacts-sdk-0.17.0-r${{ inputs.revision }}"
-          echo "ARTIFACT_TAG=$ARTIFACT_TAG" >> "$GITHUB_ENV"
-          REMOTE_TAG="$(git ls-remote --tags origin "refs/tags/$ARTIFACT_TAG" "refs/tags/$ARTIFACT_TAG^{}")"
-          if [ -n "$REMOTE_TAG" ]; then
-            echo "::error::$ARTIFACT_TAG already exists as a Git tag and must never be replaced"
+          if [[ ! "$INPUT_REVISION" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::revision must be a positive integer"
             exit 1
           fi
+          ARTIFACT_TAG="artifacts-sdk-0.17.0-r$INPUT_REVISION"
+          echo "ARTIFACT_TAG=$ARTIFACT_TAG" >> "$GITHUB_ENV"
+          REMOTE_REFS="$(git ls-remote --tags origin \
+            "refs/tags/$ARTIFACT_TAG" "refs/tags/$ARTIFACT_TAG^{}")"
+          TAG_TARGET="$(printf '%s\n' "$REMOTE_REFS" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')"
+          if [ -z "$TAG_TARGET" ]; then
+            TAG_TARGET="$(printf '%s\n' "$REMOTE_REFS" | awk 'NF == 2 { print $1; exit }')"
+          fi
+          RELEASE_EXISTS=false
           if gh release view "$ARTIFACT_TAG" >/dev/null 2>&1; then
-            echo "::error::$ARTIFACT_TAG already exists as a GitHub release and must never be replaced"
-            exit 1
+            RELEASE_EXISTS=true
+          fi
+
+          if [ "$INPUT_PUBLISH" != "true" ]; then
+            if [ -n "$TAG_TARGET" ] || [ "$RELEASE_EXISTS" = true ]; then
+              echo "::error::$ARTIFACT_TAG is already published and cannot be reused for candidate evidence"
+              exit 1
+            fi
+            echo "ARTIFACT_RELEASE_EXISTS=false" >> "$GITHUB_ENV"
+          elif [ -n "$TAG_TARGET" ] || [ "$RELEASE_EXISTS" = true ]; then
+            if [ -z "$TAG_TARGET" ] || [ "$RELEASE_EXISTS" != true ]; then
+              echo "::error::$ARTIFACT_TAG is in a partial tag/release state; refusing automatic recovery"
+              exit 1
+            fi
+            RELEASE_STATE="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$ARTIFACT_TAG" \
+              --jq '[.draft, .prerelease, .immutable, .target_commitish] | @tsv')"
+            IFS=$'\t' read -r IS_DRAFT IS_PRERELEASE IS_IMMUTABLE RELEASE_TARGET <<< "$RELEASE_STATE"
+            if [ "$TAG_TARGET" != "$GITHUB_SHA" ] || \
+               [ "$RELEASE_TARGET" != "$GITHUB_SHA" ] || \
+               [ "$IS_DRAFT" != false ] || \
+               [ "$IS_PRERELEASE" != false ] || \
+               [ "$IS_IMMUTABLE" != true ]; then
+              echo "::error::Existing $ARTIFACT_TAG is not the exact immutable release for $GITHUB_SHA"
+              echo "tag=$TAG_TARGET release=$RELEASE_TARGET draft=$IS_DRAFT prerelease=$IS_PRERELEASE immutable=$IS_IMMUTABLE"
+              exit 1
+            fi
+            echo "ARTIFACT_RELEASE_EXISTS=true" >> "$GITHUB_ENV"
+            echo "Resuming verification of existing immutable release $ARTIFACT_TAG"
+          else
+            echo "ARTIFACT_RELEASE_EXISTS=false" >> "$GITHUB_ENV"
           fi
       - name: Reproduce portable worker twice
         run: |
@@ -91,6 +132,8 @@ jobs:
       - name: Require reviewed attribution before publication
         if: inputs.publish
         run: |
+          gh release verify --help >/dev/null
+          gh release verify-asset --help >/dev/null
           if [ "${{ inputs.license_reviewed }}" != "true" ]; then
             echo "::error::Binary publication requires maintainer/legal review of THIRD_PARTY_NOTICES.md, including pinned supplements, and license_reviewed=true"
             exit 1
@@ -128,7 +171,7 @@ jobs:
             --bundle Sources/QVACClient/Resources/worker.mobile.bundle
           echo "Final publication gate: canonical Package.swift is URL-based and bound to $GITHUB_SHA"
       - name: Upload immutable candidate evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.ARTIFACT_TAG }}
           path: tools/runtime/.build/release-assets/
@@ -138,19 +181,56 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$ARTIFACT_TAG" tools/runtime/.build/release-assets/* \
-            --target "$GITHUB_SHA" \
-            --title "$ARTIFACT_TAG" \
-            --notes "Immutable iOS artifacts for exact @qvac/sdk 0.17.0. Provenance, checksums, and THIRD_PARTY_NOTICES.md are bound by artifact-manifest.json."
-          MANIFEST_SOURCE="$(node -p 'require("./tools/runtime/.build/release-assets/artifact-manifest.json").sourceCommit')"
-          REMOTE_REFS="$(git ls-remote --tags origin "refs/tags/$ARTIFACT_TAG" "refs/tags/$ARTIFACT_TAG^{}")"
-          TAG_TARGET="$(printf '%s\n' "$REMOTE_REFS" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')"
-          if [ -z "$TAG_TARGET" ]; then
-            TAG_TARGET="$(printf '%s\n' "$REMOTE_REFS" | awk 'NF == 2 { print $1; exit }')"
+          if [ "$ARTIFACT_RELEASE_EXISTS" != true ]; then
+            gh release create "$ARTIFACT_TAG" tools/runtime/.build/release-assets/* \
+              --target "$GITHUB_SHA" \
+              --latest=false \
+              --title "$ARTIFACT_TAG" \
+              --notes "Immutable iOS artifacts for exact @qvac/sdk 0.17.0. Provenance, checksums, and THIRD_PARTY_NOTICES.md are bound by artifact-manifest.json."
           fi
-          RELEASE_TARGET="$(gh release view "$ARTIFACT_TAG" --json targetCommitish --jq .targetCommitish)"
-          if [ "$MANIFEST_SOURCE" != "$GITHUB_SHA" ] || [ "$TAG_TARGET" != "$MANIFEST_SOURCE" ] || [ "$RELEASE_TARGET" != "$MANIFEST_SOURCE" ]; then
-            echo "::error::Published release/tag target does not equal manifest.sourceCommit"
-            echo "manifest=$MANIFEST_SOURCE tag=$TAG_TARGET release=$RELEASE_TARGET"
+
+          # With repository release immutability enabled, current gh creates a
+          # draft, uploads every supplied asset, and only then publishes it.
+          # Re-run the complete audit so a transient post-publication failure can
+          # be resumed without replacing a tag or any immutable asset.
+          verify_published_artifact() {
+            gh release verify "$ARTIFACT_TAG" >/dev/null || return 1
+            for ASSET in tools/runtime/.build/release-assets/*; do
+              gh release verify-asset "$ARTIFACT_TAG" "$ASSET" >/dev/null || return 1
+            done
+
+            MANIFEST_SOURCE="$(node -p 'require("./tools/runtime/.build/release-assets/artifact-manifest.json").sourceCommit')" || return 1
+            REMOTE_REFS="$(git ls-remote --tags origin "refs/tags/$ARTIFACT_TAG" "refs/tags/$ARTIFACT_TAG^{}")" || return 1
+            TAG_TARGET="$(printf '%s\n' "$REMOTE_REFS" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')"
+            if [ -z "$TAG_TARGET" ]; then
+              TAG_TARGET="$(printf '%s\n' "$REMOTE_REFS" | awk 'NF == 2 { print $1; exit }')"
+            fi
+            RELEASE_STATE="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$ARTIFACT_TAG" \
+              --jq '[.draft, .prerelease, .immutable, .target_commitish] | @tsv')" || return 1
+            IFS=$'\t' read -r IS_DRAFT IS_PRERELEASE IS_IMMUTABLE RELEASE_TARGET <<< "$RELEASE_STATE"
+            if [ "$MANIFEST_SOURCE" != "$GITHUB_SHA" ] || \
+               [ "$TAG_TARGET" != "$MANIFEST_SOURCE" ] || \
+               [ "$RELEASE_TARGET" != "$MANIFEST_SOURCE" ] || \
+               [ "$IS_DRAFT" != false ] || \
+               [ "$IS_PRERELEASE" != false ] || \
+               [ "$IS_IMMUTABLE" != true ]; then
+              echo "manifest=$MANIFEST_SOURCE tag=$TAG_TARGET release=$RELEASE_TARGET draft=$IS_DRAFT prerelease=$IS_PRERELEASE immutable=$IS_IMMUTABLE"
+              return 1
+            fi
+          }
+
+          PUBLICATION_VERIFIED=false
+          for ATTEMPT in {1..12}; do
+            if verify_published_artifact; then
+              PUBLICATION_VERIFIED=true
+              break
+            fi
+            if [ "$ATTEMPT" -lt 12 ]; then
+              sleep 5
+            fi
+          done
+          if [ "$PUBLICATION_VERIFIED" != true ]; then
+            echo "::error::Could not verify the complete immutable $ARTIFACT_TAG publication within 60 seconds; rerun this revision to resume its non-mutating audit"
             exit 1
           fi
+          echo "Verified immutable release, attestation, tag/source binding, and every asset for $ARTIFACT_TAG"

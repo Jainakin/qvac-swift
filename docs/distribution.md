@@ -10,8 +10,8 @@ The release system intentionally has two manifest modes:
 - `Package.swift.dev` is the reproducible development manifest. Its 38 local
   binary targets come from `tools/runtime/.build/artifacts`, produced by
   `tools/runtime/link-ios-artifacts.sh`.
-- An immutable `artifact-manifest.json` is published with the native GitHub
-  Release. A release `Package.swift` is generated from that schema; every binary
+- A checksum-bound `artifact-manifest.json` is published with the GitHub artifact
+  release. A release `Package.swift` is generated from that schema; every binary
   target then has the exact release URL and SHA-256 checksum. The external
   manifest is bound to the final Swift source commit and is not copied back into
   that commit (which would change the commit identity).
@@ -22,6 +22,15 @@ manifest is a short, explicit release-candidate state: no source tag is allowed,
 and the artifact publication workflow must reproduce and publish those exact
 future URLs before the source-release workflow can run. Neither workflow invents
 URLs or reuses old 0.10 assets.
+
+GitHub's repository-level **immutable releases** setting must be enabled before
+publishing any new artifact or source release. Choose the next unused artifact
+revision (`artifacts-sdk-0.17.0-rN`) and the next unused source SemVer (`vX.Y.Z`);
+never reuse, replace, or move either tag. The first exact releases,
+`artifacts-sdk-0.17.0-r1` and `v0.1.0`, predate that repository setting and are
+preserved by project policy, exact source binding, and published checksums rather
+than GitHub-native immutability. All subsequent releases use the native setting,
+and the release workflows verify GitHub's release attestations before succeeding.
 
 ## 1. Reproduce the exact development graph
 
@@ -60,9 +69,10 @@ iOS Mach-O `@rpath` dependency references them.
 ## 2. Produce an unpublished release candidate
 
 Run the **Build Immutable SDK 0.17 Artifacts** workflow on `main`. Choose a new,
-monotonically increasing revision such as `1` and leave `publish` disabled. The
-workflow uploads an Actions artifact named `artifacts-sdk-0.17.0-r1`; it does not
-create a Git tag or GitHub Release.
+monotonically increasing revision `N` and leave `publish` disabled. The workflow
+uploads an Actions artifact named `artifacts-sdk-0.17.0-rN`; it does not create a
+Git tag or GitHub Release. For example, after the published `r1` baseline, use
+revision `2` to prepare `artifacts-sdk-0.17.0-r2`.
 
 The workflow:
 
@@ -81,7 +91,7 @@ Download that workflow artifact, verify it, and generate only the URL package
 manifest:
 
 ```bash
-CANDIDATE=/absolute/path/to/artifacts-sdk-0.17.0-r1
+CANDIDATE=/absolute/path/to/artifacts-sdk-0.17.0-rN
 node tools/release/verify-release.mjs \
   "$CANDIDATE/artifact-manifest.json" \
   --assets-dir "$CANDIDATE"
@@ -125,48 +135,70 @@ workflow reproduces all bytes, then hard-fails unless:
 - generated third-party notices are fresh and the packaged notice checksum is
   bound into the release manifest;
 - `artifact-manifest.json.sourceCommit` equals `GITHUB_SHA`; and
-- neither the artifact Git tag nor GitHub Release already exists.
+- the artifact tag and release are both absent for an initial publication, or
+  they form the exact existing immutable pair for a read-only recovery; partial
+  or mismatched states are rejected.
 
-Only after those gates pass does it publish `artifacts-sdk-0.17.0-r1`. It then
-verifies that the created artifact tag, GitHub Release target, and manifest all
-resolve to the exact final source commit. Artifact tags and releases are
-immutable: if anything changes, use a new `rN`; never replace an existing release.
+Only after those gates pass does it publish `artifacts-sdk-0.17.0-rN`. It then
+uses `gh release verify` and `gh release verify-asset` to verify GitHub's release
+attestation and every local asset against the published immutable release. It
+also verifies that the artifact tag, GitHub Release target, and manifest all
+resolve to the exact final source commit. If anything changes, use a new `rN`;
+never replace an existing release.
+
+Publication is retry-safe across GitHub's irreversible boundary. If a transient
+API or attestation failure occurs after an immutable release was published,
+rerunning the same revision rebuilds the candidate and resumes a read-only audit
+only when the existing tag, release target, source commit, native immutable state,
+attestation, and every asset all match. Partial or mismatched states fail closed.
 
 The following command is a read-only independent check of the published release:
 
 ```bash
-tools/release/prepare-release.sh artifacts-sdk-0.17.0-r1
+tools/release/prepare-release.sh artifacts-sdk-0.17.0-rN
 ```
 
-It downloads and hashes every binary asset and the third-party notice, binds the
-manifest to the current Git commit, verifies the canonical URL `Package.swift`
-and embedded worker, and parses the package with SwiftPM. It never edits
-repository files. `Package.swift.dev` remains the local exact graph for the next
-development cycle.
+It downloads the assets into a fresh temporary directory, verifies the release
+attestation with `gh release verify`, verifies each byte with
+`gh release verify-asset`, and independently hashes every binary asset and the
+third-party notice before consuming their metadata. It then binds the manifest
+to the current Git commit, verifies the canonical URL `Package.swift` and
+embedded worker, and parses the package with SwiftPM. It never edits repository files.
+`Package.swift.dev` remains the local exact graph for the next development cycle.
 
 ## 4. Verify first, then create a new source version
 
 Do **not** create or push a SemVer tag by hand. Dispatch the **Source Release**
 workflow from the exact verified `main` commit with:
 
-- `version`: `0.1.0`
-- `artifact_tag`: `artifacts-sdk-0.17.0-r1`
+- `version`: the next unused SemVer, without a `v` prefix (for example, `0.1.1`)
+- `artifact_tag`: the published artifact revision used by canonical
+  `Package.swift` (for example, `artifacts-sdk-0.17.0-r2`)
 
-Before any source tag exists, the workflow binds the published artifact manifest
-and artifact tag to `GITHUB_SHA`, rejects a path-based/stale package, downloads and
+Before any source tag exists, the workflow verifies the artifact release
+attestation with `gh release verify`, binds the published artifact manifest and
+artifact tag to `GITHUB_SHA`, rejects a path-based/stale package, downloads and
 hashes every remote artifact, builds a clean external consumer from the public Git
-URL at that exact revision, and runs unit tests. It creates and pushes the immutable
-SemVer tag and GitHub source release only after every gate passes. A retry may use
-an already-created tag only when it resolves to the same verified commit; tags are
-never moved or force-updated. Pull-request CI separately requires strict-concurrency
-compilation with warnings as errors, DocC with warnings as errors, and generic iOS
-device and simulator builds.
+URL at that exact revision, and runs unit tests. It creates and pushes the SemVer
+tag and GitHub source release only after every gate passes, then verifies the
+source release attestation with `gh release verify`. A retry may use an
+already-created tag only when it resolves to the same verified commit; tags are
+never moved or force-updated. Pull-request CI separately requires
+strict-concurrency compilation with warnings as errors, DocC with warnings as
+errors, and generic iOS device and simulator builds.
+
+If verification is interrupted after the source release becomes immutable,
+rerunning the same version resumes only the non-mutating CI, package, tag, and
+release-attestation audit. It never recreates or edits the existing release.
 
 Consumers can then use:
 
 ```swift
-.package(url: "https://github.com/Jainakin/qvac-swift.git", exact: "0.1.0")
+.package(url: "https://github.com/Jainakin/qvac-swift.git", .upToNextMinor(from: "0.1.0"))
 ```
+
+Applications that require a fully frozen dependency graph should commit
+`Package.resolved` or select the desired published version with `exact:`.
 
 ## Updating the upstream SDK
 
