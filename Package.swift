@@ -1,6 +1,6 @@
 // swift-tools-version:5.10
 // QVAC Swift Client — URL-installable release manifest.
-// Generated from a checksum-bound artifact-manifest.json by the exact 0.17.0
+// Generated from an immutable artifact-manifest.json by the exact 0.17.0
 // artifact pipeline. Do not edit URLs or checksums by hand.
 
 import PackageDescription
