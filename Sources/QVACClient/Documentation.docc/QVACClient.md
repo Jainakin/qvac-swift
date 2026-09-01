@@ -55,9 +55,11 @@ return one complete base64 output per JSON record. Configure
 `maximumWireMessageBytes` and `maximumBufferedStreamBytes` on initialization for
 the application's model set and memory budget.
 
-Per-operation public event streams retain at most 64 elements. Falling behind
-fails that view explicitly with `QVACStreamBufferOverflow`; it never silently drops
-events or grows without bound.
+Per-operation public streams are bounded. ``QVACBufferedStream`` retains up to 64
+indivisible worker batches within `maximumBufferedStreamBytes` and lazily flattens
+frames containing many logical values. Falling behind on a lossless view fails it
+explicitly with ``QVACStreamBufferOverflow``. Observational progress streams instead
+coalesce older snapshots and retain the newest bounded window.
 
 ## Topics
 
@@ -73,5 +75,7 @@ events or grows without bound.
 - ``QVACErrorCode``
 - ``QVACErrorCategory``
 - ``QVACRPCOptions``
+- ``QVACBufferedStream``
 - ``QVACResponseStream``
+- ``QVACStreamBufferOverflow``
 - ``QVACSDKContract``

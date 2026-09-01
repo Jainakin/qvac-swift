@@ -26,8 +26,10 @@ before publishing it.
 
 Swift Package Index analyzes `.spi.yml` from each checked-out version. The
 immutable-by-policy `v0.1.0` tag predates this file, so it must never be moved merely
-to add hosted documentation. A subsequent patch release created from a commit that
-contains `.spi.yml` can become the first stable tag with configured versioned DocC.
+to add hosted documentation. A subsequent `v0.2.0` release created from a commit
+that contains `.spi.yml` can become the first stable tag with configured versioned
+DocC. The grant-handoff stream API is intentionally the new original API and does
+not carry a migration or compatibility layer for the unpublished review delta.
 Existing release evidence remains additive and unchanged.
 
 ## Preconditions
@@ -59,7 +61,7 @@ a valid root manifest, Swift 5 or later, a SemVer release, a protocol-qualified
    `https://github.com/Jainakin/qvac-swift.git`.
 2. Wait for the package-list validation and index build to complete. Do not create
    a replacement tag to work around a failure; fix the source and publish a new
-   SemVer patch release through the guarded release workflow.
+   SemVer release through the guarded release workflow.
 3. On the indexed package page, verify the latest reviewed stable version, iOS 17,
    macOS 14, the `QVACClient` library product, successful compatibility builds,
    and hosted DocC documentation for `QVACClient`.

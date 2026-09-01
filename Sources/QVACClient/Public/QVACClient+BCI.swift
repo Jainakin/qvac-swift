@@ -59,22 +59,50 @@ public extension QVACClient {
             var text = ""
             var segments: [TranscribeSegment] = []
             var stats: JSONValue?
-            for try await response in source {
+            let responses = QVACResponseStreamIteratorBox(source)
+            while let response = try await responses.next() {
+                if case .error(let error) = response {
+                    return try await Self.resolveResponseStreamTerminal(
+                        responses,
+                        operation: "bciTranscribe"
+                    ) { () throws -> BciTranscriptionOutcome in
+                        throw QVACError.fromWire(
+                            code: try Self.checkedWireErrorCode(error.code),
+                            message: error.message
+                        )
+                    }
+                }
                 guard case .bciTranscribe(let frame) = response else {
                     try Self.rejectUnexpectedResponse(response, expected: "bciTranscribe")
                 }
-                if let error = frame.error {
-                    throw QVACError.server(.transcriptionFailed, message: error)
+                if frame.done == true || frame.error != nil {
+                    return try await Self.resolveResponseStreamTerminal(
+                        responses,
+                        operation: "bciTranscribe"
+                    ) {
+                        if let error = frame.error {
+                            throw QVACError.server(.transcriptionFailed, message: error)
+                        }
+                        var terminalText = text
+                        var terminalSegments = segments
+                        var terminalStats = stats
+                        if let fragment = frame.text { terminalText += fragment }
+                        if let raw = frame.segment {
+                            terminalSegments.append(try TranscribeSegment(from: raw))
+                        }
+                        if let responseStats = frame.stats { terminalStats = responseStats }
+                        return BciTranscriptionOutcome(
+                            text: terminalText,
+                            segments: terminalSegments,
+                            stats: terminalStats
+                        )
+                    }
                 }
                 if let fragment = frame.text { text += fragment }
                 if let raw = frame.segment {
-                    let segment = try TranscribeSegment(from: raw)
-                    segments.append(segment)
+                    segments.append(try TranscribeSegment(from: raw))
                 }
                 if let responseStats = frame.stats { stats = responseStats }
-                if frame.done == true {
-                    return .init(text: text, segments: segments, stats: stats)
-                }
             }
             throw QVACError.client(
                 .streamEndedWithoutResponse,
@@ -121,7 +149,28 @@ public extension QVACClient {
                 }
             ) { frame in
                 if let error = frame.error {
-                    throw QVACError.server(.transcriptionFailed, message: error)
+                    return .failThenDrain(
+                        QVACError.server(.transcriptionFailed, message: error)
+                    )
+                }
+                if frame.done == true {
+                    do {
+                        var terminalEvents: [BciTranscribeStreamEvent] = []
+                        if let raw = frame.segment {
+                            terminalEvents.append(.segment(try TranscribeSegment(from: raw)))
+                        }
+                        if let text = frame.text, !text.isEmpty {
+                            terminalEvents.append(.text(text))
+                        }
+                        terminalEvents.append(.done(stats: frame.stats))
+                        return .emitThenDrain(terminalEvents)
+                    } catch let error as QVACError {
+                        return .failThenDrain(error)
+                    } catch {
+                        return .failThenDrain(.protocolViolation(
+                            "bciTranscribeStream returned a malformed terminal frame: \(error)"
+                        ))
+                    }
                 }
                 var events: [BciTranscribeStreamEvent] = []
                 if let raw = frame.segment {
@@ -129,10 +178,6 @@ public extension QVACClient {
                 }
                 if let text = frame.text, !text.isEmpty {
                     events.append(.text(text))
-                }
-                if frame.done == true {
-                    events.append(.done(stats: frame.stats))
-                    return .emitThenDrain(events)
                 }
                 return .emitMany(events)
             }

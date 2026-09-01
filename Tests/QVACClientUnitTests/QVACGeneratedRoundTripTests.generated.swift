@@ -98,7 +98,7 @@ final class QVACGeneratedRoundTripTests: XCTestCase {
         let value25 = ProvideRequest(firewall: .string("fixture"))
         try assertRoundTrip(value25)
         try assertRoundTrip(QVACRequest.provide(value25))
-        let value26 = RagRequest(operation: "fixture", chunk: true, chunkOpts: .string("fixture"), deleteOnClose: true, documents: [], ids: [], modelId: "fixture", n: 1.25, progressInterval: 1.25, query: "fixture", requestId: "fixture", topK: 1.25, withProgress: true, workspace: "fixture")
+        let value26 = RagRequest(operation: "fixture", chunk: true, chunkOpts: .string("fixture"), deleteOnClose: true, documents: .string("fixture"), ids: [], modelId: "fixture", n: 1.25, progressInterval: 1.25, query: "fixture", requestId: "fixture", topK: 1.25, withProgress: true, workspace: "fixture")
         try assertRoundTrip(value26)
         try assertRoundTrip(QVACRequest.rag(value26))
         let value27 = ResumeRequest()

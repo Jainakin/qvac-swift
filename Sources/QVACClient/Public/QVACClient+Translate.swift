@@ -23,13 +23,14 @@ public extension QVACClient {
     /// string. When `stream` is `false`, `tokenStream` is empty and `text` resolves to
     /// the complete translation.
     final class TranslationRun: @unchecked Sendable {
-        public let tokenStream: AsyncThrowingStream<String, Error>
+        /// Lossless tokens retained as byte-bounded whole worker-frame batches.
+        public let tokenStream: QVACBufferedStream<String>
         public let text: Task<String, Error>
         public let stats: Task<TranslationStats?, Error>
         private let processing: Task<String, Error>
 
         init(
-            tokenStream: AsyncThrowingStream<String, Error>,
+            tokenStream: QVACBufferedStream<String>,
             text: Task<String, Error>,
             stats: Task<TranslationStats?, Error>,
             processing: Task<String, Error>
@@ -40,7 +41,13 @@ public extension QVACClient {
             self.processing = processing
         }
 
-        deinit { processing.cancel() }
+        /// Cancel the underlying translation RPC and every public view of this run.
+        ///
+        /// Releasing the run wrapper does not cancel automatically: callers may
+        /// safely retain an extracted task or stream and consume it independently.
+        public func cancel() {
+            processing.cancel()
+        }
     }
 
     /// Translate one non-empty text with an NMT or LLM model.
@@ -166,51 +173,73 @@ public extension QVACClient {
             .translate(req),
             rpcOptions: rpcOptions
         )
-        let (tokens, tokensCont) = Self.makeStream(
+        let maximumBufferedStreamBytes = self.maximumBufferedStreamBytes
+        let (tokens, tokensCont) = Self.makeBufferedStream(
             of: String.self,
-            name: "translate.tokenStream"
+            name: "translate.tokenStream",
+            maximumBufferedBytes: maximumBufferedStreamBytes
         )
         if !stream { tokensCont.finish() }
         let statsBox = ResultBox<TranslationStats?>()
         let processing = Task<String, Error> {
             var full = ""
-            var receivedTerminalFrame = false
             do {
-                for try await response in responseStream {
+                let responses = QVACResponseStreamIteratorBox(responseStream)
+                while let response = try await responses.next() {
+                    if case .error(let error) = response {
+                        return try await Self.resolveResponseStreamTerminal(
+                            responses,
+                            operation: "translate"
+                        ) { () throws -> String in
+                            throw QVACError.fromWire(
+                                code: try Self.checkedWireErrorCode(error.code),
+                                message: error.message
+                            )
+                        }
+                    }
                     guard case .translate(let r) = response else {
                         try Self.rejectUnexpectedResponse(response, expected: "translate")
                     }
-                    if let e = r.error { throw QVACError.server(.translationFailed, message: e) }
-                    if r.done == true {
-                        if !stream { full += r.token }
-                        if let wireStats = r.stats {
-                            do {
-                                statsBox.set(try Self.decodeFromJSONValue(
-                                    wireStats,
-                                    as: TranslationStats.self
-                                ))
-                            } catch {
-                                throw QVACError.protocolViolation(
-                                    "translate returned malformed stats: \(error)"
-                                )
+
+                    // The response schema permits an explicit error without `done`.
+                    // Treat it as a declared logical terminal so a profiling trailer is
+                    // consumed before the public task reports translation failure.
+                    if r.done == true || r.error != nil {
+                        let terminal = try await Self.resolveResponseStreamTerminal(
+                            responses,
+                            operation: "translate"
+                        ) { () throws -> (token: String, stats: TranslationStats?) in
+                            if let error = r.error {
+                                throw QVACError.server(.translationFailed, message: error)
                             }
-                        } else {
-                            statsBox.set(nil)
+                            return (
+                                token: r.token,
+                                stats: try r.stats.map(Self.decodeTranslationStats)
+                            )
                         }
-                        receivedTerminalFrame = true
-                        break
+                        if !stream { full += terminal.token }
+                        statsBox.set(terminal.stats)
+                        tokensCont.finish()
+                        return full
                     }
-                    if stream { tokensCont.yield(r.token) }
+
+                    if stream {
+                        tokensCont.yield(
+                            contentsOf: [r.token],
+                            estimatedBytes: Self.conservativeBufferedJSONBytes(
+                                r,
+                                elementCount: 1,
+                                fallback: maximumBufferedStreamBytes
+                            )
+                        )
+                    }
                     if !stream { full += r.token }
                 }
-                guard receivedTerminalFrame else {
-                    throw QVACError.client(
-                        .streamEndedWithoutResponse,
-                        message: "translate ended without a terminal done frame"
-                    )
-                }
-                tokensCont.finish()
-                return full
+                try Task.checkCancellation()
+                throw QVACError.client(
+                    .streamEndedWithoutResponse,
+                    message: "translate ended without a terminal done frame"
+                )
             } catch {
                 tokensCont.finish(throwing: error)
                 throw error
@@ -227,5 +256,17 @@ public extension QVACClient {
             stats: statsTask,
             processing: processing
         )
+    }
+
+    private static func decodeTranslationStats(
+        _ wire: JSONValue
+    ) throws -> TranslationStats {
+        do {
+            return try decodeFromJSONValue(wire, as: TranslationStats.self)
+        } catch {
+            throw QVACError.protocolViolation(
+                "translate returned malformed stats: \(error)"
+            )
+        }
     }
 }

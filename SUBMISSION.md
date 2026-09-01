@@ -16,7 +16,8 @@ package, `v0.1.0`, from commit
 `85ac16212e43ec4572c96f04bf278cd67e52eb7f`. The current source handoff adds the
 remaining review and grant hardening after that immutable baseline: a finite
 default request deadline, generation-safe worker reconnect, rich-duplex
-profiling-trailer draining, stronger RAG/profiling tests, and an exact-revision
+profiling-trailer draining, batch-aware bounded public streams, retained-byte
+accounting for raw DATA frames, stronger RAG/profiling tests, and an exact-revision
 iOS 17 runtime-consumer gate. It still targets only 0.17 and deliberately adds no
 0.10 compatibility or migration layer.
 
@@ -42,15 +43,16 @@ do not report `immutable: true`. GitHub-native release immutability is enabled f
 subsequent publications, which use new additive artifact revisions and SemVer
 tags rather than altering `r1` or `v0.1.0`.
 
-`THIRD_PARTY_NOTICES.md` is deterministically generated from the exact worker
-payload plus the BareKit native closure root. It inventories 146 package
-identities: 143 contain package-provided license text and the remaining three
-are covered by exact-artifact-bound supplemental texts with pinned source
-evidence and hashes. No shipped identity remains without full license text. Its
-checksum is part of the checksum-bound artifact manifest. Before binary
-publication, a maintainer reviewed the record and three supplements and explicitly
-authorized the `license_reviewed=true` attestation; the guarded artifact workflow
-accepted that attestation and published the bound notice byte.
+The historical `r1` notice inventories 146 JavaScript package identities: 143
+contain package-provided license text and three use exact-artifact-bound
+supplements. Its checksum remains part of the immutable `r1` artifact manifest,
+and the authorized maintainer review is retained as historical evidence. The
+current deeper audit additionally binds all 38 linked native targets, their exact
+npm artifacts and source revisions, and ten independently identified native
+components. That audit exposes four transitive native-license evidence gaps. A
+`license_reviewed=true` attestation does not override them; both future
+publication workflows now fail closed until the gaps recorded in
+`tools/release/native-components.json` are resolved.
 
 ## Engineering-review comments
 
@@ -58,11 +60,11 @@ accepted that attestation and published the bound notice byte.
 |---|---|---|
 | 1 | Default missing `modelConfig` | The shared load-model request builder normalizes an omitted value to `{}` for both unary and progress calls. Unit and real-model tests exercise the omitted configuration path. |
 | 2 | Add per-request timeouts | Every public operation accepts trailing `rpcOptions: QVACRPCOptions`. Unary calls use a total deadline, server streams use a resettable inactivity deadline, and duplex calls use a setup deadline. Ordinary calls now default to a finite 60-second deadline; explicit `timeout: nil` remains available only for intentionally unbounded work protected by an external watchdog. Timeout and task cancellation remove pending RPC state and close the appropriate stream directions. |
-| 3 | Handle profiling trailers | `QVACNDJSONDecoder` incrementally handles fragmented/coalesced records, CRLF, EOF residuals, size limits, and top-level `__profilingTrailer: true` records. Profiling trailers are separated from typed responses; rich duplex wrappers perform a bounded drain to EOF before exposing their logical terminal event, so the following trailer is captured even if the consumer then stops. A typed frame after logical completion is rejected as a protocol violation, while malformed non-trailers still fail decoding. Synthetic and real 0.17 model tests cover this path. |
+| 3 | Handle profiling trailers | `QVACNDJSONDecoder` incrementally handles fragmented/coalesced records, CRLF, EOF residuals, size limits, and top-level `__profilingTrailer: true` records. Profiling trailers are separated from typed responses. High-level terminal-aware adapters—including generated server streams and concrete duplex error paths—perform a bounded drain to EOF before exposing success or throwing the retained worker error, so a following trailer is captured even if the consumer then stops. A typed frame after logical completion is rejected as a protocol violation, while malformed non-trailers still fail decoding. Synthetic and real 0.17 model tests cover this path. |
 | 4 | Pin code generation | `tools/provenance/qvac-sdk.lock.json` binds the npm tarball, integrity, shasum, release commit, and every contract input hash. Generation consumes the committed language-neutral 0.17 contract. Bootstrap independently exports the published npm contract and rejects semantic drift. Node, npm dependencies, generated output, and provenance are all locked and CI-verified. |
 | 5 | Fix real-model tests | The missing/floating fixture was replaced with checksum-, size-, filename-, and revision-pinned LLM and RAG fixtures. Required-suite wrappers reject missing configuration, skips, zero executed tests, or wrong suite names. The current local runs completed LLM 4/4 and RAG 2/2 with zero skips. |
 | 6 | Add upscale and URL installation | The exact 0.17 upscale API, rich `Data` result surface, alias normalization, progress/terminal behavior, large-frame support, unit tests, and a checksum-pinned real Real-ESRGAN test are implemented. The first 38 checksum-bound XCFramework archives are public in `artifacts-sdk-0.17.0-r1`; `v0.1.0` and its checksum-pinned root manifest remain installable directly from the Git URL. |
-| 7 | Bring the client to the current SDK | Generated request/response unions, exact wire entry points, and live coverage now match all 39 SDK 0.17 methods, 43 response leaves, 136 error codes, and 12 public model-type aliases. New 0.17 operations include audio/video/upscale, BCI, VLA, orchestration, classification, finetune, system/model-registry, lifecycle, logging, and provider APIs. |
+| 7 | Bring the client to the requested SDK | Generated request/response unions, exact wire entry points, and live coverage match the grant-pinned SDK 0.17.0 contract: all 39 methods, 43 response leaves, 136 error codes, and 12 public model-type aliases. New 0.17 operations include audio/video/upscale, BCI, VLA, orchestration, classification, finetune, system/model-registry, lifecycle, logging, and provider APIs. |
 
 ## Architecture and production hardening
 
@@ -81,6 +83,14 @@ accepted that attestation and published the bound notice byte.
 - Wire messages and NDJSON records are capped at a configurable 256 MiB by
   default; raw queued stream bytes are bounded separately. A public upscale path
   regression covers a record larger than the old 64 MiB ceiling.
+- Raw stream accounting charges both payload bytes and a conservative structural
+  cost for every DATA frame, so an empty- or tiny-frame flood cannot bypass the
+  configured budget. Queued and consumer-leased frames remain charged until the
+  next demand signal acknowledges the lease.
+- Public streams retain whole producer batches under both count and byte ceilings
+  and flatten them lazily. Lossless semantic views fail explicitly when a consumer
+  cannot keep up; observational progress views coalesce older snapshots and keep
+  the newest bounded window without failing the authoritative operation.
 - Unix-domain sockets use private owned directories, strict identity checks,
   fatal permission/close-on-exec setup, `SO_NOSIGPIPE`, bounded diagnostics,
   inherited-environment filtering, and joinable shutdown. A blocked write aborts
@@ -98,18 +108,31 @@ accepted that attestation and published the bound notice byte.
   after worklet self-exit, so a timed-out caller must close/recreate the client.
 - iOS shutdown sends bounded `__shutdown__` before terminating the worklet, and
   all concurrent close callers join the same cleanup operation.
-- Errors leaving public request and sequence boundaries are normalized to
-  `QVACError`, except Swift task cancellation, which remains `CancellationError`.
+- Errors leaving high-level public request and sequence boundaries are normalized
+  to `QVACError`, except Swift task cancellation, which remains
+  `CancellationError`. The intentionally low-level `wireProgressStream`,
+  `wireServerStream`, and `wireDuplex` escape hatches preserve
+  `QVACResponse.error` as a union value and require callers to continue the same
+  response iterator to EOF so a following profiling trailer is consumed.
 
-The unreleased review delta was revalidated locally on 2026-09-01: the strict
-unit suite passed 234/234, all 12 required no-model live tests passed, and all
-seven required pinned-model tests passed with zero skips. Those model tests
-include the real profiled completion trailer, full RAG ingest/save/search/delete/
-close lifecycle, and public upscale path. The iOS Simulator passed both the real
-bundled-worker handshake/heartbeat/close smoke and the observable-EOF adapter
-ordering test. The source commit remains subject to
-the same exact-SHA hosted matrix before grant handoff; local results are not
-presented as a substitute for that independent run.
+The unreleased review delta was revalidated locally on 2026-09-01: the fail-closed
+unit gate discovered and passed exactly 326/326 tests with zero skips; the
+Thread Sanitizer operation suite passed 118/118 and the raw-channel retention
+suite passed 9/9; all 12 required no-model live tests passed; and all seven
+required pinned-model tests passed with zero skips.
+Those model tests include the real profiled completion trailer, full RAG
+ingest/save/search/delete/close lifecycle, and public upscale path. Strict release,
+macOS example, generic iOS device, iOS Simulator, and DocC warnings-as-errors
+builds passed. The iOS Simulator also passed the real bundled-worker
+handshake/heartbeat/close smoke and observable-EOF adapter ordering test.
+
+The SwiftUI example additionally passed a cold end-to-end UI test on Hardik's
+iPhone 15 Pro running iOS 26.5.2: it downloaded and loaded the pinned model,
+streamed a real completion to its terminal result, unloaded the model, and
+reported success with zero failures or skips. The final source commit remains
+subject to the same exact-SHA hosted matrix before grant handoff; local and
+physical-device results are not presented as substitutes for that independent
+run.
 
 ## Verification evidence
 
@@ -135,7 +158,7 @@ allowed to publish.
 | DocC | Final build passed with DocC warnings as errors, Swift warnings as errors, and strict concurrency enabled |
 | SwiftUI example | Final source builds passed for macOS and generic iOS Simulator after lifecycle and cross-platform input hardening |
 | Exact codegen | Two isolated final runs completed in 0.25 seconds each; 39 methods, 43 responses, 136 errors, 12 aliases, and all six generated outputs were byte-identical to the tree |
-| Third-party attribution | 146/146 shipped identities have full text: 143 package-provided and 3 exact-artifact-bound supplements; 0 unresolved. The final generated notice SHA-256 is `e8f71b72dfc9ac532f2a4f27c3c147bb920e202ef8ed323e0e6a4352652abb4c` |
+| Historical `r1` package attribution | 146/146 JavaScript package identities have full text: 143 package-provided and 3 exact-artifact-bound supplements. The immutable published notice SHA-256 is `e8f71b72dfc9ac532f2a4f27c3c147bb920e202ef8ed323e0e6a4352652abb4c`. This historical result does not claim complete transitive native-binary closure for a future `r2`. |
 | Release/tool safety | Bootstrap, path safety, archive reproducibility, source binding, required-suite self-test, bundle provenance, runtime-lock verification, manifest regeneration, deterministic third-party attribution, and all YAML/shell/JavaScript/JSON syntax checks passed |
 | Diff hygiene | `git diff --check`, explicit file-boundary review, and a clean committed source candidate passed before publication |
 
@@ -234,23 +257,25 @@ a SemVer tag. This makes the publication sequence non-circular and fail-closed.
 | Clone to first inference under 10 minutes | Passed in the exact-release-SHA CI run under the hard 600-second limit |
 | Streaming overhead below 5% | Passed on real public completion streams; the server-normalized mean delivery-factor and raw p99 co-primary intact-block 95% upper bounds are strictly below 1.05, with raw end-to-end metrics retained and no retries or exclusions |
 | Code generation under 30 seconds | Passed twice at 0.25 seconds and remains a fixed CI gate |
-| Physical iPhone example | Source and generic device build are ready; a current 0.17 run on an actual iPhone remains required evidence |
+| Physical iPhone example | Passed on Hardik's iPhone 15 Pro (arm64, iOS 26.5.2): fresh model download/load, real streamed completion and terminal result, then unload; 1/1 UI test passed with zero failures/skips |
 | SwiftPM URL and Swift Package Index | The checksum-bound `r1` artifacts and `v0.1.0` prove baseline URL installation. CI accepts a handoff commit only after anonymously resolving that exact public Git revision with all 38 remote artifacts and completing a live iOS 17 worker handshake. Root SPI hosted-DocC configuration and publication guidance are complete. Actual additive release and Index publication remain publisher-owned and are intentionally not performed here. |
 
-## Remaining external submission evidence
+## Remaining publisher-owned work
 
-The production source, baseline release evidence, Swift Package Index
-configuration, and publication guidance are complete. Two ownership-boundary
-actions remain external and cannot be represented as completed without their own
-evidence:
+The functional source, tests, physical-device proof, baseline URL-installation
+evidence, Swift Package Index configuration, and publication guidance are
+complete. No physical-device acceptance step remains.
 
-1. Run the SwiftUI example on a physical iPhone with SDK 0.17.0 and retain the
-   device/build/log evidence for the grant reviewer.
-2. When the grant publisher is ready, create the next additive artifact/source
-   release from the final green commit and perform/verify Swift Package Index
-   publication if the live Index listing is part of acceptance.
+Before publishing a new binary artifact revision, the authorized publisher must
+close the four transitive native-license evidence gaps listed in
+`tools/release/native-components.json`. App Store distribution also requires an
+accurate per-SDK privacy manifest for every linked binary that uses Apple's
+required-reason APIs; the repository's publication audit deliberately refuses to
+guess reason codes. After those inputs are supplied and all publication checks
+pass, the publisher can create additive `artifacts-sdk-0.17.0-r2` and `v0.2.0`
+releases from the same final green commit, then submit or verify the Swift Package
+Index listing if that live listing is part of acceptance.
 
-The exact `artifacts-sdk-0.17.0-r1` and `v0.1.0` evidence remain public. No new
-artifact release, source release, or Swift Package Index submission is part of
-this handoff; those operations are reserved for the authorized grant publisher.
-Update this status only from actual physical-device and publication evidence.
+The exact `artifacts-sdk-0.17.0-r1` and `v0.1.0` evidence remain public and are
+not modified. No new artifact release, source release, or Swift Package Index
+submission is part of this handoff, per the grant workflow.

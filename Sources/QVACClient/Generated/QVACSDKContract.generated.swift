@@ -128,6 +128,10 @@ public extension QVACClient {
     /// Invoke the conditional progress transport of a request/reply method. This is
     /// available only when the manifest declares progress and the request satisfies
     /// its exact `withProgress`/operation condition.
+    ///
+    /// This low-level wire-union API yields `QVACResponse.error` as a domain
+    /// element. Continue iteration to EOF to consume a following profiling trailer.
+    /// Higher-level progress-run APIs perform that drain and then throw `QVACError`.
     func wireProgressStream(
         _ request: QVACRequest,
         rpcOptions: QVACRPCOptions = .init()
@@ -147,6 +151,11 @@ public extension QVACClient {
     }
 
     /// Invoke any contract method declared as a server stream.
+    ///
+    /// This low-level wire-union API yields `QVACResponse.error` as a domain
+    /// element. Continue iteration to EOF to consume a following profiling trailer.
+    /// Concrete generated and high-level APIs perform that drain and then throw
+    /// `QVACError`.
     func wireServerStream(
         _ request: QVACRequest,
         rpcOptions: QVACRPCOptions = .init()
@@ -156,6 +165,11 @@ public extension QVACClient {
     }
 
     /// Open any contract method declared as a duplex stream.
+    ///
+    /// The returned low-level response union yields `QVACResponse.error` as a
+    /// domain element. Continue its response iterator to EOF to consume a following
+    /// profiling trailer. Concrete generated APIs drain that trailer and throw
+    /// `QVACError`.
     func wireDuplex(
         _ request: QVACRequest,
         rpcOptions: QVACRPCOptions = .init()
@@ -209,13 +223,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<AudioGenStreamResponse> {
         let source = try await wireServerStream(.audioGenStream(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .audioGenStream(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected audioGenStream response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "audioGenStream") { response in
+            switch response {
+            case .audioGenStream(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "audioGenStream")
             }
-            return .emit(value)
         }
     }
 
@@ -225,13 +241,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<BatchCompletionStreamResponse> {
         let source = try await wireServerStream(.batchCompletionStream(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .batchCompletionStream(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected batchCompletionStream response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "batchCompletionStream") { response in
+            switch response {
+            case .batchCompletionStream(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "batchCompletionStream")
             }
-            return .emit(value)
         }
     }
 
@@ -241,13 +259,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<BciTranscribeResponse> {
         let source = try await wireServerStream(.bciTranscribe(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .bciTranscribe(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected bciTranscribe response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "bciTranscribe") { response in
+            switch response {
+            case .bciTranscribe(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "bciTranscribe")
             }
-            return .emit(value)
         }
     }
 
@@ -281,13 +301,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<ClassifyResponse> {
         let source = try await wireServerStream(.classify(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .classify(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected classify response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "classify") { response in
+            switch response {
+            case .classify(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "classify")
             }
-            return .emit(value)
         }
     }
 
@@ -307,13 +329,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<CompletionStreamResponse> {
         let source = try await wireServerStream(.completionStream(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .completionStream(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected completionStream response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "completionStream") { response in
+            switch response {
+            case .completionStream(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "completionStream")
             }
-            return .emit(value)
         }
     }
 
@@ -337,13 +361,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<DiffusionStreamResponse> {
         let source = try await wireServerStream(.diffusionStream(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .diffusionStream(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected diffusionStream response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "diffusionStream") { response in
+            switch response {
+            case .diffusionStream(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "diffusionStream")
             }
-            return .emit(value)
         }
     }
 
@@ -362,6 +388,8 @@ public extension QVACClient {
     }
 
     /// Invoke the conditional progress transport declared for `downloadAsset`.
+    /// This wire-union stream preserves `QVACResponse.error`; continue the same
+    /// iterator to EOF to consume a following profiling trailer.
     func wireDownloadAssetProgress(
         _ request: DownloadAssetRequest,
         rpcOptions: QVACRPCOptions = .init()
@@ -398,6 +426,8 @@ public extension QVACClient {
     }
 
     /// Invoke the conditional progress transport declared for `finetune`.
+    /// This wire-union stream preserves `QVACResponse.error`; continue the same
+    /// iterator to EOF to consume a following profiling trailer.
     func wireFinetuneProgress(
         _ request: FinetuneRequest,
         rpcOptions: QVACRPCOptions = .init()
@@ -476,6 +506,8 @@ public extension QVACClient {
     }
 
     /// Invoke the conditional progress transport declared for `loadModel`.
+    /// This wire-union stream preserves `QVACResponse.error`; continue the same
+    /// iterator to EOF to consume a following profiling trailer.
     func wireLoadModelProgress(
         _ request: LoadModelRequest,
         rpcOptions: QVACRPCOptions = .init()
@@ -489,13 +521,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<LoggingStreamResponse> {
         let source = try await wireServerStream(.loggingStream(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .loggingStream(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected loggingStream response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "loggingStream") { response in
+            switch response {
+            case .loggingStream(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "loggingStream")
             }
-            return .emit(value)
         }
     }
 
@@ -547,13 +581,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<OcrStreamResponse> {
         let source = try await wireServerStream(.ocrStream(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .ocrStream(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected ocrStream response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "ocrStream") { response in
+            switch response {
+            case .ocrStream(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "ocrStream")
             }
-            return .emit(value)
         }
     }
 
@@ -577,13 +613,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<PluginInvokeStreamResponse> {
         let source = try await wireServerStream(.pluginInvokeStream(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .pluginInvokeStream(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected pluginInvokeStream response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "pluginInvokeStream") { response in
+            switch response {
+            case .pluginInvokeStream(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "pluginInvokeStream")
             }
-            return .emit(value)
         }
     }
 
@@ -616,6 +654,8 @@ public extension QVACClient {
     }
 
     /// Invoke the conditional progress transport declared for `rag`.
+    /// This wire-union stream preserves `QVACResponse.error`; continue the same
+    /// iterator to EOF to consume a following profiling trailer.
     func wireRagProgress(
         _ request: RagRequest,
         rpcOptions: QVACRPCOptions = .init()
@@ -685,13 +725,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<TextToSpeechResponse> {
         let source = try await wireServerStream(.textToSpeech(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .textToSpeech(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected textToSpeech response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "textToSpeech") { response in
+            switch response {
+            case .textToSpeech(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "textToSpeech")
             }
-            return .emit(value)
         }
     }
 
@@ -711,13 +753,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<TranscribeResponse> {
         let source = try await wireServerStream(.transcribe(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .transcribe(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected transcribe response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "transcribe") { response in
+            switch response {
+            case .transcribe(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "transcribe")
             }
-            return .emit(value)
         }
     }
 
@@ -737,13 +781,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<TranslateResponse> {
         let source = try await wireServerStream(.translate(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .translate(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected translate response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "translate") { response in
+            switch response {
+            case .translate(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "translate")
             }
-            return .emit(value)
         }
     }
 
@@ -767,13 +813,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<UpscaleStreamResponse> {
         let source = try await wireServerStream(.upscaleStream(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .upscaleStream(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected upscaleStream response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "upscaleStream") { response in
+            switch response {
+            case .upscaleStream(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "upscaleStream")
             }
-            return .emit(value)
         }
     }
 
@@ -783,13 +831,15 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<VideoStreamResponse> {
         let source = try await wireServerStream(.videoStream(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .videoStream(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected videoStream response, got \(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "videoStream") { response in
+            switch response {
+            case .videoStream(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "videoStream")
             }
-            return .emit(value)
         }
     }
 }

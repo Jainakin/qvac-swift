@@ -1,0 +1,292 @@
+{
+  "schemaVersion": 1,
+  "status": "maintainer-review-required",
+  "scope": {
+    "platform": "iOS",
+    "sdkVersion": "0.17.0",
+    "linkedTargetsManifest": {
+      "file": "tools/release/artifacts.development.json",
+      "sha256": "66e2298a6abf2c19b2af9c0411aea5d6c77c5a81a4a9b70d7e89447c51ed708b"
+    },
+    "frameworkSlices": [
+      "ios-arm64",
+      "ios-arm64_x86_64-simulator"
+    ],
+    "scannerVersion": 2,
+    "appleRequirements": [
+      "https://developer.apple.com/documentation/bundleresources/privacy-manifest-files",
+      "https://developer.apple.com/documentation/bundleresources/adding-a-privacy-manifest-to-your-app-or-third-party-sdk",
+      "https://developer.apple.com/documentation/bundleresources/describing-use-of-required-reason-api",
+      "https://developer.apple.com/documentation/bundleresources/app-privacy-configuration/nsprivacyaccessedapitypes/nsprivacyaccessedapitype",
+      "https://developer.apple.com/documentation/technotes/tn3181-debugging-invalid-privacy-manifest",
+      "https://developer.apple.com/documentation/technotes/tn3184-adding-data-collection-details-to-your-privacy-manifest"
+    ]
+  },
+  "scanEvidence": [
+    {
+      "target": "BareKit",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryDiskSpace",
+          "identifiers": ["statfs"]
+        },
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat", "lstat", "stat"]
+        },
+        {
+          "category": "NSPrivacyAccessedAPICategorySystemBootTime",
+          "identifiers": ["mach_absolute_time"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    { "target": "bare-buffer.3.7.0", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-cpu-info.0.1.1", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-crypto.1.15.3", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    {
+      "target": "bare-dns.2.2.0",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["stat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    {
+      "target": "bare-ffmpeg.1.5.0",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat", "lstat", "stat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    { "target": "bare-fs.4.8.1", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-gpu-info.0.1.1", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-inspect.3.1.5", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-os.3.9.3", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-path.3.1.1", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-performance.2.1.1", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-pipe.4.3.1", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-signals.4.2.0", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-tcp.2.6.1", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-tls.3.1.10", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-type.1.1.0", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-url.2.5.2", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "bare-zlib.1.4.1", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    {
+      "target": "fs-native-extensions.1.5.0",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    { "target": "quickbit-native.2.4.8", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    {
+      "target": "qvac__asr-ggml.0.1.1",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["stat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    {
+      "target": "qvac__audiogen-ggml.0.1.1",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    { "target": "qvac__bci-whispercpp.0.6.0", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    { "target": "qvac__classification-ggml.0.15.1", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    {
+      "target": "qvac__diffusion-cpp.0.17.0",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat", "stat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    {
+      "target": "qvac__embed-llamacpp.0.30.1",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat", "stat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    {
+      "target": "qvac__fabric.0.3.1",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat", "stat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    {
+      "target": "qvac__llm-llamacpp.0.39.4",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat", "stat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    {
+      "target": "qvac__ocr-ggml.0.13.1",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    {
+      "target": "qvac__translation-nmtcpp.8.3.1",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat", "lstat", "stat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    {
+      "target": "qvac__tts-ggml.0.6.3",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    {
+      "target": "qvac__vla-ggml.0.16.2",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    { "target": "rabin-native.2.0.0", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    {
+      "target": "rocksdb-native.3.17.4",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryDiskSpace",
+          "identifiers": ["statvfs"]
+        },
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat", "stat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    { "target": "simdle-native.1.3.9", "requiredReasonAPIs": [], "privacyManifestSHA256": null },
+    {
+      "target": "sodium-native.5.1.0",
+      "requiredReasonAPIs": [
+        {
+          "category": "NSPrivacyAccessedAPICategoryFileTimestamp",
+          "identifiers": ["fstat"]
+        }
+      ],
+      "privacyManifestSHA256": null
+    },
+    { "target": "udx-native.1.21.1", "requiredReasonAPIs": [], "privacyManifestSHA256": null }
+  ],
+  "reviewDecisions": [],
+  "publicationBlockers": [
+    {
+      "id": "required-reason-api-privacy-manifests",
+      "affectedTargets": [
+        "BareKit",
+        "bare-dns.2.2.0",
+        "bare-ffmpeg.1.5.0",
+        "fs-native-extensions.1.5.0",
+        "qvac__asr-ggml.0.1.1",
+        "qvac__audiogen-ggml.0.1.1",
+        "qvac__diffusion-cpp.0.17.0",
+        "qvac__embed-llamacpp.0.30.1",
+        "qvac__fabric.0.3.1",
+        "qvac__llm-llamacpp.0.39.4",
+        "qvac__ocr-ggml.0.13.1",
+        "qvac__translation-nmtcpp.8.3.1",
+        "qvac__tts-ggml.0.6.3",
+        "qvac__vla-ggml.0.16.2",
+        "rocksdb-native.3.17.4",
+        "sodium-native.5.1.0"
+      ],
+      "missingEvidence": "Sixteen linked XCFrameworks import APIs in Apple's File Timestamp, Disk Space, or System Boot Time required-reason categories, while none of their iOS slices contains PrivacyInfo.xcprivacy and no target owner has supplied accurate approved reason selections.",
+      "action": "Each target owner must document the actual use of every detected category, select only Apple-approved reason codes that match that use, add one byte-identical reviewed PrivacyInfo.xcprivacy at the root of every iOS framework slice, and record its exact declarations and SHA-256 in reviewDecisions. Do not infer reason codes from this symbol scan."
+    },
+    {
+      "id": "complete-sdk-privacy-practices-review",
+      "affectedTargets": [
+        "BareKit",
+        "bare-buffer.3.7.0",
+        "bare-cpu-info.0.1.1",
+        "bare-crypto.1.15.3",
+        "bare-dns.2.2.0",
+        "bare-ffmpeg.1.5.0",
+        "bare-fs.4.8.1",
+        "bare-gpu-info.0.1.1",
+        "bare-inspect.3.1.5",
+        "bare-os.3.9.3",
+        "bare-path.3.1.1",
+        "bare-performance.2.1.1",
+        "bare-pipe.4.3.1",
+        "bare-signals.4.2.0",
+        "bare-tcp.2.6.1",
+        "bare-tls.3.1.10",
+        "bare-type.1.1.0",
+        "bare-url.2.5.2",
+        "bare-zlib.1.4.1",
+        "fs-native-extensions.1.5.0",
+        "quickbit-native.2.4.8",
+        "qvac__asr-ggml.0.1.1",
+        "qvac__audiogen-ggml.0.1.1",
+        "qvac__bci-whispercpp.0.6.0",
+        "qvac__classification-ggml.0.15.1",
+        "qvac__diffusion-cpp.0.17.0",
+        "qvac__embed-llamacpp.0.30.1",
+        "qvac__fabric.0.3.1",
+        "qvac__llm-llamacpp.0.39.4",
+        "qvac__ocr-ggml.0.13.1",
+        "qvac__translation-nmtcpp.8.3.1",
+        "qvac__tts-ggml.0.6.3",
+        "qvac__vla-ggml.0.16.2",
+        "rabin-native.2.0.0",
+        "rocksdb-native.3.17.4",
+        "simdle-native.1.3.9",
+        "sodium-native.5.1.0",
+        "udx-native.1.21.1"
+      ],
+      "missingEvidence": "Import and string scans cannot determine call purpose, dynamically resolved APIs, data collection, tracking domains, or whether an apparently unaffected SDK enables collection. No source-owner review decision exists for any of the complete 38-target binary closure.",
+      "action": "Review source and runtime behavior for every target and record a substantive per-target decision. A target with a manifest must bind the reviewed byte and declarations; a target without one requires explicit evidence that it uses no required-reason API, collects or enables collection of no covered data, and contacts no tracking domain. Then validate the assembled privacy report before removing this blocker."
+    }
+  ]
+}

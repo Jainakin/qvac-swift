@@ -84,9 +84,23 @@ final class BareRPCResponseStream: @unchecked Sendable {
 
 /// Demand-aware, byte-bounded channel used behind raw response streams. Unlike
 /// `AsyncThrowingStream`'s default buffering policy, this never retains an
-/// unbounded number of large media frames. A waiting consumer receives a value
-/// directly; otherwise queued `Data` is charged against the configured budget.
-private final class BoundedRPCDataChannel: @unchecked Sendable {
+/// unbounded number of large media frames. Queued values and the value currently
+/// handed to the consumer remain charged until that consumer asks for its next
+/// value. Every value also carries a conservative structural charge so empty or
+/// tiny DATA frames cannot grow the queue without consuming the configured budget.
+final class BoundedRPCDataChannel: @unchecked Sendable {
+    /// Conservative allowance for the `Data` value, its queue entry, spare Array
+    /// capacity, and allocator bookkeeping. Payload bytes are charged separately.
+    ///
+    /// Keep this visible to `@testable` unit tests so boundary assertions derive
+    /// from the production accounting rule instead of duplicating a magic number.
+    static let retainedValueOverheadBytes = 64
+
+    private struct RetainedValue {
+        let data: Data
+        let chargedBytes: Int
+    }
+
     private enum Terminal {
         case finished
         case failed(Error)
@@ -95,9 +109,14 @@ private final class BoundedRPCDataChannel: @unchecked Sendable {
     private let maximumBufferedBytes: Int
     private let onCancel: @Sendable () -> Void
     private let lock = NSLock()
-    private var queue: [Data] = []
+    /// Consumed slots are cleared immediately so their `Data` storage is not
+    /// retained while periodic prefix compaction keeps dequeue amortized O(1).
+    private var queue: [RetainedValue?] = []
     private var queueIndex = 0
+    /// Includes queued values and the value leased to the active iterator.
     private var bufferedBytes = 0
+    /// The active iterator acknowledges this lease by requesting its next value.
+    private var inFlightBytes = 0
     private var waiter: CheckedContinuation<Data?, Error>?
     private var terminal: Terminal?
     private var cancellationReported = false
@@ -116,24 +135,27 @@ private final class BoundedRPCDataChannel: @unchecked Sendable {
             lock.unlock()
             return nil
         }
-        if let current = waiter {
-            waiter = nil
-            waiting = current
-            lock.unlock()
-            waiting?.resume(returning: value)
-            return nil
-        }
-        let (attempted, overflowed) = bufferedBytes.addingReportingOverflow(value.count)
-        if overflowed || attempted > maximumBufferedBytes {
+        let (chargedBytes, chargeOverflowed) = value.count.addingReportingOverflow(
+            Self.retainedValueOverheadBytes
+        )
+        let (attempted, totalOverflowed) = bufferedBytes.addingReportingOverflow(chargedBytes)
+        if chargeOverflowed || totalOverflowed || attempted > maximumBufferedBytes {
             lock.unlock()
             return BareRPCStreamBufferOverflow(
                 maximumBufferedBytes: maximumBufferedBytes,
-                attemptedBufferedBytes: overflowed ? Int.max : attempted
+                attemptedBufferedBytes: chargeOverflowed || totalOverflowed ? Int.max : attempted
             )
         }
-        queue.append(value)
+        if let current = waiter {
+            waiter = nil
+            waiting = current
+            inFlightBytes = chargedBytes
+        } else {
+            queue.append(RetainedValue(data: value, chargedBytes: chargedBytes))
+        }
         bufferedBytes = attempted
         lock.unlock()
+        waiting?.resume(returning: value)
         return nil
     }
 
@@ -150,6 +172,7 @@ private final class BoundedRPCDataChannel: @unchecked Sendable {
         if discardingBuffered {
             queue.removeAll(keepingCapacity: false)
             queueIndex = 0
+            inFlightBytes = 0
             bufferedBytes = 0
         }
         if queueIndex >= queue.count {
@@ -166,22 +189,25 @@ private final class BoundedRPCDataChannel: @unchecked Sendable {
     }
 
     func next() async throws -> Data? {
-        try Task.checkCancellation()
         return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
+            try Task.checkCancellation()
+            let value: Data? = try await withCheckedThrowingContinuation { continuation in
                 var immediateValue: Data?
                 var immediateTerminal: Terminal?
                 var registered = false
 
                 lock.lock()
+                acknowledgeInFlightLocked()
                 if queueIndex < queue.count {
-                    immediateValue = queue[queueIndex]
-                    bufferedBytes -= immediateValue?.count ?? 0
+                    let retainedValue = queue[queueIndex]
+                    queue[queueIndex] = nil
                     queueIndex += 1
                     if queueIndex >= 64, queueIndex >= queue.count / 2 {
                         queue.removeFirst(queueIndex)
                         queueIndex = 0
                     }
+                    immediateValue = retainedValue?.data
+                    inFlightBytes = retainedValue?.chargedBytes ?? 0
                 } else if let terminal {
                     immediateTerminal = terminal
                 } else if waiter != nil {
@@ -206,20 +232,71 @@ private final class BoundedRPCDataChannel: @unchecked Sendable {
                     }
                 }
             }
+            try Task.checkCancellation()
+            return value
         } onCancel: {
             self.cancelPendingNext()
         }
     }
 
+    /// Cancel local consumption synchronously. This must discard retained values
+    /// even after a remote terminal frame removed the operation from the RPC
+    /// actor; otherwise an early break can retain a completed stream's full byte
+    /// budget for as long as the sequence value itself remains alive.
+    func cancel() {
+        cancel(resumingPendingNextWith: nil)
+    }
+
     private func cancelPendingNext() {
+        cancel(resumingPendingNextWith: CancellationError())
+    }
+
+    private func cancel(resumingPendingNextWith error: Error?) {
         let (waiting, shouldNotify): (CheckedContinuation<Data?, Error>?, Bool) = lock.withLock {
+            let wasActive = terminal == nil
+            if wasActive { terminal = .finished }
+            queue.removeAll(keepingCapacity: false)
+            queueIndex = 0
+            inFlightBytes = 0
+            bufferedBytes = 0
             defer { waiter = nil }
-            let shouldNotify = !cancellationReported && terminal == nil
+            let shouldNotify = !cancellationReported && wasActive
             cancellationReported = true
             return (waiter, shouldNotify)
         }
-        waiting?.resume(throwing: CancellationError())
+        if let error {
+            waiting?.resume(throwing: error)
+        } else {
+            waiting?.resume(returning: nil)
+        }
         if shouldNotify { onCancel() }
+    }
+
+    /// Releases the accounting lease for the value returned by the preceding
+    /// `next()` call. The payload's queue slot is cleared at dequeue time,
+    /// so the channel does not retain an already-consumed `Data` value.
+    private func acknowledgeInFlightLocked() {
+        guard inFlightBytes > 0 else { return }
+        if inFlightBytes <= bufferedBytes {
+            bufferedBytes -= inFlightBytes
+        } else {
+            // Restore coherent accounting without trapping on corrupted state.
+            bufferedBytes = 0
+        }
+        inFlightBytes = 0
+    }
+
+    /// Test-only visibility for deterministic byte-accounting and retention
+    /// assertions without timing producer/consumer races.
+    func __testState() -> (
+        queuedValues: Int,
+        bufferedBytes: Int,
+        inFlightBytes: Int,
+        hasPendingWaiter: Bool
+    ) {
+        lock.withLock {
+            (queue.count - queueIndex, bufferedBytes, inFlightBytes, waiter != nil)
+        }
     }
 }
 
@@ -298,6 +375,11 @@ actor BareRPCClient {
 
     /// Per-request bookkeeping for `duplex`.
     private final class PendingDuplex {
+        struct OutboundWrite {
+            let id: UInt64
+            let task: Task<Void, Error>
+        }
+
         let id: UInt64
         let channel: BoundedRPCDataChannel
         /// `STREAM | REQUEST | OPEN` ack from server received.
@@ -305,7 +387,6 @@ actor BareRPCClient {
         /// `RESPONSE | OPEN` from server received.
         var responseOpened = false
         var localWritesComplete = false
-        var waitForRemoteOpen = false
         var outboundEnded = false
         var finished = false
         var setupContinuation: CheckedContinuation<Void, Error>?
@@ -313,7 +394,13 @@ actor BareRPCClient {
         var timeoutTask: Task<Void, Never>?
         var setupWriteTask: Task<Void, Never>?
         var setupWriteStarted = false
-        var outboundWriteTail: Task<Void, Error>?
+        /// Every queued or executing post-handshake write. Keeping the complete
+        /// active set (rather than only the serial tail) lets terminal teardown
+        /// cancel predecessor tasks too. A canceled tail waiting on
+        /// `predecessor.value` does not propagate cancellation backwards.
+        var outboundWrites: [UInt64: Task<Void, Error>] = [:]
+        var outboundWriteTail: OutboundWrite?
+        var nextOutboundWriteID: UInt64 = 1
         init(id: UInt64, channel: BoundedRPCDataChannel) {
             self.id = id; self.channel = channel
         }
@@ -550,8 +637,8 @@ actor BareRPCClient {
                 await self?.failStream(id: id, with: CancellationError(), notifyRemote: true)
             }
         }
-        let onCancel: @Sendable () -> Void = { [weak self, id] in
-            Task { [weak self] in await self?.destroyStream(id: id) }
+        let onCancel: @Sendable () -> Void = { [channel] in
+            channel.cancel()
         }
         return BareRPCResponseStream(chunks: asyncStream, onCancel: onCancel)
     }
@@ -572,7 +659,6 @@ actor BareRPCClient {
         }
         let pending = PendingDuplex(id: id, channel: channel)
         pending.timeout = timeout
-        pending.waitForRemoteOpen = timeout != nil
         let openRequest = try BareRPCCodec.encodeRequestFrame(
             id: id,
             command: command,
@@ -637,8 +723,8 @@ actor BareRPCClient {
             guard let self else { throw BareRPCStreamClosed() }
             try await self.endDuplexOutbound(id: id)
         }
-        let onDestroy: @Sendable () -> Void = { [weak self] in
-            Task { [weak self] in await self?.destroyDuplex(id: id) }
+        let onDestroy: @Sendable () -> Void = { [channel] in
+            channel.cancel()
         }
         return BareRPCDuplexSession(
             chunks: asyncStream, onWrite: onWrite, onEnd: onEnd, onDestroy: onDestroy
@@ -771,6 +857,15 @@ actor BareRPCClient {
             }
             if flags.contains(.end) || flags.contains(.close) || flags.contains(.destroy) {
                 d.outboundEnded = true
+                if (d.setupWriteStarted && !d.localWritesComplete)
+                    || !d.outboundWrites.isEmpty {
+                    // The peer terminated the request half while its setup write or
+                    // post-handshake writes were still queued/executing. Cancel every
+                    // link and close this transport generation so even a
+                    // cancellation-oblivious writer is guaranteed to return.
+                    for task in d.outboundWrites.values { task.cancel() }
+                    _ = beginClosing()
+                }
             }
             // RESUME/PAUSE are transport-level backpressure signals.
         }
@@ -808,14 +903,28 @@ actor BareRPCClient {
         guard let duplex = pendingDuplex[id], !duplex.finished else {
             throw BareRPCStreamClosed()
         }
-        let predecessor = duplex.outboundWriteTail
+        let predecessor = duplex.outboundWriteTail?.task
+        let writeID = duplex.nextOutboundWriteID
+        duplex.nextOutboundWriteID &+= 1
+        if duplex.nextOutboundWriteID == 0 { duplex.nextOutboundWriteID = 1 }
         let transport = self.transport
         let task = Task<Void, Error> {
             if let predecessor { try await predecessor.value }
             try Task.checkCancellation()
             try await transport.write(frame)
+            // BareTransport implementations are required to cooperate with close,
+            // but a custom adapter may return normally after cancellation unblocks
+            // it. Never report that ambiguous write as successful.
+            try Task.checkCancellation()
         }
-        duplex.outboundWriteTail = task
+        duplex.outboundWrites[writeID] = task
+        duplex.outboundWriteTail = .init(id: writeID, task: task)
+        defer {
+            duplex.outboundWrites.removeValue(forKey: writeID)
+            if duplex.outboundWriteTail?.id == writeID {
+                duplex.outboundWriteTail = nil
+            }
+        }
         do {
             try await withTaskCancellationHandler {
                 try await task.value
@@ -838,11 +947,18 @@ actor BareRPCClient {
         guard let d = takeDuplex(id: id) else { return }
         d.finished = true
         resumeSetup(d, with: .failure(CancellationError()))
-        sendDuplexTeardown(
-            id: id,
-            closeRequest: !d.outboundEnded,
-            after: d.setupWriteTask
-        )
+        if d.outboundWrites.isEmpty {
+            sendDuplexTeardown(
+                id: id,
+                closeRequest: !d.outboundEnded,
+                after: d.setupWriteTask
+            )
+        } else {
+            // A post-handshake transport write may ignore task cancellation. The
+            // operation has already been removed, so fail-close this generation to
+            // unblock every writer instead of queuing teardown behind a stuck write.
+            _ = beginClosing()
+        }
         d.channel.finish(discardingBuffered: true)
     }
 
@@ -928,6 +1044,12 @@ actor BareRPCClient {
         stream.finished = true
         resumeSetup(stream, with: .success(()))
         stream.channel.finish()
+        if stream.setupWriteStarted && !stream.openSent {
+            // A peer can terminate as soon as it parses the request, before the
+            // async transport write reports completion. Cancellation alone cannot
+            // release an arbitrary BareTransport implementation.
+            _ = beginClosing()
+        }
     }
 
     private func failStream(id: UInt64, with error: Error, notifyRemote: Bool) {
@@ -935,10 +1057,9 @@ actor BareRPCClient {
         stream.finished = true
         resumeSetup(stream, with: .failure(error))
         stream.channel.finish(throwing: error, discardingBuffered: true)
-        if notifyRemote {
-            if stream.setupWriteStarted && !stream.openSent {
-                _ = beginClosing()
-            } else if stream.openSent {
+        if stream.setupWriteStarted && !stream.openSent {
+            _ = beginClosing()
+        } else if notifyRemote, stream.openSent {
                 if let frame = try? BareRPCCodec.encodeStreamFrame(
                     id: id,
                     flags: [.response, .destroy],
@@ -946,7 +1067,6 @@ actor BareRPCClient {
                 ) {
                     sendTeardown(frame, after: stream.setupWriteTask)
                 }
-            }
         }
     }
 
@@ -973,7 +1093,7 @@ actor BareRPCClient {
 
     private func completeDuplexSetupIfReady(id: UInt64) {
         guard let duplex = pendingDuplex[id], !duplex.finished, duplex.localWritesComplete else { return }
-        if duplex.waitForRemoteOpen && !(duplex.requestOpened && duplex.responseOpened) { return }
+        guard duplex.requestOpened && duplex.responseOpened else { return }
         duplex.timeoutTask?.cancel()
         duplex.timeoutTask = nil
         resumeSetup(duplex, with: .success(()))
@@ -987,7 +1107,17 @@ actor BareRPCClient {
         guard let duplex = takeDuplex(id: id) else { return }
         duplex.finished = true
         resumeSetup(duplex, with: .success(()))
-        if notifyRemote {
+        if duplex.setupWriteStarted && !duplex.localWritesComplete {
+            // Preserve the removed channel's remote terminal, but fail-close the
+            // generation so an incomplete cancellation-oblivious handshake write
+            // cannot remain behind it forever.
+            _ = beginClosing()
+        } else if !duplex.outboundWrites.isEmpty {
+            // Remote response termination raced queued/request-direction writes.
+            // Their delivery is now ambiguous, and only generation teardown can
+            // guarantee that a non-cooperative transport write is released.
+            _ = beginClosing()
+        } else if notifyRemote {
             sendDuplexTeardown(id: id, closeRequest: true, after: duplex.setupWriteTask)
         }
         duplex.channel.finish()
@@ -997,10 +1127,12 @@ actor BareRPCClient {
         guard let duplex = takeDuplex(id: id) else { return }
         duplex.finished = true
         resumeSetup(duplex, with: .failure(error))
-        if notifyRemote {
-            if duplex.setupWriteStarted && !duplex.localWritesComplete {
-                _ = beginClosing()
-            } else if duplex.localWritesComplete {
+        if duplex.setupWriteStarted && !duplex.localWritesComplete {
+            _ = beginClosing()
+        } else if !duplex.outboundWrites.isEmpty {
+            _ = beginClosing()
+        } else if notifyRemote {
+            if duplex.localWritesComplete {
                 sendDuplexTeardown(
                     id: id,
                     closeRequest: !duplex.outboundEnded,
@@ -1062,7 +1194,7 @@ actor BareRPCClient {
         duplex.timeoutTask?.cancel()
         duplex.timeoutTask = nil
         duplex.setupWriteTask?.cancel()
-        duplex.outboundWriteTail?.cancel()
+        for task in duplex.outboundWrites.values { task.cancel() }
         return duplex
     }
 
@@ -1167,7 +1299,7 @@ actor BareRPCClient {
         for (_, d) in pendingDuplex where !d.finished {
             d.timeoutTask?.cancel()
             d.setupWriteTask?.cancel()
-            d.outboundWriteTail?.cancel()
+            for task in d.outboundWrites.values { task.cancel() }
             resumeSetup(d, with: .failure(error))
             d.channel.finish(throwing: error, discardingBuffered: true)
         }
@@ -1177,6 +1309,31 @@ actor BareRPCClient {
     /// Test-only visibility for proving timeout/cancellation cleanup.
     func __testInFlightCounts() -> (sends: Int, streams: Int, duplexes: Int) {
         (pendingSends.count, pendingStreams.count, pendingDuplex.count)
+    }
+
+    /// Test-only visibility for proving that duplex teardown observes every
+    /// queued/executing write rather than only the serial tail.
+    func __testDuplexOutboundWriteCount(id: UInt64) -> Int? {
+        pendingDuplex[id]?.outboundWrites.count
+    }
+
+    /// Test-only visibility for proving that timeout configuration changes only
+    /// the timer, never the two-OPEN readiness predicate.
+    func __testDuplexSetupState(id: UInt64) -> (
+        localWritesComplete: Bool,
+        requestOpened: Bool,
+        responseOpened: Bool,
+        awaitingSetup: Bool,
+        hasTimeoutTask: Bool
+    )? {
+        guard let duplex = pendingDuplex[id] else { return nil }
+        return (
+            duplex.localWritesComplete,
+            duplex.requestOpened,
+            duplex.responseOpened,
+            duplex.setupContinuation != nil,
+            duplex.timeoutTask != nil
+        )
     }
 
     /// Test-only visibility for proving that stream activity invalidates an

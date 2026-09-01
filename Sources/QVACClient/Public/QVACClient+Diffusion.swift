@@ -5,16 +5,16 @@
 //   • output frames with base64-encoded image bytes (one per `batchCount` image)
 //
 // We expose three views:
-//   • `progress`: AsyncThrowingStream<DiffusionProgressTick>
+//   • `progressStream`: QVACBufferedStream<DiffusionProgressTick>
 //   • `outputs`:  Task<[Data], Error>  (the rendered images)
-//   • `stats`:    Task<JSONValue?, Error>
+//   • `stats`:    Task<DiffusionStats?, Error>
 
 import Foundation
 
 public extension QVACClient {
 
     /// Progress tick during diffusion sampling.
-    struct DiffusionProgressTick: Sendable, Equatable {
+    struct DiffusionProgressTick: Codable, Sendable, Equatable {
         public let step: Double
         public let totalSteps: Double
         public let elapsedMs: Double
@@ -39,14 +39,23 @@ public extension QVACClient {
         public let seed: Double?
     }
 
-    /// Streaming diffusion result. Iterate `progress` for progress events, await
+    /// Streaming diffusion result. Iterate `progressStream` for progress events, await
     /// `outputs` for the rendered images (PNG-encoded `Data`).
     final class DiffusionRun: @unchecked Sendable {
-        public let progressStream: AsyncThrowingStream<DiffusionProgressTick, Error>
+        /// Observational snapshots retaining the newest count- and byte-bounded
+        /// window if the consumer lags. Coalescing never changes `outputs` or `stats`.
+        public let progressStream: QVACBufferedStream<DiffusionProgressTick>
         public let outputs: Task<[Data], Error>
         public let stats: Task<DiffusionStats?, Error>
-        init(progressStream: AsyncThrowingStream<DiffusionProgressTick, Error>, outputs: Task<[Data], Error>, stats: Task<DiffusionStats?, Error>) {
-            self.progressStream = progressStream; self.outputs = outputs; self.stats = stats
+
+        init(
+            progressStream: QVACBufferedStream<DiffusionProgressTick>,
+            outputs: Task<[Data], Error>,
+            stats: Task<DiffusionStats?, Error>
+        ) {
+            self.progressStream = progressStream
+            self.outputs = outputs
+            self.stats = stats
         }
     }
 
@@ -64,10 +73,27 @@ public extension QVACClient {
         scheduler: String? = nil,
         seed: Int? = nil,
         batchCount: Int? = nil,
+        imgCfgScale: Double? = nil,
+        vaeTiling: Bool? = nil,
+        cachePreset: String? = nil,
         initImage: Data? = nil,
+        initImages: [Data]? = nil,
+        increaseRefIndex: Bool? = nil,
+        autoResizeRefImage: Bool? = nil,
+        lora: String? = nil,
         strength: Double? = nil,
+        upscale: JSONValue? = nil,
+        configure: @Sendable (inout DiffusionStreamRequest) -> Void = { _ in },
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> DiffusionRun {
+        guard initImage == nil || initImages == nil else {
+            throw QVACError.invalidArgument(
+                "diffusion initImage and initImages are mutually exclusive"
+            )
+        }
+        if let initImages, initImages.isEmpty {
+            throw QVACError.invalidArgument("diffusion initImages must not be empty")
+        }
         var req = DiffusionStreamRequest(modelId: modelId, prompt: prompt)
         req.negativePrompt = negativePrompt
         req.width = width
@@ -79,43 +105,113 @@ public extension QVACClient {
         req.scheduler = scheduler
         req.seed = seed
         req.batchCount = batchCount
+        req.imgCfgScale = imgCfgScale
+        req.vaeTiling = vaeTiling
+        req.cachePreset = cachePreset
         req.initImage = initImage?.base64EncodedString()
+        req.initImages = initImages?.map { $0.base64EncodedString() }
+        req.increaseRefIndex = increaseRefIndex
+        req.autoResizeRefImage = autoResizeRefImage
+        req.lora = lora
         req.strength = strength
+        req.upscale = upscale
+        configure(&req)
+        guard req.initImage == nil || req.initImages == nil else {
+            throw QVACError.invalidArgument(
+                "diffusion initImage and initImages are mutually exclusive"
+            )
+        }
+        return try await diffusion(req, rpcOptions: rpcOptions)
+    }
 
+    /// Generate images from an exact 0.17 request while retaining the rich progress,
+    /// outputs, and stats views. This overload exposes every generated request field.
+    func diffusion(
+        _ req: DiffusionStreamRequest,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws -> DiffusionRun {
         let stream: QVACResponseStream<QVACResponse> = try await streamTyped(
             .diffusionStream(req),
             rpcOptions: rpcOptions
         )
-        let (progressStream, progressCont) = Self.makeStream(
+        let maximumBufferedStreamBytes = self.maximumBufferedStreamBytes
+        let (progressStream, progressCont) = Self.makeCoalescingProgressStream(
             of: DiffusionProgressTick.self,
-            name: "diffusion.progressStream"
+            name: "diffusion.progressStream",
+            maximumBufferedBytes: maximumBufferedStreamBytes
         )
         let statsBox = ResultBox<DiffusionStats?>()
 
         let outputsTask = Task<[Data], Error> {
             var imgs: [Data] = []
-            var receivedTerminalFrame = false
             do {
-                for try await response in stream {
+                let responses = QVACResponseStreamIteratorBox(stream)
+                while let response = try await responses.next() {
+                    if case .error(let error) = response {
+                        return try await Self.resolveResponseStreamTerminal(
+                            responses,
+                            operation: "diffusionStream"
+                        ) { () throws -> [Data] in
+                            throw QVACError.fromWire(
+                                code: try Self.checkedWireErrorCode(error.code),
+                                message: error.message
+                            )
+                        }
+                    }
                     guard case .diffusionStream(let r) = response else {
                         try Self.rejectUnexpectedResponse(response, expected: "diffusionStream")
                     }
-                    if let step = r.step,
-                       let totalSteps = r.totalSteps,
-                       let elapsedMs = r.elapsedMs {
-                        progressCont.yield(DiffusionProgressTick(
-                            step: step,
-                            totalSteps: totalSteps,
-                            elapsedMs: elapsedMs
-                        ))
-                    }
-                    if let encoded = r.data {
-                        guard let bytes = Data(base64Encoded: encoded) else {
-                            throw QVACError.protocolViolation(
-                                "diffusionStream returned invalid base64 image data"
+                    if r.done == true {
+                        let terminal = try await Self.resolveResponseStreamTerminal(
+                            responses,
+                            operation: "diffusionStream"
+                        ) { () throws -> (
+                            outputs: [Data],
+                            progress: DiffusionProgressTick?,
+                            stats: DiffusionStats?
+                        ) in
+                            var terminalOutputs = imgs
+                            if let output = try Self.decodeDiffusionOutput(r.data) {
+                                terminalOutputs.append(output)
+                            }
+                            return (
+                                terminalOutputs,
+                                Self.decodeDiffusionProgress(r),
+                                try r.stats.map {
+                                    try Self.decodeInferenceStats(
+                                        $0,
+                                        as: DiffusionStats.self,
+                                        operation: "diffusion"
+                                    )
+                                }
                             )
                         }
-                        imgs.append(bytes)
+                        if let tick = terminal.progress {
+                            progressCont.yield(
+                                contentsOf: [tick],
+                                estimatedBytes: Self.conservativeBufferedJSONBytes(
+                                    tick,
+                                    elementCount: 1,
+                                    fallback: maximumBufferedStreamBytes
+                                )
+                            )
+                        }
+                        statsBox.set(terminal.stats)
+                        progressCont.finish()
+                        return terminal.outputs
+                    }
+                    if let tick = Self.decodeDiffusionProgress(r) {
+                        progressCont.yield(
+                            contentsOf: [tick],
+                            estimatedBytes: Self.conservativeBufferedJSONBytes(
+                                tick,
+                                elementCount: 1,
+                                fallback: maximumBufferedStreamBytes
+                            )
+                        )
+                    }
+                    if let output = try Self.decodeDiffusionOutput(r.data) {
+                        imgs.append(output)
                     }
                     if let wireStats = r.stats {
                         do {
@@ -129,19 +225,11 @@ public extension QVACClient {
                             )
                         }
                     }
-                    if r.done == true {
-                        receivedTerminalFrame = true
-                        break
-                    }
                 }
-                guard receivedTerminalFrame else {
-                    throw QVACError.client(
-                        .streamEndedWithoutResponse,
-                        message: "diffusionStream ended without a terminal done frame"
-                    )
-                }
-                progressCont.finish()
-                return imgs
+                throw QVACError.client(
+                    .streamEndedWithoutResponse,
+                    message: "diffusionStream ended without a terminal done frame"
+                )
             } catch {
                 progressCont.finish(throwing: error)
                 throw error
@@ -156,5 +244,29 @@ public extension QVACClient {
             outputs: outputsTask,
             stats: statsTask
         )
+    }
+
+    private static func decodeDiffusionProgress(
+        _ frame: DiffusionStreamResponse
+    ) -> DiffusionProgressTick? {
+        guard let step = frame.step,
+              let totalSteps = frame.totalSteps,
+              let elapsedMs = frame.elapsedMs else { return nil }
+        return DiffusionProgressTick(
+            step: step,
+            totalSteps: totalSteps,
+            elapsedMs: elapsedMs
+        )
+    }
+
+    private static func decodeDiffusionOutput(_ encoded: String?) throws -> Data? {
+        guard let encoded else { return nil }
+        guard !encoded.isEmpty else { return nil }
+        guard let decoded = Data(base64Encoded: encoded), !decoded.isEmpty else {
+            throw QVACError.protocolViolation(
+                "diffusionStream returned empty or invalid base64 image data"
+            )
+        }
+        return decoded
     }
 }

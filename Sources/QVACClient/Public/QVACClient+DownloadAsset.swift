@@ -12,12 +12,13 @@ public extension QVACClient {
     /// published 0.17 JavaScript client.
     final class AssetDownloadRun: @unchecked Sendable {
         public let requestId: String
-        public let progress: AsyncThrowingStream<ModelLoadProgress, Error>
+        /// Byte-bounded observational progress retaining the newest window if lagging.
+        public let progress: QVACBufferedStream<ModelLoadProgress>
         public let result: Task<String, Error>
 
         init(
             requestId: String,
-            progress: AsyncThrowingStream<ModelLoadProgress, Error>,
+            progress: QVACBufferedStream<ModelLoadProgress>,
             result: Task<String, Error>
         ) {
             self.requestId = requestId
@@ -38,7 +39,11 @@ public extension QVACClient {
         var req = DownloadAssetRequest(assetSrc: assetSrc)
         req.requestId = requestId
         req.seed = seed
-        let (progress, progressContinuation) = Self.makeStream(of: ModelLoadProgress.self)
+        let (progress, progressContinuation) = Self.makeCoalescingProgressStream(
+            of: ModelLoadProgress.self,
+            name: "downloadAsset.progress",
+            maximumBufferedBytes: maximumBufferedStreamBytes
+        )
         progressContinuation.finish()
         let result = Task<String, Error> {
             let response: QVACResponse = try await self.sendTyped(
@@ -52,6 +57,23 @@ public extension QVACClient {
             return try Self.extractDownloadedAssetId(terminal)
         }
         return AssetDownloadRun(requestId: requestId, progress: progress, result: result)
+    }
+
+    /// Download an asset described by the same 0.17 model-source descriptor accepted
+    /// by `@qvac/sdk`. The JavaScript request transform deliberately sends only the
+    /// descriptor's `src` value for `downloadAsset`; the remaining descriptor metadata
+    /// is registry/catalog metadata and is not part of this operation's wire schema.
+    @discardableResult
+    func downloadAsset(
+        assetSrc: ModelDescriptor,
+        seed: Bool = false,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws -> AssetDownloadRun {
+        try await downloadAsset(
+            assetSrc: assetSrc.src,
+            seed: seed,
+            rpcOptions: rpcOptions
+        )
     }
 
     /// Download an asset with progress events. Cancelling the run's result task
@@ -71,18 +93,31 @@ public extension QVACClient {
             rpcOptions: rpcOptions
         )
 
-        let (progressStream, progressContinuation) = Self.makeStream(of: ModelLoadProgress.self)
+        let maximumBufferedStreamBytes = self.maximumBufferedStreamBytes
+        let (progressStream, progressContinuation) = Self.makeCoalescingProgressStream(
+            of: ModelLoadProgress.self,
+            name: "downloadAsset.progress",
+            maximumBufferedBytes: maximumBufferedStreamBytes
+        )
         let assetIdTask = Task<String, Error> {
             do {
-                for try await response in source {
-                    if let id = try Self.handleDownloadAssetResponse(
+                let responses = QVACResponseStreamIteratorBox(source)
+                while let response = try await responses.next() {
+                    if let terminal = try Self.handleDownloadAssetResponse(
                         response,
-                        progress: progressContinuation
+                        progress: progressContinuation,
+                        maximumBufferedStreamBytes: maximumBufferedStreamBytes
                     ) {
+                        let id = try await Self.resolveResponseStreamTerminal(
+                            responses,
+                            operation: "downloadAsset"
+                        ) {
+                            try terminal.get()
+                        }
+                        progressContinuation.finish()
                         return id
                     }
                 }
-                progressContinuation.finish()
                 throw QVACError.protocolViolation("downloadAsset stream ended without resolution")
             } catch {
                 let publicError = Self.publicRPCError(error, operation: "downloadAsset")
@@ -97,24 +132,43 @@ public extension QVACClient {
         )
     }
 
+    /// Streaming counterpart to the descriptor download overload. Progress,
+    /// cancellation, timeout, and profiling behavior are identical to the
+    /// string-source overload.
+    func downloadAssetStreaming(
+        assetSrc: ModelDescriptor,
+        seed: Bool = false,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws -> AssetDownloadRun {
+        try await downloadAssetStreaming(
+            assetSrc: assetSrc.src,
+            seed: seed,
+            rpcOptions: rpcOptions
+        )
+    }
+
     private static func handleDownloadAssetResponse(
         _ response: QVACResponse,
-        progress: QVACStreamSink<ModelLoadProgress>
-    ) throws -> String? {
+        progress: QVACBufferedStreamSink<ModelLoadProgress>,
+        maximumBufferedStreamBytes: Int
+    ) throws -> Result<String, Error>? {
         switch response {
         case .modelProgress(let event):
-            // Overflow terminates only the optional progress view. Keep draining so
-            // the asset-id result remains independent, matching decorated promises.
-            progress.yield(ModelLoadProgress(event))
+            // Progress snapshots coalesce if the observer lags. Keep draining so the
+            // asset-id result remains independent, matching decorated promises.
+            progress.yield(
+                contentsOf: [try ModelLoadProgress(event)],
+                estimatedBytes: conservativeBufferedJSONBytes(
+                    event,
+                    elementCount: 1,
+                    fallback: maximumBufferedStreamBytes
+                )
+            )
             return nil
         case .downloadAsset(let result):
-            progress.finish()
-            return try extractDownloadedAssetId(result)
+            return Result { try extractDownloadedAssetId(result) }
         case .error(let error):
-            throw QVACError.fromWire(
-                code: try checkedWireErrorCode(error.code),
-                message: error.message
-            )
+            return .failure(retainedWireError(error))
         default:
             try rejectUnexpectedResponse(
                 response,

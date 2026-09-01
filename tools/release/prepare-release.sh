@@ -14,16 +14,13 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-REPOSITORY="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
-DOWNLOAD_DIR="$(mktemp -d)"
-trap 'rm -rf "$DOWNLOAD_DIR"' EXIT
 
 cd "$REPO_ROOT"
 CURRENT_COMMIT="$(git rev-parse HEAD)"
-if ! git diff --quiet || ! git diff --cached --quiet; then
-    echo "[prepare-release] error: tracked files must be committed before release validation" >&2
-    exit 3
-fi
+node "$SCRIPT_DIR/require-clean-worktree.mjs" "$REPO_ROOT"
+REPOSITORY="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
+DOWNLOAD_DIR="$(mktemp -d)"
+trap 'rm -rf "$DOWNLOAD_DIR"' EXIT
 
 REMOTE_REFS="$(git ls-remote --tags origin \
     "refs/tags/$ARTIFACT_TAG" "refs/tags/$ARTIFACT_TAG^{}")"
@@ -59,7 +56,8 @@ node "$SCRIPT_DIR/verify-release.mjs" "$MANIFEST" \
     --source-commit "$CURRENT_COMMIT" \
     --assets-dir "$DOWNLOAD_DIR" \
     --package "$REPO_ROOT/Package.swift" \
-    --bundle "$REPO_ROOT/Sources/QVACClient/Resources/worker.mobile.bundle"
+    --bundle "$REPO_ROOT/Sources/QVACClient/Resources/worker.mobile.bundle" \
+    --privacy-audit "$REPO_ROOT/tools/release/privacy-manifest-audit.json"
 swift package --package-path "$REPO_ROOT" dump-package >/dev/null
 
 echo "[prepare-release] published artifacts, canonical URL manifest, and source commit are identical"

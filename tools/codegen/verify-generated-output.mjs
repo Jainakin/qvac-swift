@@ -82,7 +82,8 @@ for (const required of [
   ') async throws -> QVACResponseStream<QVACResponse>',
   'guard method.callShape == expected else',
   'usesConditionalProgressTransport',
-  'return Self.pullMap(source) { response in',
+  'return Self.pullMap(source, operation:',
+  'return .failThenDrain(Self.retainedWireError(error))',
 ]) {
   if (!api.includes(required)) throw new Error(`[generated] generic routing guard missing: ${required}`)
 }
@@ -107,6 +108,12 @@ for (const required of [
   if (!types.includes(required)) {
     throw new Error(`[generated] translate string|string[] invariant missing: ${required}`)
   }
+}
+if (!types.includes('public var documents: JSONValue?')) {
+  throw new Error('[generated] rag documents exact multi-shape representation is missing')
+}
+if (types.includes('public var documents: [JSONValue]?')) {
+  throw new Error('[generated] rag documents must preserve scalar, string-array, and embedded-object-array wire shapes')
 }
 if (!roundTrips.includes('test_one_or_many_wire_union_round_trips_scalar_and_array')) {
   throw new Error('[generated] translate string|string[] round-trip coverage is missing')

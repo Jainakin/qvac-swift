@@ -34,9 +34,15 @@ chunks before a write. Binary duplex data above it must be split into smaller ch
 Inbound transport buffers and each raw stream queue are byte-bounded. Transport
 adapters deliver at most 64 KiB to the frame decoder at a time; raw operation queues
 use the per-operation `maximumBufferedStreamBytes` budget (the wire ceiling by default).
-Public fan-out streams are separately element-bounded. Oversized input and
-slow-consumer overflow fail explicitly instead of allocating without limit or
-dropping data silently. Buffer budgets apply per concurrent operation.
+Raw queue accounting includes payload bytes plus a conservative per-DATA-frame
+structural allowance, so empty and tiny frames cannot bypass that bound.
+Public fan-out streams are separately bounded. Lossless views retain whole wire
+batches within both a batch-count ceiling and `maximumBufferedStreamBytes`, then
+flatten multi-value frames lazily. They fail explicitly on slow-consumer overflow
+instead of allocating without limit or dropping semantic data. Observational
+progress views retain a bounded window of the newest snapshots and coalesce older
+snapshots under burst load. Buffer budgets apply per stream and per concurrent
+operation.
 
 This limit is intentionally configurable because 0.17 video and upscaling return a
 complete base64 media output in one record. Base64 parsing, JSON decoding, and final

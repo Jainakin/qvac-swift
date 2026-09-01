@@ -56,7 +56,7 @@ public extension QVACClient {
         }
     }
 
-    /// A document chunk produced by ``ragChunk(documents:chunkOpts:rpcOptions:)``.
+    /// A document chunk produced by a RAG chunk operation.
     struct RagChunk: Sendable, Equatable {
         public let id: String
         public let content: String
@@ -124,7 +124,10 @@ public extension QVACClient {
     /// Outcome of `ragIngest` / `ragSaveEmbeddings`.
     struct RagIngestResult: Sendable, Equatable {
         public let processed: [RagSaveResult]
-        public let droppedIndices: [Int]
+        /// Numeric indices reported by the 0.17 worker. The upstream schema uses
+        /// `z.number()` rather than an integer schema, so fractional values are
+        /// preserved instead of being narrowed or rejected by the Swift adapter.
+        public let droppedIndices: [Double]
     }
 
     /// Outcome of a workspace reindex operation.
@@ -137,12 +140,13 @@ public extension QVACClient {
     /// decorated-promise contract.
     final class RagOperationRun<Output: Sendable>: @unchecked Sendable {
         public let requestId: String
-        public let progress: AsyncThrowingStream<RagProgressResponse, Error>
+        /// Byte-bounded observational snapshots retaining the newest window if lagging.
+        public let progress: QVACBufferedStream<RagProgressResponse>
         public let result: Task<Output, Error>
 
         init(
             requestId: String,
-            progress: AsyncThrowingStream<RagProgressResponse, Error>,
+            progress: QVACBufferedStream<RagProgressResponse>,
             result: Task<Output, Error>
         ) {
             self.requestId = requestId
@@ -167,7 +171,7 @@ public extension QVACClient {
     ) async throws -> RagOperationRun<RagIngestResult> {
         var req = RagRequest(operation: "ingest")
         req.modelId = modelId
-        req.documents = documents.map(JSONValue.string)
+        req.documents = .array(documents.map(JSONValue.string))
         req.workspace = workspace
         req.chunk = chunk
         req.chunkOpts = chunkOpts?.wireValue
@@ -181,9 +185,46 @@ public extension QVACClient {
             }
             return RagIngestResult(
                 processed: try processed.map(Self.parseRagSaveResult),
-                droppedIndices: try droppedIndices.map {
-                    try Self.checkedWireInteger($0, field: "rag.ingest.droppedIndices")
-                }
+                droppedIndices: try Self.checkedFiniteNumbers(
+                    droppedIndices,
+                    field: "rag.ingest.droppedIndices"
+                )
+            )
+        }
+    }
+
+    /// Scalar-document spelling accepted by the 0.17 RAG wire schema.
+    @discardableResult
+    func ragIngest(
+        modelId: String,
+        documents: String,
+        workspace: String? = nil,
+        chunk: Bool = true,
+        chunkOpts: RagChunkOptions? = nil,
+        withProgress: Bool = false,
+        progressInterval: Double? = nil,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws -> RagOperationRun<RagIngestResult> {
+        var req = RagRequest(operation: "ingest")
+        req.modelId = modelId
+        req.documents = .string(documents)
+        req.workspace = workspace
+        req.chunk = chunk
+        req.chunkOpts = chunkOpts?.wireValue
+        req.withProgress = withProgress ? true : nil
+        req.progressInterval = progressInterval
+        return try await makeRagRun(req, op: "ingest", rpcOptions: rpcOptions) { r in
+            guard let processed = r.processed, let droppedIndices = r.droppedIndices else {
+                throw QVACError.protocolViolation(
+                    "rag ingest response omitted processed or droppedIndices"
+                )
+            }
+            return RagIngestResult(
+                processed: try processed.map(Self.parseRagSaveResult),
+                droppedIndices: try Self.checkedFiniteNumbers(
+                    droppedIndices,
+                    field: "rag.ingest.droppedIndices"
+                )
             )
         }
     }
@@ -196,25 +237,29 @@ public extension QVACClient {
     func ragSearch(
         modelId: String,
         query: String,
-        topK: Int = 5,
-        n: Int = 3,
+        topK: Double = 5,
+        n: Double = 3,
         workspace: String? = nil,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> [RagSearchResult] {
         guard !query.isEmpty else {
             throw QVACError.invalidArgument("rag search query must not be empty")
         }
-        guard topK > 0 else {
-            throw QVACError.invalidArgument("rag search topK must be greater than zero")
+        guard topK.isFinite, topK > 0 else {
+            throw QVACError.invalidArgument(
+                "rag search topK must be a finite number greater than zero"
+            )
         }
-        guard n > 0 else {
-            throw QVACError.invalidArgument("rag search n must be greater than zero")
+        guard n.isFinite, n > 0 else {
+            throw QVACError.invalidArgument(
+                "rag search n must be a finite number greater than zero"
+            )
         }
         var req = RagRequest(operation: "search")
         req.modelId = modelId
         req.query = query
-        req.topK = Double(topK)
-        req.n = Double(n)
+        req.topK = topK
+        req.n = n
         req.workspace = workspace
         return try await runRagAndExtract(req, op: "search", rpcOptions: rpcOptions) { r in
             guard let results = r.results else {
@@ -233,7 +278,24 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> [RagChunk] {
         var req = RagRequest(operation: "chunk")
-        req.documents = documents.map(JSONValue.string)
+        req.documents = .array(documents.map(JSONValue.string))
+        req.chunkOpts = chunkOpts?.wireValue
+        return try await runRagAndExtract(req, op: "chunk", rpcOptions: rpcOptions) { r in
+            guard let chunks = r.chunks else {
+                throw QVACError.protocolViolation("rag chunk response omitted chunks")
+            }
+            return try chunks.map(Self.parseRagChunk)
+        }
+    }
+
+    /// Scalar-document spelling accepted by the 0.17 RAG chunk schema.
+    func ragChunk(
+        documents: String,
+        chunkOpts: RagChunkOptions? = nil,
+        rpcOptions: QVACRPCOptions = .init()
+    ) async throws -> [RagChunk] {
+        var req = RagRequest(operation: "chunk")
+        req.documents = .string(documents)
         req.chunkOpts = chunkOpts?.wireValue
         return try await runRagAndExtract(req, op: "chunk", rpcOptions: rpcOptions) { r in
             guard let chunks = r.chunks else {
@@ -257,7 +319,7 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> RagOperationRun<[RagSaveResult]> {
         var req = RagRequest(operation: "saveEmbeddings")
-        req.documents = documents.map(\.wireValue)
+        req.documents = .array(documents.map(\.wireValue))
         req.modelId = modelId
         req.workspace = workspace
         req.withProgress = withProgress ? true : nil
@@ -370,9 +432,11 @@ public extension QVACClient {
         var request = input
         let requestId = UUID().uuidString
         request.requestId = requestId
-        let (progress, progressSink) = Self.makeStream(
+        let maximumBufferedStreamBytes = self.maximumBufferedStreamBytes
+        let (progress, progressSink) = Self.makeCoalescingProgressStream(
             of: RagProgressResponse.self,
-            name: "rag:\(op):progress"
+            name: "rag:\(op):progress",
+            maximumBufferedBytes: maximumBufferedStreamBytes
         )
 
         if request.withProgress == true {
@@ -382,27 +446,48 @@ public extension QVACClient {
             )
             let result = Task<Output, Error> {
                 do {
-                    for try await response in source {
+                    let responses = QVACResponseStreamIteratorBox(source)
+                    while let response = try await responses.next() {
                         switch response {
                         case .ragProgress(let event):
+                            // The 0.17 JavaScript adapter intentionally ignores valid
+                            // RAG progress updates belonging to another operation. This
+                            // can happen when a shared worker interleaves observational
+                            // events; they are not a terminal protocol error for this run.
                             guard event.operation == op else {
-                                throw QVACError.protocolViolation(
-                                    "rag \(op) received progress for \(event.operation)"
+                                continue
+                            }
+                            // Progress is an optional observational view. Coalesce old
+                            // snapshots if its observer lags while this task continues
+                            // draining toward the authoritative result.
+                            progressSink.yield(
+                                contentsOf: [event],
+                                estimatedBytes: Self.conservativeBufferedJSONBytes(
+                                    event,
+                                    elementCount: 1,
+                                    fallback: maximumBufferedStreamBytes
+                                )
+                            )
+                        case .rag(let terminal):
+                            let output = try await Self.resolveResponseStreamTerminal(
+                                responses,
+                                operation: "rag"
+                            ) {
+                                let validated = try Self.validateRagResponse(terminal, op: op)
+                                return try extractor(validated)
+                            }
+                            progressSink.finish()
+                            return output
+                        case .error(let error):
+                            return try await Self.resolveResponseStreamTerminal(
+                                responses,
+                                operation: "rag"
+                            ) { () throws -> Output in
+                                throw QVACError.fromWire(
+                                    code: try Self.checkedWireErrorCode(error.code),
+                                    message: error.message
                                 )
                             }
-                            // Progress is an optional bounded view. If it overflows,
-                            // the sink terminates that view explicitly while this task
-                            // continues draining toward the authoritative result.
-                            progressSink.yield(event)
-                        case .rag(let terminal):
-                            let validated = try Self.validateRagResponse(terminal, op: op)
-                            progressSink.finish()
-                            return try extractor(validated)
-                        case .error(let error):
-                            throw QVACError.fromWire(
-                                code: try Self.checkedWireErrorCode(error.code),
-                                message: error.message
-                            )
                         default:
                             try Self.rejectUnexpectedResponse(
                                 response,
@@ -490,6 +575,16 @@ public extension QVACClient {
             throw QVACError.protocolViolation("rag chunk must contain string id and content")
         }
         return RagChunk(id: id, content: content)
+    }
+
+    private static func checkedFiniteNumbers(
+        _ values: [Double],
+        field: String
+    ) throws -> [Double] {
+        guard values.allSatisfy(\.isFinite) else {
+            throw QVACError.protocolViolation("\(field) must contain only finite numbers")
+        }
+        return values
     }
 
     private static func parseRagSearchResult(_ value: JSONValue) throws -> RagSearchResult {

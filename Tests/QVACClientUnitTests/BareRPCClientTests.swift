@@ -62,6 +62,7 @@ final class BareRPCClientTests: XCTestCase {
     actor GatedWriteTransport: BareTransport {
         nonisolated private let inbound = InboundPipe()
         private var writeWaiters: [CheckedContinuation<Void, Error>] = []
+        private var outboundBytes = Data()
         private var writeCount = 0
         private var closeCount = 0
 
@@ -69,6 +70,7 @@ final class BareRPCClientTests: XCTestCase {
 
         func write(_ data: Data) async throws {
             writeCount += 1
+            outboundBytes.append(data)
             try await withCheckedThrowingContinuation { continuation in
                 writeWaiters.append(continuation)
             }
@@ -82,6 +84,61 @@ final class BareRPCClientTests: XCTestCase {
             inbound.continuation.finish()
         }
 
+        func feedInbound(_ data: Data) { inbound.continuation.yield(data) }
+        func outbound() -> Data { outboundBytes }
+        func counts() -> (writes: Int, closes: Int) { (writeCount, closeCount) }
+    }
+
+    /// Lets the three duplex-handshake writes complete, then suspends every
+    /// post-handshake write until `close()`. The suspended writes deliberately
+    /// ignore task cancellation so the RPC layer must fail-close the generation.
+    actor DuplexWriteGateTransport: BareTransport {
+        nonisolated private let inbound = InboundPipe()
+        private var outboundBytes = Data()
+        private var writeWaiters: [CheckedContinuation<Void, Never>] = []
+        private var writeCount = 0
+        private var closeCount = 0
+        private var closed = false
+
+        nonisolated func inboundStream() -> AsyncThrowingStream<Data, Error> { inbound.stream }
+
+        func write(_ data: Data) async throws {
+            writeCount += 1
+            outboundBytes.append(data)
+            if writeCount == 3 {
+                let reader = BareRPCFrameReader()
+                try reader.append(outboundBytes)
+                guard case .request(let id, _, _, _) = reader.next() else {
+                    throw BareRPCProtocolError("duplex gate did not receive a request frame")
+                }
+                var acknowledgements = BareRPCCodec.__testEncodeStreamFrame(
+                    id: id,
+                    flags: [.request, .open]
+                )
+                acknowledgements.append(BareRPCCodec.__testEncodeStreamFrame(
+                    id: id,
+                    flags: [.response, .open]
+                ))
+                inbound.continuation.yield(acknowledgements)
+            }
+            guard writeCount > 3 else { return }
+            await withCheckedContinuation { continuation in
+                writeWaiters.append(continuation)
+            }
+        }
+
+        func close() {
+            guard !closed else { return }
+            closed = true
+            closeCount += 1
+            let waiters = writeWaiters
+            writeWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+            inbound.continuation.finish()
+        }
+
+        func feedInbound(_ data: Data) { inbound.continuation.yield(data) }
+        func outbound() -> Data { outboundBytes }
         func counts() -> (writes: Int, closes: Int) { (writeCount, closeCount) }
     }
 
@@ -257,6 +314,41 @@ final class BareRPCClientTests: XCTestCase {
         return frames(in: await transport.outbound())
     }
 
+    /// Open both duplex directions explicitly. A nil timeout removes only the
+    /// deadline; it must not let the client return before these peer acknowledgements.
+    private static func openDuplex(
+        command: UInt64,
+        initialPayload: Data,
+        on rpc: BareRPCClient,
+        transport: MockTransport,
+        timeout: Duration? = nil
+    ) async throws -> (session: BareRPCDuplexSession, frames: [BareRPCFrame]) {
+        let opening = Task {
+            try await rpc.duplex(
+                command: command,
+                initialPayload: initialPayload,
+                timeout: timeout
+            )
+        }
+        let frames = try await waitForFrames(3, on: transport)
+        guard let first = frames.first,
+              case .request(let id, _, _, _) = first else {
+            await rpc.close()
+            _ = try? await opening.value
+            throw BareRPCProtocolError("expected duplex request frame")
+        }
+        var acknowledgements = BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.request, .open]
+        )
+        acknowledgements.append(BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.response, .open]
+        ))
+        await transport.feedInbound(acknowledgements)
+        return (try await opening.value, frames)
+    }
+
     private static func waitForNoInFlight(
         _ rpc: BareRPCClient,
         timeout: Duration = .seconds(1)
@@ -318,6 +410,90 @@ final class BareRPCClientTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(5))
         }
         XCTFail("timed out waiting for gated transport counts \(expected); got \(await transport.counts())")
+    }
+
+    private static func waitForDuplexGateCounts(
+        _ expected: (writes: Int, closes: Int),
+        on transport: DuplexWriteGateTransport,
+        timeout: Duration = .seconds(1)
+    ) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            let counts = await transport.counts()
+            if counts.writes >= expected.writes, counts.closes >= expected.closes { return true }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let counts = await transport.counts()
+        XCTFail("timed out waiting for duplex gate counts \(expected); got \(counts)")
+        return false
+    }
+
+    private static func waitForDuplexOutboundWrites(
+        _ expected: Int,
+        id: UInt64,
+        on rpc: BareRPCClient,
+        timeout: Duration = .seconds(1)
+    ) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await rpc.__testDuplexOutboundWriteCount(id: id) == expected { return true }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let activeWriteCount = await rpc.__testDuplexOutboundWriteCount(id: id)
+        XCTFail(
+            "timed out waiting for \(expected) active duplex writes; got "
+                + String(describing: activeWriteCount)
+        )
+        return false
+    }
+
+    private static func waitForDuplexSetupState(
+        id: UInt64,
+        on rpc: BareRPCClient,
+        localWritesComplete: Bool,
+        requestOpened: Bool,
+        responseOpened: Bool,
+        awaitingSetup: Bool,
+        hasTimeoutTask: Bool,
+        timeout: Duration = .seconds(1)
+    ) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if let state = await rpc.__testDuplexSetupState(id: id),
+               state.localWritesComplete == localWritesComplete,
+               state.requestOpened == requestOpened,
+               state.responseOpened == responseOpened,
+               state.awaitingSetup == awaitingSetup,
+               state.hasTimeoutTask == hasTimeoutTask {
+                return true
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let state = await rpc.__testDuplexSetupState(id: id)
+        XCTFail("timed out waiting for duplex setup state; got \(String(describing: state))")
+        return false
+    }
+
+    private static func waitForCompletion(
+        _ flags: [CompletionFlag],
+        timeout: Duration = .seconds(1)
+    ) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            var complete = true
+            for flag in flags where !(await flag.get()) {
+                complete = false
+                break
+            }
+            if complete { return true }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("timed out waiting for concurrent tasks to complete")
+        return false
     }
 
     private static func waitForFactoryCalls(
@@ -523,8 +699,12 @@ final class BareRPCClientTests: XCTestCase {
             maximumWireMessageBytes: 64,
             maximumBufferedStreamBytes: 64
         )
-        let raw = try await rpc.duplex(command: 9, initialPayload: Data("{}".utf8))
-        _ = try await Self.waitForFrames(3, on: mock)
+        let (raw, _) = try await Self.openDuplex(
+            command: 9,
+            initialPayload: Data("{}".utf8),
+            on: rpc,
+            transport: mock
+        )
         let session = QVACDuplexSession<Response>(raw: raw, operation: "duplex-size-test")
 
         do {
@@ -694,6 +874,179 @@ final class BareRPCClientTests: XCTestCase {
         try await Self.waitForGatedCounts((writes: 1, closes: 1), on: transport)
         try await Self.waitForNoInFlight(rpc)
         await rpc.close()
+    }
+
+    func test_stream_remote_terminal_and_error_unblock_noncooperative_setup_writes() async throws {
+        do {
+            let transport = GatedWriteTransport()
+            let rpc = BareRPCClient(transport: transport)
+            let opening = Task {
+                try await rpc.stream(command: 811, data: Data("blocked".utf8))
+            }
+            try await Self.waitForGatedCounts((writes: 1, closes: 0), on: transport)
+            let frames = Self.frames(in: await transport.outbound())
+            guard case .request(let id, _, _, _) = frames.first else {
+                await transport.close()
+                _ = try? await opening.value
+                return XCTFail("expected request frame")
+            }
+
+            await transport.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+                id: id,
+                flags: [.response, .end]
+            ))
+            let stream = try await opening.value
+            var received: [Data] = []
+            for try await chunk in stream.chunks { received.append(chunk) }
+            XCTAssertTrue(received.isEmpty, "remote END must remain authoritative")
+            try await Self.waitForGatedCounts((writes: 1, closes: 1), on: transport)
+            try await Self.waitForNoInFlight(rpc)
+            await rpc.close()
+            let counts = await transport.counts()
+            XCTAssertEqual(counts.closes, 1)
+        }
+
+        do {
+            let transport = GatedWriteTransport()
+            let rpc = BareRPCClient(transport: transport)
+            let opening = Task {
+                try await rpc.stream(command: 812, data: Data("blocked".utf8))
+            }
+            try await Self.waitForGatedCounts((writes: 1, closes: 0), on: transport)
+            let frames = Self.frames(in: await transport.outbound())
+            guard case .request(let id, _, _, _) = frames.first else {
+                await transport.close()
+                _ = try? await opening.value
+                return XCTFail("expected request frame")
+            }
+            let serverError = BareRPCError(
+                message: "stream setup rejected",
+                code: "SETUP_REJECTED",
+                errno: 52_200
+            )
+
+            await transport.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+                id: id,
+                flags: [.response, .error],
+                payload: .error(serverError)
+            ))
+            do {
+                _ = try await opening.value
+                XCTFail("expected remote setup error")
+            } catch let error as BareRPCError {
+                XCTAssertEqual(error, serverError)
+            } catch {
+                XCTFail("unexpected setup error: \(error)")
+            }
+            try await Self.waitForGatedCounts((writes: 1, closes: 1), on: transport)
+            try await Self.waitForNoInFlight(rpc)
+            await rpc.close()
+            let counts = await transport.counts()
+            XCTAssertEqual(counts.closes, 1)
+        }
+    }
+
+    func test_duplex_remote_terminal_and_error_unblock_noncooperative_setup_writes() async throws {
+        do {
+            let transport = GatedWriteTransport()
+            let rpc = BareRPCClient(transport: transport)
+            let opening = Task {
+                try await rpc.duplex(command: 813, initialPayload: Data("blocked".utf8))
+            }
+            try await Self.waitForGatedCounts((writes: 1, closes: 0), on: transport)
+            let frames = Self.frames(in: await transport.outbound())
+            guard case .request(let id, _, _, _) = frames.first else {
+                await transport.close()
+                _ = try? await opening.value
+                return XCTFail("expected duplex request frame")
+            }
+
+            await transport.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+                id: id,
+                flags: [.response, .end]
+            ))
+            let session = try await opening.value
+            var received: [Data] = []
+            for try await chunk in session.chunks { received.append(chunk) }
+            XCTAssertTrue(received.isEmpty, "remote END must remain authoritative")
+            try await Self.waitForGatedCounts((writes: 1, closes: 1), on: transport)
+            try await Self.waitForNoInFlight(rpc)
+            await rpc.close()
+            let counts = await transport.counts()
+            XCTAssertEqual(counts.closes, 1)
+        }
+
+        do {
+            let transport = GatedWriteTransport()
+            let rpc = BareRPCClient(transport: transport)
+            let opening = Task {
+                try await rpc.duplex(command: 814, initialPayload: Data("blocked".utf8))
+            }
+            try await Self.waitForGatedCounts((writes: 1, closes: 0), on: transport)
+            let frames = Self.frames(in: await transport.outbound())
+            guard case .request(let id, _, _, _) = frames.first else {
+                await transport.close()
+                _ = try? await opening.value
+                return XCTFail("expected duplex request frame")
+            }
+            let serverError = BareRPCError(
+                message: "duplex setup rejected",
+                code: "SETUP_REJECTED",
+                errno: 52_200
+            )
+
+            await transport.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+                id: id,
+                flags: [.response, .error],
+                payload: .error(serverError)
+            ))
+            do {
+                _ = try await opening.value
+                XCTFail("expected remote setup error")
+            } catch let error as BareRPCError {
+                XCTAssertEqual(error, serverError)
+            } catch {
+                XCTFail("unexpected setup error: \(error)")
+            }
+            try await Self.waitForGatedCounts((writes: 1, closes: 1), on: transport)
+            try await Self.waitForNoInFlight(rpc)
+            await rpc.close()
+            let counts = await transport.counts()
+            XCTAssertEqual(counts.closes, 1)
+        }
+
+        do {
+            let transport = GatedWriteTransport()
+            let rpc = BareRPCClient(transport: transport)
+            let opening = Task {
+                try await rpc.duplex(command: 815, initialPayload: Data("blocked".utf8))
+            }
+            try await Self.waitForGatedCounts((writes: 1, closes: 0), on: transport)
+            let frames = Self.frames(in: await transport.outbound())
+            guard case .request(let id, _, _, _) = frames.first else {
+                await transport.close()
+                _ = try? await opening.value
+                return XCTFail("expected duplex request frame")
+            }
+
+            await transport.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+                id: id,
+                flags: [.request, .end]
+            ))
+            do {
+                _ = try await opening.value
+                XCTFail("expected request-half setup termination to close the generation")
+            } catch is BareRPCConnectionClosed {
+                // expected
+            } catch {
+                XCTFail("unexpected request-half setup error: \(error)")
+            }
+            try await Self.waitForGatedCounts((writes: 1, closes: 1), on: transport)
+            try await Self.waitForNoInFlight(rpc)
+            await rpc.close()
+            let counts = await transport.counts()
+            XCTAssertEqual(counts.closes, 1)
+        }
     }
 
     func test_precancelled_send_stream_and_duplex_never_register_or_write() async throws {
@@ -1078,12 +1431,59 @@ final class BareRPCClientTests: XCTestCase {
         await rpc.close()
     }
 
+    func test_stream_destroy_after_remote_end_discards_queued_data_without_late_teardown() async throws {
+        let mock = MockTransport()
+        let rpc = BareRPCClient(transport: mock)
+        let retainedResponse = try await rpc.stream(command: 9, data: Data("request".utf8))
+        let frames = try await Self.waitForFrames(2, on: mock)
+        guard case .request(let id, _, _, _) = frames[0] else {
+            return XCTFail("expected request")
+        }
+
+        var inbound = BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.response, .data],
+            payload: .data(Data("first".utf8))
+        )
+        inbound.append(BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.response, .data],
+            payload: .data(Data("queued".utf8))
+        ))
+        inbound.append(BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.response, .end]
+        ))
+        await mock.feedInbound(inbound)
+        try await Self.waitForNoInFlight(rpc)
+
+        var iterator = retainedResponse.chunks.makeAsyncIterator()
+        let first = try await iterator.next()
+        XCTAssertEqual(first, Data("first".utf8))
+
+        retainedResponse.destroy()
+        let valueAfterDestroy = try await iterator.next()
+        XCTAssertNil(valueAfterDestroy, "destroy after remote END must discard queued data")
+
+        try await Task.sleep(for: .milliseconds(20))
+        let outboundAfterDestroy = await mock.outbound()
+        XCTAssertEqual(
+            Self.frames(in: outboundAfterDestroy).count,
+            2,
+            "a completed remote stream must not receive a late destroy frame"
+        )
+        withExtendedLifetime(retainedResponse) {}
+        await rpc.close()
+    }
+
     func test_slow_raw_stream_consumer_gets_explicit_byte_budget_overflow() async throws {
         let mock = MockTransport()
+        let retainedFrameBytes = 6 + BoundedRPCDataChannel.retainedValueOverheadBytes
+        let maximumBufferedBytes = retainedFrameBytes * 2 - 1
         let rpc = try BareRPCClient(
             transport: mock,
             maximumWireMessageBytes: 1_024,
-            maximumBufferedStreamBytes: 8
+            maximumBufferedStreamBytes: maximumBufferedBytes
         )
         let stream = try await rpc.stream(command: 85, data: Data("{}".utf8))
         let frames = try await Self.waitForFrames(2, on: mock)
@@ -1109,8 +1509,8 @@ final class BareRPCClientTests: XCTestCase {
             for try await chunk in stream.chunks { received.append(chunk) }
             XCTFail("expected stream buffer overflow")
         } catch let error as BareRPCStreamBufferOverflow {
-            XCTAssertEqual(error.maximumBufferedBytes, 8)
-            XCTAssertEqual(error.attemptedBufferedBytes, 12)
+            XCTAssertEqual(error.maximumBufferedBytes, maximumBufferedBytes)
+            XCTAssertEqual(error.attemptedBufferedBytes, retainedFrameBytes * 2)
         }
         XCTAssertEqual(received, [], "overflow is terminal and discards stale queued chunks")
         let outbound = try await Self.waitForFrames(3, on: mock)
@@ -1127,7 +1527,12 @@ final class BareRPCClientTests: XCTestCase {
         let mock = MockTransport()
         let rpc = BareRPCClient(transport: mock)
         let initialPayload = Data("hello".utf8)
-        let session = try await rpc.duplex(command: 5, initialPayload: initialPayload)
+        let (session, _) = try await Self.openDuplex(
+            command: 5,
+            initialPayload: initialPayload,
+            on: rpc,
+            transport: mock
+        )
 
         // Inspect outbound bytes. Should contain 3 handshake frames.
         let out = await mock.outbound()
@@ -1149,7 +1554,12 @@ final class BareRPCClientTests: XCTestCase {
     func test_duplex_write_emits_data_frames() async throws {
         let mock = MockTransport()
         let rpc = BareRPCClient(transport: mock)
-        let session = try await rpc.duplex(command: 5, initialPayload: Data("init".utf8))
+        let (session, _) = try await Self.openDuplex(
+            command: 5,
+            initialPayload: Data("init".utf8),
+            on: rpc,
+            transport: mock
+        )
         let chunk = Data("audio-chunk".utf8)
         try await session.write(chunk)
         try await session.end()
@@ -1167,11 +1577,277 @@ final class BareRPCClientTests: XCTestCase {
         await rpc.close()
     }
 
+    func test_duplex_destroy_unblocks_all_concurrent_noncooperative_writes() async throws {
+        let transport = DuplexWriteGateTransport()
+        let rpc = BareRPCClient(transport: transport)
+        let session = try await rpc.duplex(command: 5, initialPayload: Data("init".utf8))
+        let initialFrames = Self.frames(in: await transport.outbound())
+        guard let firstFrame = initialFrames.first,
+              case .request(let id, _, _, _) = firstFrame else {
+            return XCTFail("expected duplex request frame")
+        }
+
+        let firstCompleted = CompletionFlag()
+        let firstWrite = Task {
+            do {
+                try await session.write(Data("first".utf8))
+                await firstCompleted.set()
+            } catch {
+                await firstCompleted.set()
+                throw error
+            }
+        }
+        guard try await Self.waitForDuplexGateCounts(
+            (writes: 4, closes: 0),
+            on: transport
+        ) else {
+            await transport.close()
+            _ = try? await firstWrite.value
+            return
+        }
+
+        let secondCompleted = CompletionFlag()
+        let secondWrite = Task {
+            do {
+                try await session.write(Data("second".utf8))
+                await secondCompleted.set()
+            } catch {
+                await secondCompleted.set()
+                throw error
+            }
+        }
+        guard try await Self.waitForDuplexOutboundWrites(2, id: id, on: rpc) else {
+            session.destroy()
+            await transport.close()
+            _ = try? await firstWrite.value
+            _ = try? await secondWrite.value
+            return
+        }
+
+        session.destroy()
+        guard try await Self.waitForDuplexGateCounts(
+            (writes: 4, closes: 1),
+            on: transport
+        ), try await Self.waitForCompletion([firstCompleted, secondCompleted]) else {
+            await transport.close()
+            return
+        }
+
+        do {
+            try await firstWrite.value
+            XCTFail("expected first write cancellation")
+        } catch is CancellationError {
+            // expected
+        } catch {
+            XCTFail("unexpected first write error: \(error)")
+        }
+        do {
+            try await secondWrite.value
+            XCTFail("expected queued write cancellation")
+        } catch is CancellationError {
+            // expected
+        } catch {
+            XCTFail("unexpected queued write error: \(error)")
+        }
+
+        let counts = await transport.counts()
+        XCTAssertEqual(counts.writes, 4, "the queued write must never reach the transport")
+        XCTAssertEqual(counts.closes, 1)
+        let isOpen = await rpc.isOpen()
+        XCTAssertFalse(isOpen)
+        try await Self.waitForNoInFlight(rpc)
+        await rpc.close()
+    }
+
+    func test_duplex_remote_end_unblocks_all_concurrent_noncooperative_writes() async throws {
+        let transport = DuplexWriteGateTransport()
+        let rpc = BareRPCClient(transport: transport)
+        let session = try await rpc.duplex(command: 5, initialPayload: Data("init".utf8))
+        let initialFrames = Self.frames(in: await transport.outbound())
+        guard let firstFrame = initialFrames.first,
+              case .request(let id, _, _, _) = firstFrame else {
+            return XCTFail("expected duplex request frame")
+        }
+
+        let firstCompleted = CompletionFlag()
+        let firstWrite = Task {
+            do {
+                try await session.write(Data("first".utf8))
+                await firstCompleted.set()
+            } catch {
+                await firstCompleted.set()
+                throw error
+            }
+        }
+        guard try await Self.waitForDuplexGateCounts(
+            (writes: 4, closes: 0),
+            on: transport
+        ) else {
+            await transport.close()
+            _ = try? await firstWrite.value
+            return
+        }
+
+        let secondCompleted = CompletionFlag()
+        let secondWrite = Task {
+            do {
+                try await session.write(Data("second".utf8))
+                await secondCompleted.set()
+            } catch {
+                await secondCompleted.set()
+                throw error
+            }
+        }
+        guard try await Self.waitForDuplexOutboundWrites(2, id: id, on: rpc) else {
+            await transport.close()
+            _ = try? await firstWrite.value
+            _ = try? await secondWrite.value
+            return
+        }
+
+        await transport.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.response, .end]
+        ))
+        guard try await Self.waitForDuplexGateCounts(
+            (writes: 4, closes: 1),
+            on: transport
+        ), try await Self.waitForCompletion([firstCompleted, secondCompleted]) else {
+            await transport.close()
+            return
+        }
+
+        do {
+            try await firstWrite.value
+            XCTFail("expected first write cancellation")
+        } catch is CancellationError {
+            // expected
+        } catch {
+            XCTFail("unexpected first write error: \(error)")
+        }
+        do {
+            try await secondWrite.value
+            XCTFail("expected queued write cancellation")
+        } catch is CancellationError {
+            // expected
+        } catch {
+            XCTFail("unexpected queued write error: \(error)")
+        }
+
+        var received: [Data] = []
+        for try await chunk in session.chunks { received.append(chunk) }
+        XCTAssertTrue(received.isEmpty, "remote END must remain the response terminal event")
+        let counts = await transport.counts()
+        XCTAssertEqual(counts.writes, 4, "the queued write must never reach the transport")
+        XCTAssertEqual(counts.closes, 1)
+        let isOpen = await rpc.isOpen()
+        XCTAssertFalse(isOpen)
+        try await Self.waitForNoInFlight(rpc)
+        await rpc.close()
+    }
+
+    func test_duplex_remote_request_end_unblocks_all_concurrent_noncooperative_writes() async throws {
+        let transport = DuplexWriteGateTransport()
+        let rpc = BareRPCClient(transport: transport)
+        let session = try await rpc.duplex(command: 5, initialPayload: Data("init".utf8))
+        let initialFrames = Self.frames(in: await transport.outbound())
+        guard let firstFrame = initialFrames.first,
+              case .request(let id, _, _, _) = firstFrame else {
+            return XCTFail("expected duplex request frame")
+        }
+
+        let firstCompleted = CompletionFlag()
+        let firstWrite = Task {
+            do {
+                try await session.write(Data("first".utf8))
+                await firstCompleted.set()
+            } catch {
+                await firstCompleted.set()
+                throw error
+            }
+        }
+        guard try await Self.waitForDuplexGateCounts(
+            (writes: 4, closes: 0),
+            on: transport
+        ) else {
+            await transport.close()
+            _ = try? await firstWrite.value
+            return
+        }
+
+        let secondCompleted = CompletionFlag()
+        let secondWrite = Task {
+            do {
+                try await session.write(Data("second".utf8))
+                await secondCompleted.set()
+            } catch {
+                await secondCompleted.set()
+                throw error
+            }
+        }
+        guard try await Self.waitForDuplexOutboundWrites(2, id: id, on: rpc) else {
+            session.destroy()
+            await transport.close()
+            _ = try? await firstWrite.value
+            _ = try? await secondWrite.value
+            return
+        }
+
+        await transport.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.request, .end]
+        ))
+        guard try await Self.waitForDuplexGateCounts(
+            (writes: 4, closes: 1),
+            on: transport
+        ), try await Self.waitForCompletion([firstCompleted, secondCompleted]) else {
+            await transport.close()
+            return
+        }
+
+        do {
+            try await firstWrite.value
+            XCTFail("expected first write cancellation")
+        } catch is CancellationError {
+            // expected
+        } catch {
+            XCTFail("unexpected first write error: \(error)")
+        }
+        do {
+            try await secondWrite.value
+            XCTFail("expected queued write cancellation")
+        } catch is CancellationError {
+            // expected
+        } catch {
+            XCTFail("unexpected queued write error: \(error)")
+        }
+
+        do {
+            for try await _ in session.chunks {}
+            XCTFail("fail-closing the generation must terminate the response half")
+        } catch is BareRPCConnectionClosed {
+            // expected
+        } catch {
+            XCTFail("unexpected response-half error: \(error)")
+        }
+        let counts = await transport.counts()
+        XCTAssertEqual(counts.writes, 4, "the queued write must never reach the transport")
+        XCTAssertEqual(counts.closes, 1)
+        let isOpen = await rpc.isOpen()
+        XCTAssertFalse(isOpen)
+        try await Self.waitForNoInFlight(rpc)
+        await rpc.close()
+    }
+
     func test_duplex_remote_error_before_half_close_remains_observable_from_response_stream() async throws {
         let mock = MockTransport()
         let rpc = BareRPCClient(transport: mock)
-        let session = try await rpc.duplex(command: 17, initialPayload: Data("metadata".utf8))
-        let initialFrames = try await Self.waitForFrames(3, on: mock)
+        let (session, initialFrames) = try await Self.openDuplex(
+            command: 17,
+            initialPayload: Data("metadata".utf8),
+            on: rpc,
+            transport: mock
+        )
         guard case .request(let id, _, _, _) = initialFrames[0] else {
             return XCTFail("expected request frame")
         }
@@ -1207,6 +1883,87 @@ final class BareRPCClientTests: XCTestCase {
         }
 
         await rpc.close()
+    }
+
+    func test_duplex_nil_and_finite_timeouts_share_remote_open_readiness() async throws {
+        let configurations: [(timeout: Duration?, hasTimeoutTask: Bool)] = [
+            (nil, false),
+            (.seconds(1), true),
+        ]
+
+        for configuration in configurations {
+            let mock = MockTransport()
+            let rpc = BareRPCClient(transport: mock)
+            let opening = Task {
+                try await rpc.duplex(
+                    command: 171,
+                    initialPayload: Data("metadata".utf8),
+                    timeout: configuration.timeout
+                )
+            }
+            let frames = try await Self.waitForFrames(3, on: mock)
+            guard case .request(let id, _, _, _) = frames[0] else {
+                opening.cancel()
+                await rpc.close()
+                _ = try? await opening.value
+                return XCTFail("expected duplex request frame")
+            }
+
+            guard try await Self.waitForDuplexSetupState(
+                id: id,
+                on: rpc,
+                localWritesComplete: true,
+                requestOpened: false,
+                responseOpened: false,
+                awaitingSetup: true,
+                hasTimeoutTask: configuration.hasTimeoutTask
+            ) else {
+                opening.cancel()
+                await rpc.close()
+                return
+            }
+
+            await mock.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+                id: id,
+                flags: [.request, .open]
+            ))
+            guard try await Self.waitForDuplexSetupState(
+                id: id,
+                on: rpc,
+                localWritesComplete: true,
+                requestOpened: true,
+                responseOpened: false,
+                awaitingSetup: true,
+                hasTimeoutTask: configuration.hasTimeoutTask
+            ) else {
+                opening.cancel()
+                await rpc.close()
+                return
+            }
+
+            await mock.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+                id: id,
+                flags: [.response, .open]
+            ))
+            let session = try await opening.value
+            guard try await Self.waitForDuplexSetupState(
+                id: id,
+                on: rpc,
+                localWritesComplete: true,
+                requestOpened: true,
+                responseOpened: true,
+                awaitingSetup: false,
+                hasTimeoutTask: false
+            ) else {
+                session.destroy()
+                await rpc.close()
+                return
+            }
+
+            session.destroy()
+            try await Self.waitForNoInFlight(rpc)
+            await rpc.close()
+        }
     }
 
     func test_duplex_open_timeout_sends_both_half_stream_teardowns_once() async throws {
@@ -1289,8 +2046,12 @@ final class BareRPCClientTests: XCTestCase {
 
         let mock = MockTransport()
         let rpc = BareRPCClient(transport: mock)
-        let raw = try await rpc.duplex(command: 15, initialPayload: Data("metadata".utf8))
-        let frames = try await Self.waitForFrames(3, on: mock)
+        let (raw, frames) = try await Self.openDuplex(
+            command: 15,
+            initialPayload: Data("metadata".utf8),
+            on: rpc,
+            transport: mock
+        )
         guard case .request(let id, _, _, _) = frames[0] else {
             return XCTFail("expected request frame")
         }
@@ -1320,8 +2081,12 @@ final class BareRPCClientTests: XCTestCase {
 
         let mock = MockTransport()
         let rpc = BareRPCClient(transport: mock)
-        let raw = try await rpc.duplex(command: 151, initialPayload: Data("metadata".utf8))
-        let initialFrames = try await Self.waitForFrames(3, on: mock)
+        let (raw, initialFrames) = try await Self.openDuplex(
+            command: 151,
+            initialPayload: Data("metadata".utf8),
+            on: rpc,
+            transport: mock
+        )
         guard case .request(let id, _, _, _) = initialFrames[0] else {
             return XCTFail("expected request frame")
         }
@@ -1353,7 +2118,12 @@ final class BareRPCClientTests: XCTestCase {
 
         let mock = MockTransport()
         let rpc = BareRPCClient(transport: mock)
-        let raw = try await rpc.duplex(command: 16, initialPayload: Data("metadata".utf8))
+        let (raw, _) = try await Self.openDuplex(
+            command: 16,
+            initialPayload: Data("metadata".utf8),
+            on: rpc,
+            transport: mock
+        )
         let session = QVACDuplexSession<Value>(raw: raw, operation: "testDuplex")
         let first = session.responses
         _ = first
@@ -1563,6 +2333,66 @@ final class BareRPCClientTests: XCTestCase {
         let terminal = try await iterator.next()
         XCTAssertNil(terminal)
         XCTAssertEqual(DemandProbeResponse.decodeCount.get(), 3)
+        await client.close()
+    }
+
+    func test_precancelled_typed_stream_next_rejects_buffered_record() async throws {
+        let mock = MockTransport()
+        let client = QVACClient(testing: mock)
+        let stream: QVACResponseStream<DemandProbeResponse> = try await client.streamTyped(
+            .heartbeat(HeartbeatRequest())
+        )
+        let frames = try await Self.waitForFrames(2, on: mock)
+        guard case .request(let id, _, _, _) = frames[0] else {
+            return XCTFail("expected request frame")
+        }
+
+        var inbound = BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.response, .data],
+            payload: .data(Data("{\"value\":1}\n{\"value\":2}\n".utf8))
+        )
+        inbound.append(BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.response, .end]
+        ))
+        await mock.feedInbound(inbound)
+
+        let firstConsumed = CompletionFlag()
+        let releaseSecondRead = StartGate()
+        let consumer = Task {
+            var iterator = stream.makeAsyncIterator()
+            guard try await iterator.next()?.value == 1 else {
+                throw QVACError.protocolViolation("typed-stream fixture did not decode first record")
+            }
+            await firstConsumed.set()
+            await releaseSecondRead.wait()
+            return try await iterator.next()?.value
+        }
+        while !(await firstConsumed.get()) { await Task.yield() }
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(1))
+        while !(await releaseSecondRead.isWaiting()) {
+            guard clock.now < deadline else {
+                consumer.cancel()
+                await releaseSecondRead.release()
+                return XCTFail("consumer did not reach the pre-cancel gate")
+            }
+            await Task.yield()
+        }
+
+        consumer.cancel()
+        await releaseSecondRead.release()
+        do {
+            let value = try await consumer.value
+            XCTFail("pre-cancelled typed next() decoded buffered value \(String(describing: value))")
+        } catch is CancellationError {
+            // Expected: cancellation wins over the second coalesced record.
+        } catch {
+            XCTFail("expected structured cancellation, got \(error)")
+        }
+        try await Self.waitForNoInFlight(client.rpc)
         await client.close()
     }
 

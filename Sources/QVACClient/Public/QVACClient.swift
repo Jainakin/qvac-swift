@@ -614,8 +614,10 @@ public actor QVACClient {
         return try decodeOrThrow(Response.self, from: data)
     }
 
-    /// Send `request`, stream NDJSON chunks back, decode each line into `Response`.
-    /// Caller iterates the returned stream — errors propagate via throw.
+    /// Send `request`, stream NDJSON chunks back, and decode each line into `Response`.
+    /// Concrete response types drain and throw server error envelopes. The explicit
+    /// `QVACResponse` wire union instead yields its `.error` case so low-level wire
+    /// APIs preserve every domain record and let their caller drain metadata to EOF.
     func streamTyped<Response: Decodable & Sendable>(
         _ request: QVACRequest,
         decoding _: Response.Type = Response.self,
@@ -762,11 +764,66 @@ public actor QVACClient {
             _ = try strippingProfilingMetadata(from: data, handler: profilingMetadataHandler)
             return nil
         }
+
+        // Streaming error envelopes are logical terminal records. Preserve them in
+        // the generated response union so eager adapters can drain a following
+        // profiling trailer on the exact iterator before surfacing the mapped error.
+        // Unary decoding continues to throw error envelopes immediately.
+        if type == QVACResponse.self {
+            let stripped = try strippingProfilingMetadata(
+                from: data,
+                handler: profilingMetadataHandler
+            )
+            do {
+                let response = try JSONDecoder().decode(QVACResponse.self, from: stripped)
+                guard let typed = response as? R else {
+                    throw QVACError.protocolViolation(
+                        "decoded QVACResponse could not be returned as the requested type"
+                    )
+                }
+                return typed
+            } catch let error as QVACError {
+                throw error
+            } catch {
+                if let object = try? JSONSerialization.jsonObject(with: stripped) as? [String: Any],
+                   object["type"] as? String == ErrorResponse.discriminator {
+                    throw QVACError.protocolViolation("malformed error response: \(error)")
+                }
+                throw QVACError.encoding("could not decode response: \(error)")
+            }
+        }
         return try decodeOrThrowStatic(
             type,
             from: data,
             profilingMetadataHandler: profilingMetadataHandler
         )
+    }
+
+    /// Recognize a concrete typed stream's terminal `type: "error"` envelope
+    /// without throwing before its profiling trailer and transport EOF are read.
+    /// `QVACResponse` streams intentionally retain the union case instead and are
+    /// drained by their operation-specific pull mapper.
+    fileprivate static func retainedConcreteStreamError(
+        from data: Data,
+        profilingMetadataHandler: (@Sendable (QVACProfilingMetadata) -> Void)?
+    ) throws -> QVACError? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["type"] as? String == ErrorResponse.discriminator else {
+            return nil
+        }
+
+        let stripped = try strippingProfilingMetadata(
+            from: data,
+            handler: profilingMetadataHandler
+        )
+        do {
+            let envelope = try JSONDecoder().decode(ErrorResponse.self, from: stripped)
+            return retainedWireError(envelope)
+        } catch let error as QVACError {
+            return error
+        } catch {
+            return .protocolViolation("malformed error response: \(error)")
+        }
     }
 
     static func validatedTimeout(_ timeout: Duration?) throws -> Duration? {
@@ -1267,6 +1324,7 @@ private actor QVACTypedStreamDriver<Response: Sendable & Decodable> {
     private var decoder: QVACNDJSONDecoder
     private var reachedEOF = false
     private var isReading = false
+    private let terminalDrainTimeout: Duration = .seconds(5)
 
     init(
         raw: BareRPCResponseStream,
@@ -1291,13 +1349,23 @@ private actor QVACTypedStreamDriver<Response: Sendable & Decodable> {
         defer { isReading = false }
         return try await withTaskCancellationHandler(operation: { () async throws -> Response? in
             do {
+                try Task.checkCancellation()
                 while true {
                     if let record = try decoder.nextRecord(finalizing: reachedEOF) {
+                        if ObjectIdentifier(Response.self) != ObjectIdentifier(QVACResponse.self),
+                           let terminalError = try QVACClient.retainedConcreteStreamError(
+                               from: record,
+                               profilingMetadataHandler: profilingMetadataHandler
+                           ) {
+                            try await drainConcreteStreamAfterTerminalError()
+                            throw terminalError
+                        }
                         if let value: Response = try QVACClient.decodeStreamRecord(
                             Response.self,
                             from: record,
                             profilingMetadataHandler: profilingMetadataHandler
                         ) {
+                            try Task.checkCancellation()
                             return value
                         }
                         continue
@@ -1311,11 +1379,57 @@ private actor QVACTypedStreamDriver<Response: Sendable & Decodable> {
                     }
                 }
             } catch {
+                decoder.discardBufferedBytes()
                 throw QVACClient.publicRPCError(error, operation: operation)
             }
         }, onCancel: {
             self.raw.destroy()
         })
+    }
+
+    /// Concrete typed streams cannot represent `ErrorResponse` in their element
+    /// type. Drain only metadata to EOF before throwing the retained server error,
+    /// matching the profiling semantics of union-backed rich stream adapters.
+    private func drainConcreteStreamAfterTerminalError() async throws {
+        let timeout = terminalDrainTimeout
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await self.consumeConcreteTerminalTail() }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw BareRPCRequestTimeout(timeout: timeout)
+            }
+            defer { group.cancelAll() }
+            guard try await group.next() != nil else {
+                throw QVACError.protocolViolation(
+                    "terminal response drain had no active task"
+                )
+            }
+        }
+    }
+
+    private func consumeConcreteTerminalTail() async throws {
+        while true {
+            try Task.checkCancellation()
+            if let record = try decoder.nextRecord(finalizing: reachedEOF) {
+                if let _: Response = try QVACClient.decodeStreamRecord(
+                    Response.self,
+                    from: record,
+                    profilingMetadataHandler: profilingMetadataHandler
+                ) {
+                    throw QVACError.protocolViolation(
+                        "response stream received a domain response after its terminal error"
+                    )
+                }
+                continue
+            }
+            if reachedEOF { return }
+
+            if let chunk = try await iterator.next() {
+                decoder.receive(chunk)
+            } else {
+                reachedEOF = true
+            }
+        }
     }
 
     deinit { raw.destroy() }

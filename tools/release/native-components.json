@@ -1,0 +1,195 @@
+{
+  "schemaVersion": 1,
+  "scope": {
+    "platforms": [
+      "ios-arm64",
+      "ios-arm64-simulator",
+      "ios-x64-simulator"
+    ],
+    "linkedTargetsManifest": {
+      "file": "tools/release/artifacts.development.json",
+      "sha256": "66e2298a6abf2c19b2af9c0411aea5d6c77c5a81a4a9b70d7e89447c51ed708b"
+    },
+    "runtimeResolutionInventory": {
+      "file": "tools/runtime/resolution-inventory.json",
+      "sha256": "55304ce79ce51af6f63371dcb80e8d7cdc8e443bac2f8129ce76c20200a6b348"
+    },
+    "runtimePackageLock": {
+      "file": "tools/runtime/package-lock.json",
+      "sha256": "c703ecc9a91d7389743c824e0c56ae63991917ff3cce504156aab9856a86f9d9"
+    }
+  },
+  "packageSourceCommits": {
+    "@qvac/asr-ggml@0.1.1": "41ec845b5ca7151468b3ca6393ad6113960eeb7b",
+    "@qvac/audiogen-ggml@0.1.1": "41ec845b5ca7151468b3ca6393ad6113960eeb7b",
+    "@qvac/bci-whispercpp@0.6.0": "41ec845b5ca7151468b3ca6393ad6113960eeb7b",
+    "@qvac/classification-ggml@0.15.1": "ba2971d5900997ff7958d955f592625e8fb2447f",
+    "@qvac/diffusion-cpp@0.17.0": "9dd7acb31a97bd709d492827ed322557fc262b48",
+    "@qvac/embed-llamacpp@0.30.1": "f2beb791a99028aae609a778f4f188949b5937c3",
+    "@qvac/fabric@0.3.1": "f2beb791a99028aae609a778f4f188949b5937c3",
+    "@qvac/llm-llamacpp@0.39.4": "cba9434b05b708449393986ed8e58360dc58f61e",
+    "@qvac/ocr-ggml@0.13.1": "f2beb791a99028aae609a778f4f188949b5937c3",
+    "@qvac/translation-nmtcpp@8.3.1": "0d0a7d660bf4d84d9994e3f69bd8956db3b5f744",
+    "@qvac/tts-ggml@0.6.3": "dd896710e6ecbbcf1058c32f6901752ffa032066",
+    "@qvac/vla-ggml@0.16.2": "0c46c44a391a046298fb567bde6e6784883f9192",
+    "bare-buffer@3.7.0": "852330d92e6f8ed00301f35830ef47d390ba6fa6",
+    "bare-cpu-info@0.1.1": "7e95c28e703ee7f691b5cfd62b9052bbae8b8a64",
+    "bare-crypto@1.15.3": "283c4853bf8d5be397bb4f89ba98a4d4e5a97481",
+    "bare-dns@2.2.0": "ce2e8410e0b86aac53efba15f4f173b8dfc83563",
+    "bare-ffmpeg@1.5.0": "b4ed0f33b7ef588208e68d1448e5c7e37f91adad",
+    "bare-fs@4.8.1": "dec17980f2347c600c15ab15d4fb6ebe16193a36",
+    "bare-gpu-info@0.1.1": "4744a2c6d09ddc78c126aad43dd8e54410ed75ef",
+    "bare-inspect@3.1.5": "d6cfcd31d1afa1b933f6f09cbe1de2b9f9ad7a71",
+    "bare-os@3.9.3": "68831c6e95c4fc541353beef2c37dde51e6fda31",
+    "bare-path@3.1.1": "5a5a0160c826da16341c467d80129f814773f435",
+    "bare-performance@2.1.1": "1586fbbd64c8877d0c3ad6b3cc484886e2e4b588",
+    "bare-pipe@4.3.1": "5cc6e19b4f524065ffb1b9494b9888291962955f",
+    "bare-signals@4.2.0": "c1e800a5020c6879b0003355ae79f179466ab46c",
+    "bare-tcp@2.6.1": "5ba63dea8844d3d39cf2a87a86e42130c32cf3a5",
+    "bare-tls@3.1.10": "de58740f0a8f77841958ff402b0564f3b092d7c8",
+    "bare-type@1.1.0": "bf53ddb94330138483a1aa991bdc4fdb628d1d6f",
+    "bare-url@2.5.2": "b8543f7b2768670a99040b163655ed351b747c1b",
+    "bare-zlib@1.4.1": "05950aa9005d64a05082532a519d8c09ff4d4989",
+    "fs-native-extensions@1.5.0": "59caf0f973e526db561e4da4592fc407b890e90f",
+    "quickbit-native@2.4.8": "5325cdea0b61a40023ea13deaf766046e7b60a56",
+    "rabin-native@2.0.0": "58112d2fa44df51adfc1ab0eb9b3eaae86b8aef0",
+    "react-native-bare-kit@0.15.0": "bc7aa196249745abfd4263200dda24f60b2dd24d",
+    "rocksdb-native@3.17.4": "252829d75a11ff6eb506d1c78164d06cd8469741",
+    "simdle-native@1.3.9": "e03e0260a2abdc391fc0bcfe3f7e3cb8bddfc770",
+    "sodium-native@5.1.0": "f566427e31344db077007f1ebf188ee743b46d57",
+    "udx-native@1.21.1": "a94258e6911c2a1028a8d4c4e79aab487d5295a7"
+  },
+  "verifiedComponents": [
+    {
+      "name": "FFmpeg",
+      "license": "LGPL-2.1-or-later",
+      "parentTargets": ["bare-ffmpeg.1.5.0"],
+      "source": {"repository": "https://github.com/FFmpeg/FFmpeg", "revision": "239f2c733de417201d7ad3b3b8b0d9b63285b2b1"},
+      "licenseFiles": [
+        {"path": "COPYING.LGPLv2.1", "url": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/239f2c733de417201d7ad3b3b8b0d9b63285b2b1/COPYING.LGPLv2.1", "sha256": "246041b6ecf9bc32d718a62c57877c78b5eb397b6467e74ed7ae2626ab189c30"}
+      ],
+      "evidence": "The exact bare-ffmpeg npm payload pins n8.1.1 and disables GPL; this commit is the peeled n8.1.1 tag."
+    },
+    {
+      "name": "dav1d",
+      "license": "BSD-2-Clause",
+      "parentTargets": ["bare-ffmpeg.1.5.0"],
+      "source": {"repository": "https://code.videolan.org/videolan/dav1d", "revision": "42b2b24fb8819f1ed3643aa9cf2a62f03868e3aa"},
+      "licenseFiles": [
+        {"path": "COPYING", "url": "https://code.videolan.org/videolan/dav1d/-/raw/42b2b24fb8819f1ed3643aa9cf2a62f03868e3aa/COPYING", "sha256": "b327887de263238deaa80c34cdd2ff3e0ba1d35db585ce14a37ce3e74ee389e9"}
+      ],
+      "evidence": "The shipped binary embeds version 1.5.1-0-g42b2b24; the authoritative 1.5.1 tag peels to this commit."
+    },
+    {
+      "name": "Opus",
+      "license": "BSD-3-Clause",
+      "parentTargets": ["bare-ffmpeg.1.5.0"],
+      "source": {"repository": "https://github.com/xiph/opus", "revision": "ddbe48383984d56acd9e1ab6a090c54ca6b735a6"},
+      "licenseFiles": [
+        {"path": "COPYING", "url": "https://raw.githubusercontent.com/xiph/opus/ddbe48383984d56acd9e1ab6a090c54ca6b735a6/COPYING", "sha256": "01e1167d54a096d123cf6dfbbeb19587278845c6481d2d66d545669846079551"}
+      ],
+      "evidence": "The exact bare-ffmpeg npm payload pins v1.5.2; this commit is the peeled v1.5.2 tag."
+    },
+    {
+      "name": "libvpx",
+      "license": "BSD-3-Clause",
+      "parentTargets": ["bare-ffmpeg.1.5.0"],
+      "source": {"repository": "https://github.com/webmproject/libvpx", "revision": "9f9b7e9ba2eb9d01640a9e69a3d655866265cf7f"},
+      "licenseFiles": [
+        {"path": "LICENSE", "url": "https://raw.githubusercontent.com/webmproject/libvpx/9f9b7e9ba2eb9d01640a9e69a3d655866265cf7f/LICENSE", "sha256": "8267348d5af1262c11d1a08de2f5afc77457755f1ac658627dd9acf71011d615"}
+      ],
+      "evidence": "The exact bare-ffmpeg npm payload pins v1.15.0; this commit is the peeled v1.15.0 tag."
+    },
+    {
+      "name": "SVT-AV1",
+      "license": "BSD-2-Clause",
+      "parentTargets": ["bare-ffmpeg.1.5.0"],
+      "source": {"repository": "https://github.com/AOMediaCodec/SVT-AV1", "revision": "6e69def4ec283fe0b71195671245c3b768bebdef"},
+      "licenseFiles": [
+        {"path": "LICENSE-BSD2.md", "url": "https://raw.githubusercontent.com/AOMediaCodec/SVT-AV1/6e69def4ec283fe0b71195671245c3b768bebdef/LICENSE-BSD2.md", "sha256": "c582fcbeb9cf972a60d298bfaf41dc5adff2dd14208946edcb9bb56a281e8438"}
+      ],
+      "evidence": "The exact bare-ffmpeg npm payload pins 2.3.0; this commit is the peeled official v2.3.0 mirror tag."
+    },
+    {
+      "name": "RocksDB",
+      "license": "Apache-2.0 OR GPL-2.0-only",
+      "parentTargets": ["rocksdb-native.3.17.4"],
+      "source": {"repository": "https://github.com/facebook/rocksdb", "revision": "c007dd1da63fadc6bd0f34c7b8314cc29e7a42bd"},
+      "licenseFiles": [
+        {"path": "LICENSE.Apache", "url": "https://raw.githubusercontent.com/facebook/rocksdb/c007dd1da63fadc6bd0f34c7b8314cc29e7a42bd/LICENSE.Apache", "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"},
+        {"path": "COPYING", "url": "https://raw.githubusercontent.com/facebook/rocksdb/c007dd1da63fadc6bd0f34c7b8314cc29e7a42bd/COPYING", "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"}
+      ],
+      "evidence": "rocksdb-native pins librocksdb 1a00e82d69fc7abba2669f3379be39647d3bae1a, whose build manifest pins RocksDB v10.5.1 at this commit."
+    },
+    {
+      "name": "libsodium",
+      "license": "ISC",
+      "parentTargets": ["sodium-native.5.1.0"],
+      "source": {"repository": "https://github.com/jedisct1/libsodium", "revision": "e18eee6532f5dc4b0f7ee99024e24bf4c8e12fc2"},
+      "licenseFiles": [
+        {"path": "LICENSE", "url": "https://raw.githubusercontent.com/jedisct1/libsodium/e18eee6532f5dc4b0f7ee99024e24bf4c8e12fc2/LICENSE", "sha256": "508a76d186356c0dd807a670ef510964f8724557024796a2c426c6c0e19ab683"}
+      ],
+      "evidence": "The exact sodium-native source gitHead directly fetches this full revision (published as short ref e18eee6)."
+    },
+    {
+      "name": "BoringSSL",
+      "license": "Apache-2.0",
+      "parentTargets": ["bare-crypto.1.15.3", "bare-tls.3.1.10"],
+      "source": {"repository": "https://github.com/google/boringssl", "revision": "617634bc015344093f5ea0b0a5b653c924cfa20d"},
+      "licenseFiles": [
+        {"path": "LICENSE", "url": "https://raw.githubusercontent.com/google/boringssl/617634bc015344093f5ea0b0a5b653c924cfa20d/LICENSE", "sha256": "827c8d8fc207c2392794eef9e00fe246f9f61fdcc132556c275be3dd8c3cd97f"}
+      ],
+      "evidence": "Both exact bare-crypto and bare-tls npm payloads pin BoringSSL 0.20260211.0; this commit is the peeled upstream tag, whose library license is Apache-2.0."
+    },
+    {
+      "name": "zlib",
+      "license": "Zlib",
+      "parentTargets": ["bare-zlib.1.4.1"],
+      "source": {"repository": "https://github.com/madler/zlib", "revision": "da607da739fa6047df13e66a2af6b8bec7c2a498"},
+      "licenseFiles": [
+        {"path": "LICENSE", "url": "https://raw.githubusercontent.com/madler/zlib/da607da739fa6047df13e66a2af6b8bec7c2a498/LICENSE", "sha256": "e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2"}
+      ],
+      "evidence": "The exact bare-zlib npm payload pins 1.3.2; this commit is the peeled v1.3.2 tag."
+    },
+    {
+      "name": "Bare runtime",
+      "license": "Apache-2.0",
+      "parentTargets": ["BareKit"],
+      "source": {"repository": "https://github.com/holepunchto/bare", "revision": "5cf8db08c17a433a2f05b25e397a7ebcdcf5a158"},
+      "licenseFiles": [
+        {"path": "LICENSE", "url": "https://raw.githubusercontent.com/holepunchto/bare/5cf8db08c17a433a2f05b25e397a7ebcdcf5a158/LICENSE", "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"}
+      ],
+      "evidence": "react-native-bare-kit 0.15.0 fetches BareKit v2.3.0, whose source pins Bare runtime 1.29.4 at this commit."
+    }
+  ],
+  "closureRequirements": [
+    {
+      "id": "ffmpeg-lgpl-static-distribution-plan",
+      "affectedTargets": ["bare-ffmpeg.1.5.0"],
+      "missingEvidence": "The exact iOS bare-ffmpeg framework exports FFmpeg av* symbols while declaring no FFmpeg dynamic-library dependency, which is evidence that LGPL-2.1-or-later FFmpeg code is statically embedded. The release inputs do not contain an approved LGPL distribution plan, the exact corresponding-source bundle, or the relinkable objects/relink mechanism for a recipient-modified FFmpeg build.",
+      "action": "Before distributing the binary, have qualified counsel or the publishing maintainer select and document an LGPL-2.1 compliance route; ship the required notices and license text, exact corresponding machine-readable source plus build scripts, and any relinkable object files or replacement mechanism that route requires, all byte-bound to this FFmpeg build. Do not treat license_reviewed=true by itself as closure evidence.",
+      "resolution": null
+    },
+    {
+      "id": "barekit-v8-transitive-provenance",
+      "affectedTargets": ["BareKit"],
+      "missingEvidence": "Bare 1.29.4 identifies the statically linked V8/libc++ archive only as Hyperdrive key krmguqnh75rud4iieqgmzyqoza415cbu68payoww65ii9fzt5n4o checkout 133. The public source does not map that immutable artifact to exact Chromium, V8, ICU, simdutf, and other bundled source revisions or ship their complete license payload.",
+      "action": "Obtain an upstream SBOM/NOTICE for BareKit v2.3.0 or a signed mapping from Hyperdrive checkout 133 to the exact chromium-prebuilds commit and complete third-party license set.",
+      "resolution": null
+    },
+    {
+      "id": "qvac-addon-vcpkg-license-closure",
+      "affectedTargets": ["qvac__asr-ggml.0.1.1", "qvac__audiogen-ggml.0.1.1", "qvac__bci-whispercpp.0.6.0", "qvac__classification-ggml.0.15.1", "qvac__diffusion-cpp.0.17.0", "qvac__embed-llamacpp.0.30.1", "qvac__fabric.0.3.1", "qvac__llm-llamacpp.0.39.4", "qvac__ocr-ggml.0.13.1", "qvac__translation-nmtcpp.8.3.1", "qvac__tts-ggml.0.6.3", "qvac__vla-ggml.0.16.2"],
+      "missingEvidence": "The npm artifacts contain prebuilt native binaries and human-readable component summaries, but no resolved vcpkg install manifest binding every transitive port to its source archive and no complete license-text payload. Some published NOTICE files are absent from the npm tarball and some label build-only qvac-lint-cpp as Unknown.",
+      "action": "Have the upstream addon build export its resolved iOS vcpkg dependency graph, source checksums, enabled features, and collected license files, then bind that report to each published prebuild digest.",
+      "resolution": null
+    },
+    {
+      "id": "bare-addon-transitive-license-texts",
+      "affectedTargets": ["bare-buffer.3.7.0", "bare-cpu-info.0.1.1", "bare-crypto.1.15.3", "bare-dns.2.2.0", "bare-ffmpeg.1.5.0", "bare-gpu-info.0.1.1", "bare-performance.2.1.1", "bare-tls.3.1.10", "bare-url.2.5.2", "bare-zlib.1.4.1", "fs-native-extensions.1.5.0", "quickbit-native.2.4.8", "rabin-native.2.0.0", "rocksdb-native.3.17.4", "simdle-native.1.3.9", "sodium-native.5.1.0", "udx-native.1.21.1"],
+      "missingEvidence": "Exact wrapper source pins are recoverable and several major child revisions are recorded above, but the npm tarballs do not include the complete child license/notice texts or a build-produced assertion that the enumerated children are the entire static closure.",
+      "action": "Collect license files from every directly fetched revision, include any nested static dependencies, and publish a build-generated closure manifest tied to each iOS prebuild SHA-256.",
+      "resolution": null
+    }
+  ]
+}

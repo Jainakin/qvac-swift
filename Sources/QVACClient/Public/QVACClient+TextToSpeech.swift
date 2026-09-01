@@ -1,8 +1,10 @@
 // QVAC-208 — textToSpeech (single-shot synthesis)
 //
-// Synthesizes speech audio from text. The worker emits a stream of audio chunks; each
-// chunk is a `[Float64]` of mono samples at the model's sample rate (usually 22050 Hz
-// or 24000 Hz — call `client.getLoadedModelInfo(…)` to confirm).
+// Synthesizes speech audio from text. QVAC 0.17 emits native signed 16-bit PCM sample
+// values as JSON numbers, which the generated wire contract decodes to Swift `Double`.
+// The sample rate is engine-specific: current upstream engines use 24 kHz (Chatterbox),
+// 44.1 kHz (Supertonic/Parler), or 48 kHz for enhanced output; supported configurations
+// range from 8–192 kHz.
 //
 // Three views are exposed:
 //   • `bufferStream`: live sample stream for low-latency playback
@@ -12,7 +14,6 @@
 import Foundation
 
 public extension QVACClient {
-
     /// Per-sentence update emitted when `sentenceStream: true` is requested.
     /// Contains the chunk index and the text being synthesized in that chunk.
     struct TtsSentenceChunkUpdate: Sendable, Equatable {
@@ -23,20 +24,35 @@ public extension QVACClient {
 
     /// Outcome of a `textToSpeech(…)` call.
     final class TextToSpeechRun: @unchecked Sendable {
-        public let bufferStream: AsyncThrowingStream<Double, Error>
-        public let chunkUpdates: AsyncThrowingStream<TtsSentenceChunkUpdate, Error>?
+        /// A sample-by-sample view that retains bounded whole wire chunks and
+        /// flattens each chunk lazily as it is consumed.
+        public let bufferStream: QVACBufferedStream<Double>
+        /// Byte-bounded sentence updates, one atomic batch per worker frame.
+        public let chunkUpdates: QVACBufferedStream<TtsSentenceChunkUpdate>?
         public let buffer: Task<[Double], Error>
         public let done: Task<Bool, Error>
+        private let processing: Task<Bool, Error>
+
         init(
-            bufferStream: AsyncThrowingStream<Double, Error>,
-            chunkUpdates: AsyncThrowingStream<TtsSentenceChunkUpdate, Error>?,
+            bufferStream: QVACBufferedStream<Double>,
+            chunkUpdates: QVACBufferedStream<TtsSentenceChunkUpdate>?,
             buffer: Task<[Double], Error>,
-            done: Task<Bool, Error>
+            done: Task<Bool, Error>,
+            processing: Task<Bool, Error>
         ) {
             self.bufferStream = bufferStream
             self.chunkUpdates = chunkUpdates
             self.buffer = buffer
             self.done = done
+            self.processing = processing
+        }
+
+        /// Cancel the underlying synthesis RPC and every public view of this run.
+        ///
+        /// Releasing the run wrapper does not cancel automatically: callers may
+        /// safely retain an extracted task or stream and consume it independently.
+        public func cancel() {
+            processing.cancel()
         }
     }
 
@@ -114,17 +130,20 @@ public extension QVACClient {
             .textToSpeech(req),
             rpcOptions: rpcOptions
         )
-        let (bufferStream, bufferSink) = Self.makeStream(
+        let maximumBufferedStreamBytes = self.maximumBufferedStreamBytes
+        let (bufferStream, bufferSink) = Self.makeBufferedStream(
             of: Double.self,
-            name: "textToSpeech.bufferStream"
+            name: "textToSpeech.bufferStream",
+            maximumBufferedBytes: maximumBufferedStreamBytes
         )
         if !stream { bufferSink.finish() }
-        let chunkUpdates: AsyncThrowingStream<TtsSentenceChunkUpdate, Error>?
-        let chunkSink: QVACStreamSink<TtsSentenceChunkUpdate>?
+        let chunkUpdates: QVACBufferedStream<TtsSentenceChunkUpdate>?
+        let chunkSink: QVACBufferedStreamSink<TtsSentenceChunkUpdate>?
         if sentenceStream {
-            let pair = Self.makeStream(
+            let pair = Self.makeBufferedStream(
                 of: TtsSentenceChunkUpdate.self,
-                name: "textToSpeech.chunkUpdates"
+                name: "textToSpeech.chunkUpdates",
+                maximumBufferedBytes: maximumBufferedStreamBytes
             )
             chunkUpdates = pair.0
             chunkSink = pair.1
@@ -138,36 +157,66 @@ public extension QVACClient {
             var full: [Double] = []
             var receivedTerminalFrame = false
             do {
-                for try await response in responseStream {
+                let responses = QVACResponseStreamIteratorBox(responseStream)
+                while let response = try await responses.next() {
+                    if case .error(let error) = response {
+                        return try await Self.resolveResponseStreamTerminal(
+                            responses,
+                            operation: "textToSpeech"
+                        ) { () throws -> Bool in
+                            throw QVACError.fromWire(
+                                code: try Self.checkedWireErrorCode(error.code),
+                                message: error.message
+                            )
+                        }
+                    }
                     guard case .textToSpeech(let r) = response else {
                         try Self.rejectUnexpectedResponse(response, expected: "textToSpeech")
                     }
                     if !r.buffer.isEmpty {
                         if stream {
-                            for sample in r.buffer { bufferSink.yield(sample) }
+                            bufferSink.yield(
+                                contentsOf: r.buffer,
+                                estimatedBytes: Self.retainedTtsSampleBytes(r.buffer.count)
+                            )
                         } else {
                             full.append(contentsOf: r.buffer)
                         }
                     }
                     if sentenceStream,
                        !r.buffer.isEmpty || r.chunkIndex != nil || r.sentenceChunk?.isEmpty == false {
-                        chunkSink?.yield(.init(
-                            buffer: r.buffer,
-                            chunkIndex: r.chunkIndex,
-                            sentenceChunk: r.sentenceChunk
-                        ))
+                        chunkSink?.yield(
+                            contentsOf: [.init(
+                                buffer: r.buffer,
+                                chunkIndex: r.chunkIndex,
+                                sentenceChunk: r.sentenceChunk
+                            )],
+                            estimatedBytes: max(
+                                Self.retainedTtsSampleBytes(r.buffer.count),
+                                Self.conservativeBufferedJSONBytes(
+                                    r,
+                                    elementCount: 1,
+                                    fallback: maximumBufferedStreamBytes
+                                )
+                            )
+                        )
                     }
                     if r.done == true {
                         receivedTerminalFrame = true
                         break
                     }
                 }
+                try Task.checkCancellation()
                 guard receivedTerminalFrame else {
                     throw QVACError.client(
                         .streamEndedWithoutResponse,
                         message: "textToSpeech ended without a terminal done frame"
                     )
                 }
+                try await Self.drainResponseStreamAfterTerminal(
+                    responses,
+                    operation: "textToSpeech"
+                )
                 collectedBuffer.set(stream ? [] : full)
                 bufferSink.finish()
                 chunkSink?.finish()
@@ -186,7 +235,15 @@ public extension QVACClient {
             bufferStream: bufferStream,
             chunkUpdates: chunkUpdates,
             buffer: buffer,
-            done: done
+            done: done,
+            processing: done
         )
+    }
+
+    private static func retainedTtsSampleBytes(_ sampleCount: Int) -> Int {
+        let (bytes, overflowed) = sampleCount.multipliedReportingOverflow(
+            by: MemoryLayout<Double>.stride
+        )
+        return overflowed ? Int.max : bytes
     }
 }

@@ -3,18 +3,64 @@
 import Foundation
 
 public extension QVACClient {
+    /// File attachment supplied to a multimodal completion message.
+    struct ChatAttachment: Codable, Sendable, Equatable {
+        /// Absolute or SDK-resolvable path understood by the worker.
+        public var path: String
+
+        public init(path: String) {
+            self.path = path
+        }
+    }
+
     struct ChatMessage: Codable, Sendable, Equatable {
         public var role: String
         public var content: String
+        public var attachments: [ChatAttachment]?
 
-        public init(role: String, content: String) {
+        public init(
+            role: String,
+            content: String,
+            attachments: [ChatAttachment]? = nil
+        ) {
             self.role = role
             self.content = content
+            self.attachments = attachments
         }
 
-        public static func user(_ value: String) -> Self { .init(role: "user", content: value) }
-        public static func assistant(_ value: String) -> Self { .init(role: "assistant", content: value) }
-        public static func system(_ value: String) -> Self { .init(role: "system", content: value) }
+        public static func user(
+            _ value: String,
+            attachments: [ChatAttachment]? = nil
+        ) -> Self {
+            .init(role: "user", content: value, attachments: attachments)
+        }
+
+        public static func assistant(
+            _ value: String,
+            attachments: [ChatAttachment]? = nil
+        ) -> Self {
+            .init(role: "assistant", content: value, attachments: attachments)
+        }
+
+        public static func system(
+            _ value: String,
+            attachments: [ChatAttachment]? = nil
+        ) -> Self {
+            .init(role: "system", content: value, attachments: attachments)
+        }
+
+        var wireValue: JSONValue {
+            var object: [String: JSONValue] = [
+                "role": .string(role),
+                "content": .string(content),
+            ]
+            if let attachments {
+                object["attachments"] = .array(attachments.map { attachment in
+                    .object(["path": .string(attachment.path)])
+                })
+            }
+            return .object(object)
+        }
     }
 
     enum CompletionToolDialect: String, Codable, Sendable, Equatable, CaseIterable {
@@ -289,13 +335,13 @@ public extension QVACClient {
         /// Stable client-generated identifier carried on the wire.
         public let requestId: String
         /// Normalized completion events in worker order.
-        public let events: AsyncThrowingStream<CompletionEvent, Error>
+        public let events: QVACBufferedStream<CompletionEvent>
         /// Authoritative aggregated terminal result.
         public let final: Task<CompletionFinal, Error>
         /// Convenience stream containing only assistant-content deltas.
-        public let tokenStream: AsyncThrowingStream<String, Error>
+        public let tokenStream: QVACBufferedStream<String>
         /// Convenience stream containing completed tool calls.
-        public let toolCallStream: AsyncThrowingStream<CompletionToolCall, Error>
+        public let toolCallStream: QVACBufferedStream<CompletionToolCall>
         /// Convenience task resolving to normalized assistant text.
         public let text: Task<String, Error>
         /// Convenience task resolving to all completed tool calls.
@@ -305,10 +351,10 @@ public extension QVACClient {
 
         init(
             requestId: String,
-            events: AsyncThrowingStream<CompletionEvent, Error>,
+            events: QVACBufferedStream<CompletionEvent>,
             final: Task<CompletionFinal, Error>,
-            tokenStream: AsyncThrowingStream<String, Error>,
-            toolCallStream: AsyncThrowingStream<CompletionToolCall, Error>,
+            tokenStream: QVACBufferedStream<String>,
+            toolCallStream: QVACBufferedStream<CompletionToolCall>,
             text: Task<String, Error>,
             toolCalls: Task<[CompletionToolCall], Error>,
             stats: Task<CompletionStats?, Error>
@@ -328,8 +374,8 @@ public extension QVACClient {
     ///
     /// The request id is available as soon as this method returns, so callers can
     /// issue targeted cancellation without waiting for a decoded token. Supply an
-    /// explicit `rpcOptions.timeout` for a bounded operation; the exact upstream
-    /// default remains unlimited.
+    /// explicit `rpcOptions.timeout` to override the production-safe 60-second
+    /// default inactivity deadline, or pass `nil` for an intentionally unbounded run.
     func completion(
         modelId: String,
         history: [ChatMessage],
@@ -348,9 +394,7 @@ public extension QVACClient {
             hasTools: tools?.isEmpty == false,
             context: "completion"
         )
-        let historyWire: [JSONValue] = history.map {
-            .object(["role": .string($0.role), "content": .string($0.content)])
-        }
+        let historyWire = history.map(\.wireValue)
         let requestId = UUID().uuidString
         var request = CompletionStreamRequest(
             history: historyWire,
@@ -370,14 +414,21 @@ public extension QVACClient {
             .completionStream(request),
             rpcOptions: rpcOptions
         )
-        let (events, eventSink) = Self.makeStream(
+        let maximumBufferedStreamBytes = self.maximumBufferedStreamBytes
+        let (events, eventSink) = Self.makeBufferedStream(
             of: CompletionEvent.self,
-            name: "completion.events"
+            name: "completion.events",
+            maximumBufferedBytes: maximumBufferedStreamBytes
         )
-        let (tokens, tokenSink) = Self.makeStream(of: String.self, name: "completion.tokenStream")
-        let (toolStream, toolSink) = Self.makeStream(
+        let (tokens, tokenSink) = Self.makeBufferedStream(
+            of: String.self,
+            name: "completion.tokenStream",
+            maximumBufferedBytes: maximumBufferedStreamBytes
+        )
+        let (toolStream, toolSink) = Self.makeBufferedStream(
             of: CompletionToolCall.self,
-            name: "completion.toolCallStream"
+            name: "completion.toolCallStream",
+            maximumBufferedBytes: maximumBufferedStreamBytes
         )
 
         let final = Task<CompletionFinal, Error> {
@@ -390,30 +441,53 @@ public extension QVACClient {
             var terminalError: String?
             var receivedTerminalFrame = false
             do {
-                for try await response in source {
-                    guard case .completionStream(let frame) = response else {
-                        if case .error(let error) = response {
+                let responses = QVACResponseStreamIteratorBox(source)
+                while let response = try await responses.next() {
+                    if case .error(let error) = response {
+                        return try await Self.resolveResponseStreamTerminal(
+                            responses,
+                            operation: "completionStream"
+                        ) { () throws -> CompletionFinal in
                             throw QVACError.fromWire(
                                 code: try Self.checkedWireErrorCode(error.code),
                                 message: error.message
                             )
                         }
+                    }
+                    guard case .completionStream(let frame) = response else {
                         throw QVACError.protocolViolation(
                             "completionStream returned \(response.discriminator)"
                         )
                     }
-                    for wireEvent in frame.events {
-                        let event = try CompletionEvent(wire: wireEvent)
-                        eventSink.yield(event)
+                    let parsedEvents: [CompletionEvent]
+                    let terminalValidation: Result<[CompletionEvent], Error>?
+                    if frame.done == true {
+                        let validation = Result<[CompletionEvent], Error> {
+                            try frame.events.map(CompletionEvent.init(wire:))
+                        }
+                        terminalValidation = validation
+                        parsedEvents = (try? validation.get()) ?? []
+                    } else {
+                        terminalValidation = nil
+                        parsedEvents = try frame.events.map(CompletionEvent.init(wire:))
+                    }
+                    let estimatedFrameBytes = Self.conservativeBufferedJSONBytes(
+                        frame.events,
+                        elementCount: frame.events.count,
+                        fallback: maximumBufferedStreamBytes
+                    )
+                    var frameTokens: [String] = []
+                    var frameToolCalls: [CompletionToolCall] = []
+                    for event in parsedEvents {
                         switch event {
                         case .contentDelta(_, let text):
                             contentText += text
-                            if stream { tokenSink.yield(text) }
+                            if stream { frameTokens.append(text) }
                         case .thinkingDelta(_, let text):
                             thinkingText += text
                         case .toolCall(_, let call):
                             toolCalls.append(call)
-                            if stream { toolSink.yield(call) }
+                            if stream { frameToolCalls.append(call) }
                         case .stats(_, let value):
                             stats = value
                         case .done(_, let reason, let raw):
@@ -426,7 +500,32 @@ public extension QVACClient {
                             break
                         }
                     }
+                    eventSink.yield(
+                        contentsOf: parsedEvents,
+                        estimatedBytes: estimatedFrameBytes
+                    )
+                    if stream {
+                        tokenSink.yield(
+                            contentsOf: frameTokens,
+                            estimatedBytes: estimatedFrameBytes
+                        )
+                        toolSink.yield(
+                            contentsOf: frameToolCalls,
+                            estimatedBytes: estimatedFrameBytes
+                        )
+                    }
                     if frame.done == true {
+                        let validation = terminalValidation ?? .failure(
+                            QVACError.protocolViolation(
+                                "completionStream terminal validation was not captured"
+                            )
+                        )
+                        _ = try await Self.resolveResponseStreamTerminal(
+                            responses,
+                            operation: "completionStream"
+                        ) {
+                            try validation.get()
+                        }
                         receivedTerminalFrame = true
                         break
                     }

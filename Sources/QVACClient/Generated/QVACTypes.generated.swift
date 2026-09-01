@@ -1765,7 +1765,7 @@ public struct RagRequest: Codable, Sendable, Equatable {
 
     public var deleteOnClose: Bool?
 
-    public var documents: [JSONValue]?
+    public var documents: JSONValue?
 
     public var ids: [String]?
 
@@ -1787,7 +1787,7 @@ public struct RagRequest: Codable, Sendable, Equatable {
 
     public var workspace: String?
 
-    public init(operation: String, chunk: Bool? = nil, chunkOpts: JSONValue? = nil, deleteOnClose: Bool? = nil, documents: [JSONValue]? = nil, ids: [String]? = nil, modelId: String? = nil, n: Double? = nil, progressInterval: Double? = nil, query: String? = nil, requestId: String? = nil, topK: Double? = nil, withProgress: Bool? = nil, workspace: String? = nil) {
+    public init(operation: String, chunk: Bool? = nil, chunkOpts: JSONValue? = nil, deleteOnClose: Bool? = nil, documents: JSONValue? = nil, ids: [String]? = nil, modelId: String? = nil, n: Double? = nil, progressInterval: Double? = nil, query: String? = nil, requestId: String? = nil, topK: Double? = nil, withProgress: Bool? = nil, workspace: String? = nil) {
         self.type = Self.discriminator
         self.operation = operation
         self.chunk = chunk
@@ -1837,7 +1837,7 @@ public struct RagRequest: Codable, Sendable, Equatable {
         self.chunk = try container.decodeIfPresent(Bool.self, forKey: .chunk)
         self.chunkOpts = try container.decodeIfPresent(JSONValue.self, forKey: .chunkOpts)
         self.deleteOnClose = try container.decodeIfPresent(Bool.self, forKey: .deleteOnClose)
-        self.documents = try container.decodeIfPresent([JSONValue].self, forKey: .documents)
+        self.documents = try container.decodeIfPresent(JSONValue.self, forKey: .documents)
         self.ids = try container.decodeIfPresent([String].self, forKey: .ids)
         self.modelId = try container.decodeIfPresent(String.self, forKey: .modelId)
         self.n = try container.decodeIfPresent(Double.self, forKey: .n)

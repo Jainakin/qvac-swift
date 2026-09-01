@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       revision:
-        description: Monotonic artifact revision (creates artifacts-sdk-0.17.0-rN)
+        description: Monotonic artifact revision N >= 2 (creates hardened artifacts-sdk-0.17.0-rN)
         required: true
         type: number
       publish:
@@ -61,6 +61,10 @@ jobs:
           fi
           if [[ ! "$INPUT_REVISION" =~ ^[1-9][0-9]*$ ]]; then
             echo "::error::revision must be a positive integer"
+            exit 1
+          fi
+          if [ "$INPUT_REVISION" -lt 2 ]; then
+            echo "::error::r1 is the immutable historical schema-v2 baseline; all new candidates require r2 or later and schema v3"
             exit 1
           fi
           ARTIFACT_TAG="artifacts-sdk-0.17.0-r$INPUT_REVISION"
@@ -132,7 +136,7 @@ jobs:
             tools/runtime/.build/link-set.json
       - name: Verify exact third-party attribution
         run: node tools/release/generate-third-party-notices.mjs --check
-      - name: Package deterministic assets and manifest
+      - name: Package deterministic assets and byte-bound evidence manifest
         run: |
           tools/runtime/test-path-safety.sh
           node tools/release/test-archive-reproducibility.mjs
@@ -151,10 +155,17 @@ jobs:
             --source-commit "$GITHUB_SHA"
           node tools/release/verify-release.mjs \
             tools/runtime/.build/release-assets/artifact-manifest.json \
+            --require-schema 3 \
+            --privacy-audit tools/release/privacy-manifest-audit.json \
             --assets-dir tools/runtime/.build/release-assets
-      - name: Require reviewed attribution before publication
+      - name: Require reviewed attribution and privacy closure before publication
         if: inputs.publish
         run: |
+          node tools/release/generate-third-party-notices.mjs --check-publication
+          node tools/release/verify-privacy-manifests.mjs --check-publication \
+            --frameworks tools/runtime/.build/artifacts \
+            --link-set tools/runtime/.build/link-set.json \
+            --assets-dir tools/runtime/.build/release-assets
           gh release verify --help >/dev/null
           gh release verify-asset --help >/dev/null
           if [ "${{ inputs.license_reviewed }}" != "true" ]; then
@@ -188,10 +199,12 @@ jobs:
         run: |
           node tools/release/verify-release.mjs \
             tools/runtime/.build/release-assets/artifact-manifest.json \
+            --require-schema 3 \
             --source-commit "$GITHUB_SHA" \
             --assets-dir tools/runtime/.build/release-assets \
             --package Package.swift \
-            --bundle Sources/QVACClient/Resources/worker.mobile.bundle
+            --bundle Sources/QVACClient/Resources/worker.mobile.bundle \
+            --privacy-audit tools/release/privacy-manifest-audit.json
           echo "Final publication gate: canonical Package.swift is URL-based and bound to $GITHUB_SHA"
       - name: Upload immutable candidate evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -231,7 +244,7 @@ jobs:
               --target "$GITHUB_SHA" \
               --latest=false \
               --title "$ARTIFACT_TAG" \
-              --notes "Immutable iOS artifacts for exact @qvac/sdk 0.17.0. Provenance, checksums, and THIRD_PARTY_NOTICES.md are bound by artifact-manifest.json."
+              --notes "Immutable iOS artifacts for exact @qvac/sdk 0.17.0. The worker, native archives, THIRD_PARTY_NOTICES.md, privacy audit, runtime resolution inventory, and SDK provenance are byte-bound by artifact-manifest.json."
           fi
 
           # With repository release immutability enabled, current gh creates a

@@ -354,6 +354,18 @@ function swiftType(prop, context = {}) {
   prop = resolveRef(prop)
   if (!prop || typeof prop !== 'object') return 'JSONValue'
 
+  // One `rag` discriminator covers three document wire shapes in 0.17:
+  // `string | string[]` for chunk/ingest and an object array for
+  // saveEmbeddings. The merged generated struct must retain that complete union;
+  // choosing only the most specific array arm silently rewrites scalar input.
+  // JSONValue is the exact lossless representation until Swift emits a dedicated
+  // three-arm public union.
+  if (context.side === 'request'
+      && context.discriminator === 'rag'
+      && context.propName === 'documents') {
+    return 'JSONValue'
+  }
+
   // Preserve the SDK's `T | T[]` wire unions as an exact, strongly typed value.
   // The pinned 0.17 translate schema uses this for NMT scalar/batch input.
   if (Array.isArray(prop.anyOf) || Array.isArray(prop.oneOf)) {

@@ -3,8 +3,9 @@
 Native Swift access to QVAC's local-first AI worker for iOS 17+ and macOS 14+
 (arm64), using Swift concurrency and bounded `AsyncSequence` streams.
 
-Published `0.1.x` releases target the exact `@qvac/sdk@0.17.0` contract. They do
-not contain a 0.10 compatibility or migration layer.
+The current source targets the exact `@qvac/sdk@0.17.0` contract and is intended
+for the unreleased `v0.2.0` source release. It contains no 0.10 compatibility or
+migration layer.
 
 ## Release status
 
@@ -22,11 +23,16 @@ moved or replaced.
 
 The current grant-handoff source contains additional post-`v0.1.0` review
 hardening: a finite default request deadline, generation-safe worker reconnect,
-rich-duplex profiling-trailer draining, stronger real RAG/profiling coverage, and
-an exact-revision iOS 17 URL-consumer runtime gate. It is intentionally not tagged
-or submitted to Swift Package Index here. The authorized grant publisher should
-create the next additive artifact revision and SemVer release from a fully green
-commit by following `docs/distribution.md`.
+rich-duplex profiling-trailer draining, bounded batch-aware streams, stronger real
+RAG/profiling coverage, and an exact-revision iOS 17 URL-consumer runtime gate. It
+is intentionally not tagged or submitted to Swift Package Index here. Grant
+reviewers acting as the authorized publisher—not this handoff—must publish the
+next additive artifact revision
+`artifacts-sdk-0.17.0-r2` and then source release `v0.2.0` from the same fully green
+commit by following `docs/distribution.md`. Future publication is deliberately
+blocked until the native-license and Apple privacy-manifest audits documented
+there are complete; the prior `license_reviewed=true` attestation does not bypass
+those evidence requirements.
 
 For each release, canonical `Package.swift` is the public URL-backed manifest for
 that release's artifact revision; `Package.swift.dev` retains the exact local
@@ -48,13 +54,14 @@ index checklist. The exact redistributed-package inventory, package-provided
 texts, and pinned supplements are in
 [Third-party notices](THIRD_PARTY_NOTICES.md).
 
-Consume the latest reviewed `0.1.x` patch as follows:
+After the authorized grant publisher releases `v0.2.0`, consume reviewed `0.2.x`
+patches as follows:
 
 ```swift
 dependencies: [
     .package(
         url: "https://github.com/Jainakin/qvac-swift.git",
-        .upToNextMinor(from: "0.1.0")
+        .upToNextMinor(from: "0.2.0")
     ),
 ],
 targets: [
@@ -73,10 +80,10 @@ explicit source-version pin, use `exact:` with the desired reviewed tag from the
 
 The repository-side Swift Package Index work is the publication guidance and CI
 configuration supplied by `.spi.yml` and `docs/swift-package-index.md`. Actual
-Index publication is intentionally reserved for the authorized publisher. A
-current SDK 0.17.0 run of the SwiftUI example on a physical iPhone also remains
-external grant evidence; neither external action affects package integrity or URL
-installability.
+Index publication is intentionally reserved for the authorized publisher. The
+SDK 0.17.0 SwiftUI flow has passed on a physical iPhone 15 Pro (arm64, iOS 26.5.2):
+fresh model download/load, real streamed completion, terminal result, and unload.
+No physical-device acceptance step remains.
 
 ## Exact upstream identity
 
@@ -217,9 +224,11 @@ worklet exit, close and recreate `QVACClient` rather than assuming automatic sta
 recovery.
 
 Profiling can be enabled per call. Metadata-only profiling trailer records are
-consumed separately and never decoded as ordinary response types. Rich duplex
-streams perform a bounded, eager terminal drain, so profiling is captured before a
-terminal event is exposed even if the consumer then leaves the loop:
+consumed separately and never decoded as ordinary response types. High-level
+terminal-aware streams—including generated server streams and concrete duplex
+error paths—perform a bounded, eager drain to EOF before exposing success or
+throwing the retained worker error. This captures profiling even if the consumer
+then leaves the loop:
 
 ```swift
 let options = QVACRPCOptions(
@@ -290,13 +299,21 @@ stream queues are bounded. The default maximum wire message is 256 MiB because
 
 Tune `maximumWireMessageBytes:` and `maximumBufferedStreamBytes:` in the client
 initializer for the deployment. A lower value reduces worst-case memory exposure
-but rejects larger valid outputs. Base64 decoding and `Data` ownership can
+but rejects larger valid outputs. Raw queue accounting charges payload bytes plus a
+conservative per-DATA-frame structural allowance, including for empty frames.
+Base64 decoding and `Data` ownership can
 temporarily require several times the encoded payload size, which matters on
 memory-constrained iOS devices.
 
-Public fan-out streams are bounded to 64 elements. A slow observer fails with
-`QVACStreamBufferOverflow`; terminal result tasks continue independently when the
-progress view is observational.
+Batch-aware public run streams use the single-consumer `QVACBufferedStream`. They
+queue at most 64 whole worker batches, bound queued plus partially consumed data by
+the configured `maximumBufferedStreamBytes`, and flatten accepted multi-value
+frames lazily for callers. A lagging lossless view fails with
+`QVACStreamBufferOverflow`; its
+authoritative aggregate continues independently. Observational progress views use
+the same count and byte ceilings but coalesce older snapshots to retain the newest
+bounded window. An indivisible batch larger than the byte budget fails only that
+view rather than silently truncating it.
 
 ## Reproducible development setup
 

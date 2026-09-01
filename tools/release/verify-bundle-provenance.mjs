@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { basename, dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { validateReleaseManifest } from './release-manifest.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(scriptDir, '..', '..')
@@ -144,8 +145,7 @@ export function verifyBundle(bundlePath, artifactManifestPath) {
   }
 
   if (artifactManifestPath) {
-    const manifest = JSON.parse(readFileSync(artifactManifestPath, 'utf8'))
-    if (manifest.schemaVersion !== 2 || manifest.mode !== 'release') fail('artifact manifest must be schema v2 release mode')
+    const manifest = validateReleaseManifest(JSON.parse(readFileSync(artifactManifestPath, 'utf8')))
     for (const [field, actual] of [
       ['sha256', bundle.sha256],
       ['size', bundle.size],

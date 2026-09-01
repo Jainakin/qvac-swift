@@ -20,6 +20,8 @@ const generatedFrameworkRoot = resolve(repoRoot, 'tools/runtime/.build')
 const expectedFrameworksDir = join(generatedFrameworkRoot, 'artifacts')
 const noticesPath = join(repoRoot, 'THIRD_PARTY_NOTICES.md')
 const noticeGeneratorPath = join(repoRoot, 'tools/release/generate-third-party-notices.mjs')
+const privacyAuditPath = join(repoRoot, 'tools/release/privacy-manifest-audit.json')
+const privacyAuditVerifierPath = join(repoRoot, 'tools/release/verify-privacy-manifests.mjs')
 const allowedOutputRoots = [
   resolve(repoRoot, 'release-candidate'),
   generatedFrameworkRoot,
@@ -99,10 +101,12 @@ if (existsSync(outputDir) && realpathSync(outputDir) !== outputDirCanonical) {
   throw new Error('[package-artifacts] canonical output escaped its tool-owned root')
 }
 
+const linkSetPathCanonical = realpathSync(linkSetPath)
+const bundlePathCanonical = realpathSync(bundlePath)
 const canonicalInputs = [
   ['framework input', frameworksDirCanonical],
-  ['link-set input', realpathSync(linkSetPath)],
-  ['bundle input', realpathSync(bundlePath)],
+  ['link-set input', linkSetPathCanonical],
+  ['bundle input', bundlePathCanonical],
 ]
 
 assertExistingPathHasNoSymlinkComponents(noticesPath, repoRoot, 'third-party notices input')
@@ -110,16 +114,24 @@ if (!lstatSync(noticesPath).isFile()) {
   throw new Error('[package-artifacts] THIRD_PARTY_NOTICES.md must be a regular file')
 }
 execFileSync(process.execPath, [noticeGeneratorPath, '--check'], { stdio: 'inherit' })
-canonicalInputs.push(['third-party notices input', realpathSync(noticesPath)])
+const noticesPathCanonical = realpathSync(noticesPath)
+canonicalInputs.push(['third-party notices input', noticesPathCanonical])
+assertExistingPathHasNoSymlinkComponents(privacyAuditPath, repoRoot, 'privacy audit input')
+if (!lstatSync(privacyAuditPath).isFile()) {
+  throw new Error('[package-artifacts] privacy-manifest-audit.json must be a regular file')
+}
+execFileSync(process.execPath, [privacyAuditVerifierPath, '--check-frameworks',
+  '--frameworks', frameworksDirCanonical,
+  '--link-set', linkSetPathCanonical,
+], { stdio: 'inherit' })
+const privacyAuditPathCanonical = realpathSync(privacyAuditPath)
+canonicalInputs.push(['privacy audit input', privacyAuditPathCanonical])
 for (const [label, input] of canonicalInputs) {
   if (overlaps(outputDirCanonical, input)) {
     throw new Error(`[package-artifacts] output must not equal, contain, or be contained by ${label}`)
   }
 }
 
-const linkSetPathCanonical = canonicalInputs[1][1]
-const bundlePathCanonical = canonicalInputs[2][1]
-const noticesPathCanonical = canonicalInputs[3][1]
 const linkSet = JSON.parse(readFileSync(linkSetPathCanonical, 'utf8'))
 if (linkSet.mode !== 'link-set') throw new Error('[package-artifacts] input is not a link-set manifest')
 if (!Array.isArray(linkSet.targets) || linkSet.targets.length === 0 || new Set(linkSet.targets).size !== linkSet.targets.length) {
@@ -151,6 +163,7 @@ for (const target of linkSet.targets) {
 
 copyFileSync(bundlePathCanonical, join(outputDirCanonical, 'worker.mobile.bundle'))
 copyFileSync(noticesPathCanonical, join(outputDirCanonical, 'THIRD_PARTY_NOTICES.md'))
+copyFileSync(privacyAuditPathCanonical, join(outputDirCanonical, 'privacy-manifest-audit.json'))
 copyFileSync(join(repoRoot, 'tools/runtime/resolution-inventory.json'), join(outputDirCanonical, 'runtime-resolution-inventory.json'))
 copyFileSync(join(repoRoot, 'tools/provenance/qvac-sdk.lock.json'), join(outputDirCanonical, 'qvac-sdk-provenance.json'))
-console.log(`[package-artifacts] staged ${linkSet.targets.length} deterministic archives + notices/provenance in ${outputDirCanonical}`)
+console.log(`[package-artifacts] staged ${linkSet.targets.length} deterministic archives + notices/privacy/provenance in ${outputDirCanonical}`)

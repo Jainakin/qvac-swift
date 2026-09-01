@@ -28,6 +28,8 @@ final class QVACRuntimeContractTests: XCTestCase {
         XCTAssertEqual(streamingJSON["withProgress"] as? Bool, true)
         XCTAssertEqual(unaryJSON["requestId"] as? String, "unary-request")
         XCTAssertEqual(streamingJSON["requestId"] as? String, "stream-request")
+        XCTAssertEqual(unaryJSON["seed"] as? Bool, false)
+        XCTAssertEqual(streamingJSON["seed"] as? Bool, false)
     }
 
     func test_load_request_builder_preserves_explicit_model_config() throws {
@@ -37,12 +39,19 @@ final class QVACRuntimeContractTests: XCTestCase {
             modelConfig: .object(["contextSize": .number(4096)]),
             modelName: "named",
             requestId: "request-id",
-            withProgress: false
+            withProgress: false,
+            seed: true,
+            delegate: .object(["peerId": .string("desktop-peer")])
         )
         let json = try Self.object(for: .loadModel(request))
         let config = try XCTUnwrap(json["modelConfig"] as? [String: Any])
         XCTAssertEqual(config["contextSize"] as? Double, 4096)
         XCTAssertEqual(json["modelName"] as? String, "named")
+        XCTAssertEqual(json["seed"] as? Bool, true)
+        XCTAssertEqual(
+            (json["delegate"] as? [String: Any])?["peerId"] as? String,
+            "desktop-peer"
+        )
     }
 
     func test_load_request_builder_normalizes_pinned_model_aliases_and_preserves_custom_types() throws {

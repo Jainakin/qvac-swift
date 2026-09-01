@@ -139,22 +139,50 @@ public extension QVACClient {
             var fullText = ""
             var segments: [TranscribeSegment] = []
             var stats: JSONValue?
-            for try await response in stream {
+            let responses = QVACResponseStreamIteratorBox(stream)
+            while let response = try await responses.next() {
+                if case .error(let error) = response {
+                    return try await Self.resolveResponseStreamTerminal(
+                        responses,
+                        operation: "transcribe"
+                    ) { () throws -> TranscriptionOutcome in
+                        throw QVACError.fromWire(
+                            code: try Self.checkedWireErrorCode(error.code),
+                            message: error.message
+                        )
+                    }
+                }
                 guard case .transcribe(let frame) = response else {
                     try Self.rejectUnexpectedResponse(response, expected: "transcribe")
                 }
-                if let error = frame.error {
-                    throw QVACError.server(.transcriptionFailed, message: error)
+                if frame.done == true || frame.error != nil {
+                    return try await Self.resolveResponseStreamTerminal(
+                        responses,
+                        operation: "transcribe"
+                    ) {
+                        if let error = frame.error {
+                            throw QVACError.server(.transcriptionFailed, message: error)
+                        }
+                        var terminalText = fullText
+                        var terminalSegments = segments
+                        var terminalStats = stats
+                        if let text = frame.text { terminalText += text }
+                        if let rawSegment = frame.segment {
+                            terminalSegments.append(try TranscribeSegment(from: rawSegment))
+                        }
+                        if let responseStats = frame.stats { terminalStats = responseStats }
+                        return TranscriptionOutcome(
+                            text: terminalText,
+                            segments: terminalSegments,
+                            stats: terminalStats
+                        )
+                    }
                 }
                 if let text = frame.text { fullText += text }
                 if let rawSegment = frame.segment {
-                    let segment = try TranscribeSegment(from: rawSegment)
-                    segments.append(segment)
+                    segments.append(try TranscribeSegment(from: rawSegment))
                 }
                 if let responseStats = frame.stats { stats = responseStats }
-                if frame.done == true {
-                    return .init(text: fullText, segments: segments, stats: stats)
-                }
             }
             throw QVACError.client(
                 .streamEndedWithoutResponse,

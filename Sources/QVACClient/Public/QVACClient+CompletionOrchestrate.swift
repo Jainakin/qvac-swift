@@ -81,6 +81,33 @@ public extension QVACClient {
                     )
                 }
             ) { frame in
+                if frame.done == true {
+                    do {
+                        var terminalEvents: [CompletionOrchestrationEvent] = []
+                        if let events = frame.events {
+                            terminalEvents.append(.turnEvents(
+                                turn: frame.turn ?? 0,
+                                events: events
+                            ))
+                        }
+                        if let rawCallback = frame.toolCallback {
+                            guard let callback = CompletionToolCallback(wire: rawCallback) else {
+                                throw QVACError.protocolViolation(
+                                    "completionOrchestrate returned malformed toolCallback"
+                                )
+                            }
+                            terminalEvents.append(.toolCallback(callback))
+                        }
+                        terminalEvents.append(.done(stopReason: frame.stopReason))
+                        return .emitThenDrain(terminalEvents)
+                    } catch let error as QVACError {
+                        return .failThenDrain(error)
+                    } catch {
+                        return .failThenDrain(.protocolViolation(
+                            "completionOrchestrate returned a malformed terminal frame: \(error)"
+                        ))
+                    }
+                }
                 var mapped: [CompletionOrchestrationEvent] = []
                 if let events = frame.events {
                     mapped.append(.turnEvents(turn: frame.turn ?? 0, events: events))
@@ -92,10 +119,6 @@ public extension QVACClient {
                         )
                     }
                     mapped.append(.toolCallback(callback))
-                }
-                if frame.done == true {
-                    mapped.append(.done(stopReason: frame.stopReason))
-                    return .emitThenDrain(mapped)
                 }
                 return .emitMany(mapped)
             }
@@ -130,12 +153,7 @@ public extension QVACClient {
         captureThinking: Bool = false,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> CompletionOrchestrationSession {
-        let historyValue: [JSONValue] = history.map { message in
-            .object([
-                "role": .string(message.role),
-                "content": .string(message.content),
-            ])
-        }
+        let historyValue = history.map(\.wireValue)
         let request = CompletionOrchestrateRequest(
             history: historyValue,
             modelId: modelId,

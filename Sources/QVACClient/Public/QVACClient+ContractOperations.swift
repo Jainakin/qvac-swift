@@ -50,18 +50,19 @@ public extension QVACClient {
                 "expected finetune response, got \(response.discriminator)"
             )
         }
-        return result
+        return try Self.validateFinetuneResponse(result)
     }
 
     /// Progress and terminal result for a finetuning start/resume operation.
     final class FinetuneRun: @unchecked Sendable {
         public let requestId: String
-        public let progress: AsyncThrowingStream<FinetuneProgressResponse, Error>
+        /// Lossless per-step metrics retained as byte-bounded worker-frame batches.
+        public let progress: QVACBufferedStream<FinetuneProgressResponse>
         public let result: Task<FinetuneResponse, Error>
 
         init(
             requestId: String,
-            progress: AsyncThrowingStream<FinetuneProgressResponse, Error>,
+            progress: QVACBufferedStream<FinetuneProgressResponse>,
             result: Task<FinetuneResponse, Error>
         ) {
             self.requestId = requestId
@@ -86,16 +87,46 @@ public extension QVACClient {
         // contract guard so cancel/status-style unary operations fail locally
         // instead of opening a stream that can never receive their unary reply.
         let source = try await wireFinetuneProgress(request, rpcOptions: rpcOptions)
-        let (progress, continuation) = Self.makeStream(of: FinetuneProgressResponse.self)
+        let maximumBufferedStreamBytes = self.maximumBufferedStreamBytes
+        let (progress, continuation) = Self.makeBufferedStream(
+            of: FinetuneProgressResponse.self,
+            name: "finetune.progress",
+            maximumBufferedBytes: maximumBufferedStreamBytes
+        )
         let result = Task<FinetuneResponse, Error> {
             do {
-                for try await response in source {
+                let responses = QVACResponseStreamIteratorBox(source)
+                while let response = try await responses.next() {
                     switch response {
                     case .finetuneProgress(let event):
-                        continuation.yield(event)
+                        let validated = try Self.validateFinetuneProgress(event)
+                        continuation.yield(
+                            contentsOf: [validated],
+                            estimatedBytes: Self.conservativeBufferedJSONBytes(
+                                event,
+                                elementCount: 1,
+                                fallback: maximumBufferedStreamBytes
+                            )
+                        )
                     case .finetune(let terminal):
+                        let validated = try await Self.resolveResponseStreamTerminal(
+                            responses,
+                            operation: "finetune"
+                        ) {
+                            try Self.validateFinetuneResponse(terminal)
+                        }
                         continuation.finish()
-                        return terminal
+                        return validated
+                    case .error(let error):
+                        return try await Self.resolveResponseStreamTerminal(
+                            responses,
+                            operation: "finetune"
+                        ) { () throws -> FinetuneResponse in
+                            throw QVACError.fromWire(
+                                code: try Self.checkedWireErrorCode(error.code),
+                                message: error.message
+                            )
+                        }
                     default:
                         try Self.rejectUnexpectedResponse(
                             response,
@@ -115,6 +146,117 @@ public extension QVACClient {
             }
         }
         return FinetuneRun(requestId: requestId, progress: progress, result: result)
+    }
+
+    private static func validateFinetuneResponse(
+        _ response: FinetuneResponse
+    ) throws -> FinetuneResponse {
+        switch response.status {
+        case "IDLE", "RUNNING", "PAUSED", "CANCELLED", "COMPLETED":
+            break
+        default:
+            throw QVACError.protocolViolation(
+                "finetune.status is not a QVAC 0.17 value: \(response.status)"
+            )
+        }
+        if let stats = response.stats {
+            try validateFinetuneStats(stats)
+        }
+        return response
+    }
+
+    private static func validateFinetuneProgress(
+        _ response: FinetuneProgressResponse
+    ) throws -> FinetuneProgressResponse {
+        let counters: [(String, Int)] = [
+            ("global_steps", response.globalSteps),
+            ("current_epoch", response.currentEpoch),
+            ("current_batch", response.currentBatch),
+            ("total_batches", response.totalBatches),
+        ]
+        for (field, value) in counters where value < 0 {
+            throw QVACError.protocolViolation(
+                "finetune:progress.\(field) must be nonnegative"
+            )
+        }
+        let durations: [(String, Double)] = [
+            ("elapsed_ms", response.elapsedMs),
+            ("eta_ms", response.etaMs),
+        ]
+        for (field, value) in durations where !value.isFinite || value < 0 {
+            throw QVACError.protocolViolation(
+                "finetune:progress.\(field) must be a finite nonnegative number"
+            )
+        }
+        try validateFinetuneMetric(response.loss, field: "finetune:progress.loss")
+        try validateFinetuneMetric(
+            response.lossUncertainty,
+            field: "finetune:progress.loss_uncertainty"
+        )
+        try validateFinetuneMetric(response.accuracy, field: "finetune:progress.accuracy")
+        try validateFinetuneMetric(
+            response.accuracyUncertainty,
+            field: "finetune:progress.accuracy_uncertainty"
+        )
+        return response
+    }
+
+    private static func validateFinetuneStats(_ value: JSONValue) throws {
+        guard case .object(let stats) = value else {
+            throw QVACError.protocolViolation("finetune.stats must be an object")
+        }
+        let required: Set<String> = ["global_steps", "epochs_completed"]
+        let numeric: Set<String> = [
+            "train_loss", "val_loss", "train_accuracy", "val_accuracy", "learning_rate",
+        ]
+        let nullableNumeric: Set<String> = [
+            "train_loss_uncertainty", "val_loss_uncertainty",
+            "train_accuracy_uncertainty", "val_accuracy_uncertainty",
+        ]
+        let allowed = required.union(numeric).union(nullableNumeric)
+        guard required.isSubset(of: Set(stats.keys)),
+              Set(stats.keys).isSubset(of: allowed) else {
+            throw QVACError.protocolViolation(
+                "finetune.stats must contain global_steps and epochs_completed "
+                    + "and no fields outside the QVAC 0.17 contract"
+            )
+        }
+        for field in required {
+            guard case .number(let raw) = stats[field] else {
+                throw QVACError.protocolViolation("finetune.stats.\(field) must be an integer")
+            }
+            let integer = try checkedWireInteger(raw, field: "finetune.stats.\(field)")
+            guard integer >= 0 else {
+                throw QVACError.protocolViolation(
+                    "finetune.stats.\(field) must be nonnegative"
+                )
+            }
+        }
+        for field in numeric where stats[field] != nil {
+            guard case .number(let number) = stats[field], number.isFinite else {
+                throw QVACError.protocolViolation(
+                    "finetune.stats.\(field) must be a finite number"
+                )
+            }
+        }
+        for field in nullableNumeric {
+            guard let metric = stats[field] else { continue }
+            try validateFinetuneMetric(metric, field: "finetune.stats.\(field)")
+        }
+    }
+
+    private static func validateFinetuneMetric(
+        _ value: JSONValue,
+        field: String
+    ) throws {
+        switch value {
+        case .null:
+            return
+        case .number(let number) where number.isFinite:
+            return
+        default:
+            throw QVACError.protocolViolation("\(field) must be a finite number or null")
+        }
     }
 
     /// Return metadata for a model that is currently loaded in the worker.
@@ -176,15 +318,12 @@ public extension QVACClient {
         let source: QVACResponseStream<QVACResponse> = try await streamTyped(
             .loggingStream(LoggingStreamRequest(id: id)), rpcOptions: rpcOptions
         )
-        return Self.pullMap(source) { response in
+        return Self.pullMap(source, operation: "loggingStream") { response in
             switch response {
             case .loggingStream(let event):
                 return .emit(event)
             case .error(let error):
-                throw QVACError.fromWire(
-                    code: try Self.checkedWireErrorCode(error.code),
-                    message: error.message
-                )
+                return .failThenDrain(Self.retainedWireError(error))
             default:
                 try Self.rejectUnexpectedResponse(response, expected: "loggingStream")
             }

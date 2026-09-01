@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'New source SemVer without the v prefix (first stable release: 0.1.0)'
+        description: 'New source SemVer without the v prefix (grant handoff target: 0.2.0)'
         required: true
         type: string
       artifact_tag:
-        description: Published immutable artifact tag built from this exact commit
+        description: Published schema-v3 artifact tag (r2+) built from this exact commit
         required: true
         type: string
 
@@ -52,8 +52,8 @@ jobs:
             echo "::error::version must be a valid SemVer without v or build metadata"
             exit 1
           fi
-          if [[ ! "$INPUT_ARTIFACT_TAG" =~ ^artifacts-sdk-0\.17\.0-r[1-9][0-9]*$ ]]; then
-            echo "::error::artifact_tag must be artifacts-sdk-0.17.0-rN"
+          if [[ ! "$INPUT_ARTIFACT_TAG" =~ ^artifacts-sdk-0\.17\.0-r([2-9]|[1-9][0-9]+)$ ]]; then
+            echo "::error::artifact_tag must be hardened schema-v3 artifacts-sdk-0.17.0-rN with N >= 2"
             exit 1
           fi
           if [ "$GITHUB_REF" != "refs/tags/$INPUT_ARTIFACT_TAG" ]; then
@@ -147,6 +147,10 @@ jobs:
           fi
           echo "SOURCE_TAG_EXISTS=$SOURCE_TAG_EXISTS" >> "$GITHUB_ENV"
           echo "SOURCE_RELEASE_EXISTS=$SOURCE_RELEASE_EXISTS" >> "$GITHUB_ENV"
+      - name: Require complete native-license and privacy closure before publication
+        run: |
+          node tools/release/generate-third-party-notices.mjs --check-publication
+          node tools/release/verify-privacy-manifests.mjs --check-publication
       - name: Require the complete CI workflow to have passed for this exact commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -190,9 +194,11 @@ jobs:
         run: |
           node tools/release/verify-release.mjs \
             "$RELEASE_ARTIFACT_MANIFEST" \
+            --require-schema 3 \
             --source-commit "$GITHUB_SHA" \
             --package Package.swift \
             --bundle Sources/QVACClient/Resources/worker.mobile.bundle \
+            --privacy-audit tools/release/privacy-manifest-audit.json \
             --remote
           swift package dump-package >/dev/null
       - name: Prove clean Git-URL consumer resolution before creating a tag

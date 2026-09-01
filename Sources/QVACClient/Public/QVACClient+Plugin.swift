@@ -52,8 +52,9 @@ public extension QVACClient {
     }
 
     /// Invoke a streaming plugin handler. Returns a single-consumer
-    /// ``QVACResponseStream`` of decoded chunks. The stream terminates when the
-    /// worker emits `done: true`; breaking iteration tears down the remote stream.
+    /// ``QVACResponseStream`` of decoded chunks. In 0.17, `done` is optional and
+    /// merely suppresses that frame's payload; transport EOF is normal completion.
+    /// Breaking iteration tears down the remote stream.
     func invokePluginStream<Params: Encodable & Sendable, Chunk: Decodable & Sendable>(
         modelId: String,
         handler: String,
@@ -68,24 +69,13 @@ public extension QVACClient {
             rpcOptions: rpcOptions
         )
 
-        return Self.pullMap(
-            rawStream,
-            endOfSourceError: {
-                QVACError.client(
-                    .streamEndedWithoutResponse,
-                    message: "pluginInvokeStream ended without a terminal done frame"
-                )
-            }
-        ) { response in
+        return Self.pullMap(rawStream, operation: "pluginInvokeStream") { response in
             switch response {
             case .pluginInvokeStream(let frame):
-                if frame.done == true { return .finish }
+                if frame.done == true { return .skip }
                 return .emit(try Self.decodeFromJSONValue(frame.result, as: Chunk.self))
             case .error(let error):
-                throw QVACError.fromWire(
-                    code: try Self.checkedWireErrorCode(error.code),
-                    message: error.message
-                )
+                return .failThenDrain(Self.retainedWireError(error))
             default:
                 try Self.rejectUnexpectedResponse(response, expected: "pluginInvokeStream")
             }

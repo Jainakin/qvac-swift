@@ -86,6 +86,13 @@ struct QVACNDJSONDecoder: Sendable {
         return records
     }
 
+    /// Release any complete or partial records after the owning stream becomes
+    /// terminal. This is intentionally separate from `finish()`: cancellation and
+    /// decoding failures must not materialize or retain unread domain data.
+    mutating func discardBufferedBytes() {
+        reset()
+    }
+
     private mutating func reset() {
         bytes.removeAll(keepingCapacity: false)
         recordStart = 0

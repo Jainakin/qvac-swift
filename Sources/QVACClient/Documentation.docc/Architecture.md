@@ -89,8 +89,13 @@ hand-maintained routing switch when the contract gains a method.
 
 Frame size, NDJSON record size, transport buffering, and each raw operation queue
 have explicit byte ceilings. Public mapped streams are pull-driven, so a slow
-consumer does not create an unbounded eager decoding task. High-level fan-out views
-use a bounded element count and report overflow explicitly.
+consumer does not create an unbounded eager decoding task. High-level lossless
+fan-out views retain whole wire batches under count and configured byte ceilings.
+``QVACBufferedStream`` flattens multi-value batches lazily, so one valid TTS or
+completion frame cannot overflow before Swift schedules its consumer. Slow-consumer
+overflow is still explicit and never drops a partial batch.
+Observational progress fan-out retains the newest bounded window and coalesces old
+snapshots, because the 0.17 worker may emit progress once per network chunk.
 
 Live server and duplex responses use `QVACResponseStream`, a single-consumer
 sequence whose iterator owns the RPC teardown lease. Leaving a `for try await`
@@ -127,6 +132,15 @@ published numeric codes. Malformed frames and unexpected response variants becom
 protocol violations; malformed JSON/NDJSON becomes an encoding error; operating
 system failures remain transport errors. Internal bare-rpc error types are not
 exposed through public async sequences.
+
+The `wireProgressStream`, `wireServerStream`, and `wireDuplex` escape hatches are
+deliberately lower level: their `QVACResponse` union preserves an `.error` record as
+a domain element. A caller using those APIs must continue the same response iterator
+to EOF after observing `.error` so a following profiling trailer is consumed.
+Concrete-response generated adapters and high-level run APIs perform that bounded
+drain themselves and then throw the corresponding `QVACError`; generated conditional
+progress accessors remain wire-union streams because one operation can emit several
+response variants.
 
 ## See also
 

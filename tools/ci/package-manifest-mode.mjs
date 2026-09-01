@@ -16,6 +16,8 @@ const packagePath = resolve(repositoryRoot, 'Package.swift')
 const developmentPackagePath = resolve(repositoryRoot, 'Package.swift.dev')
 const developmentManifestPath = resolve(repositoryRoot, 'tools/release/artifacts.development.json')
 const releaseBasePattern = /^https:\/\/github\.com\/Jainakin\/qvac-swift\/releases\/download\/(artifacts-sdk-0\.17\.0-r[1-9][0-9]*)\/$/
+const legacyArtifactTag = 'artifacts-sdk-0.17.0-r1'
+const legacySourceCommit = '85ac16212e43ec4572c96f04bf278cd67e52eb7f'
 
 function fail(message) {
   throw new Error(`[package-manifest-mode] ${message}`)
@@ -76,10 +78,12 @@ function parseReleasePackage(packageText, developmentManifest) {
   }
 
   const syntheticManifest = {
-    schemaVersion: 2,
+    schemaVersion: artifactTag === legacyArtifactTag ? 2 : 3,
     mode: 'release',
     artifactTag,
-    sourceCommit: '0000000000000000000000000000000000000001',
+    sourceCommit: artifactTag === legacyArtifactTag
+      ? legacySourceCommit
+      : '0000000000000000000000000000000000000001',
     sdk: developmentManifest.sdk,
     bundle: {
       assetName: 'worker.mobile.bundle',
@@ -97,6 +101,7 @@ function parseReleasePackage(packageText, developmentManifest) {
       sha256: checksum('third-party-notices'),
       url: `${releaseBase}THIRD_PARTY_NOTICES.md`,
     },
+    ...(artifactTag === legacyArtifactTag ? {} : releaseEvidence(releaseBase, developmentManifest.sdk)),
     artifacts: artifacts.map(artifact => ({
       target: artifact.target,
       assetName: `${artifact.target}.xcframework.zip`,
@@ -139,13 +144,38 @@ function checksum(value) {
   return createHash('sha256').update(value).digest('hex')
 }
 
+function releaseEvidence(releaseBase, sdk) {
+  return {
+    privacyAudit: {
+      assetName: 'privacy-manifest-audit.json',
+      size: 1,
+      sha256: checksum('privacy-manifest-audit'),
+      url: `${releaseBase}privacy-manifest-audit.json`,
+    },
+    runtimeResolutionInventory: {
+      assetName: 'runtime-resolution-inventory.json',
+      size: 1,
+      sha256: sdk.runtimeInventorySHA256,
+      url: `${releaseBase}runtime-resolution-inventory.json`,
+    },
+    sdkProvenance: {
+      assetName: 'qvac-sdk-provenance.json',
+      size: 1,
+      sha256: checksum('sdk-provenance'),
+      url: `${releaseBase}qvac-sdk-provenance.json`,
+    },
+  }
+}
+
 function makeReleaseFixture(developmentManifest, tag = 'artifacts-sdk-0.17.0-r99') {
   const releaseBase = `https://github.com/Jainakin/qvac-swift/releases/download/${tag}/`
   return renderPackageManifest({
-    schemaVersion: 2,
+    schemaVersion: tag === legacyArtifactTag ? 2 : 3,
     mode: 'release',
     artifactTag: tag,
-    sourceCommit: '0000000000000000000000000000000000000001',
+    sourceCommit: tag === legacyArtifactTag
+      ? legacySourceCommit
+      : '0000000000000000000000000000000000000001',
     sdk: developmentManifest.sdk,
     bundle: {
       assetName: 'worker.mobile.bundle',
@@ -163,6 +193,7 @@ function makeReleaseFixture(developmentManifest, tag = 'artifacts-sdk-0.17.0-r99
       sha256: checksum('third-party-notices'),
       url: `${releaseBase}THIRD_PARTY_NOTICES.md`,
     },
+    ...(tag === legacyArtifactTag ? {} : releaseEvidence(releaseBase, developmentManifest.sdk)),
     artifacts: developmentManifest.targets.map(target => {
       const digest = checksum(target)
       return {
@@ -195,6 +226,11 @@ function selfTest() {
   const inspected = inspectCanonicalPackage(release, developmentPackageText, developmentManifest)
   if (inspected.mode !== 'release' || inspected.artifactTag !== 'artifacts-sdk-0.17.0-r99') {
     fail('self-test did not recognize the generated URL manifest')
+  }
+  const legacyRelease = makeReleaseFixture(developmentManifest, legacyArtifactTag)
+  const inspectedLegacy = inspectCanonicalPackage(legacyRelease, developmentPackageText, developmentManifest)
+  if (inspectedLegacy.mode !== 'release' || inspectedLegacy.artifactTag !== legacyArtifactTag) {
+    fail('self-test did not recognize the immutable historical r1 URL manifest')
   }
   expectFailure(
     () => inspectCanonicalPackage(release.replace('Jainakin/qvac-swift', 'attacker/fork'), developmentPackageText, developmentManifest),

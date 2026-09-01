@@ -53,13 +53,14 @@ public extension QVACClient {
     /// `stream` is `false`, `blockStream` is empty and `blocks` resolves to the complete
     /// collected list.
     final class OCRRun: @unchecked Sendable {
-        public let blockStream: AsyncThrowingStream<[OCRTextBlock], Error>
+        /// One block array per worker frame, retained as byte-bounded atomic batches.
+        public let blockStream: QVACBufferedStream<[OCRTextBlock]>
         public let blocks: Task<[OCRTextBlock], Error>
         public let stats: Task<OCRStats?, Error>
         private let processing: Task<[OCRTextBlock], Error>
 
         init(
-            blockStream: AsyncThrowingStream<[OCRTextBlock], Error>,
+            blockStream: QVACBufferedStream<[OCRTextBlock]>,
             blocks: Task<[OCRTextBlock], Error>,
             stats: Task<OCRStats?, Error>,
             processing: Task<[OCRTextBlock], Error>
@@ -70,7 +71,13 @@ public extension QVACClient {
             self.processing = processing
         }
 
-        deinit { processing.cancel() }
+        /// Cancel the underlying OCR RPC and every public view of this run.
+        ///
+        /// Releasing the run wrapper does not cancel automatically: callers may
+        /// safely retain an extracted task or stream and consume it independently.
+        public func cancel() {
+            processing.cancel()
+        }
     }
 
     /// OCR an image from a file path.
@@ -120,54 +127,95 @@ public extension QVACClient {
             rpcOptions: rpcOptions
         )
 
-        let (blockStream, blockCont) = Self.makeStream(
+        let maximumBufferedStreamBytes = self.maximumBufferedStreamBytes
+        let (blockStream, blockCont) = Self.makeBufferedStream(
             of: [OCRTextBlock].self,
-            name: "ocr.blockStream"
+            name: "ocr.blockStream",
+            maximumBufferedBytes: maximumBufferedStreamBytes
         )
         if !stream { blockCont.finish() }
         let statsBox = ResultBox<OCRStats?>()
         let processing = Task<[OCRTextBlock], Error> {
             var collected: [OCRTextBlock] = []
-            var receivedTerminalFrame = false
             do {
-                for try await response in responseStream {
+                let responses = QVACResponseStreamIteratorBox(responseStream)
+                while let response = try await responses.next() {
+                    if case .error(let error) = response {
+                        return try await Self.resolveResponseStreamTerminal(
+                            responses,
+                            operation: "ocrStream"
+                        ) { () throws -> [OCRTextBlock] in
+                            throw QVACError.fromWire(
+                                code: try Self.checkedWireErrorCode(error.code),
+                                message: error.message
+                            )
+                        }
+                    }
                     guard case .ocrStream(let r) = response else {
                         try Self.rejectUnexpectedResponse(response, expected: "ocrStream")
                     }
-                    if let e = r.error { throw QVACError.server(.ocrFailed, message: e) }
+
+                    // An explicit OCR error is a logical terminal even on workers that
+                    // omit `done`. Retain terminal validation as a Result, drain the
+                    // exact iterator (capturing profiling), and only then expose it.
+                    if r.done == true || r.error != nil {
+                        let terminal = try await Self.resolveResponseStreamTerminal(
+                            responses,
+                            operation: "ocrStream"
+                        ) { () throws -> (blocks: [OCRTextBlock], stats: OCRStats?) in
+                            if let error = r.error {
+                                throw QVACError.server(.ocrFailed, message: error)
+                            }
+                            let blocks = try (r.blocks ?? []).map(OCRTextBlock.init(wire:))
+                            let stats = try r.stats.map(Self.decodeOCRStats)
+                            return (blocks, stats)
+                        }
+
+                        if stream {
+                            if !terminal.blocks.isEmpty {
+                                blockCont.yield(
+                                    contentsOf: [terminal.blocks],
+                                    estimatedBytes: Self.conservativeBufferedJSONBytes(
+                                        r.blocks ?? [],
+                                        elementCount: terminal.blocks.count,
+                                        fallback: maximumBufferedStreamBytes
+                                    )
+                                )
+                            }
+                        } else {
+                            collected.append(contentsOf: terminal.blocks)
+                        }
+                        if r.stats != nil { statsBox.set(terminal.stats) }
+                        blockCont.finish()
+                        return stream ? [] : collected
+                    }
+
                     if let wireBlocks = r.blocks {
                         let blocks = try wireBlocks.map(OCRTextBlock.init(wire:))
                         if stream {
-                            if !blocks.isEmpty { blockCont.yield(blocks) }
+                            if !blocks.isEmpty {
+                                blockCont.yield(
+                                    contentsOf: [blocks],
+                                    estimatedBytes: Self.conservativeBufferedJSONBytes(
+                                        wireBlocks,
+                                        elementCount: blocks.count,
+                                        fallback: maximumBufferedStreamBytes
+                                    )
+                                )
+                            }
                         } else {
                             collected.append(contentsOf: blocks)
                         }
                     }
                     if let wireStats = r.stats {
-                        do {
-                            statsBox.set(try Self.decodeFromJSONValue(
-                                wireStats,
-                                as: OCRStats.self
-                            ))
-                        } catch {
-                            throw QVACError.protocolViolation(
-                                "OCR returned malformed stats: \(error)"
-                            )
-                        }
-                    }
-                    if r.done == true {
-                        receivedTerminalFrame = true
-                        break
+                        statsBox.set(try Self.decodeOCRStats(wireStats))
                     }
                 }
-                guard receivedTerminalFrame else {
-                    throw QVACError.client(
-                        .streamEndedWithoutResponse,
-                        message: "ocrStream ended without a terminal done frame"
-                    )
-                }
-                blockCont.finish()
-                return stream ? [] : collected
+                try Task.checkCancellation()
+                throw QVACError.client(
+                    .streamEndedWithoutResponse,
+                    message: "ocrStream ended without a terminal done frame"
+                )
             } catch {
                 blockCont.finish(throwing: error)
                 throw error
@@ -184,6 +232,16 @@ public extension QVACClient {
             stats: statsTask,
             processing: processing
         )
+    }
+
+    private static func decodeOCRStats(_ wire: JSONValue) throws -> OCRStats {
+        do {
+            return try decodeFromJSONValue(wire, as: OCRStats.self)
+        } catch {
+            throw QVACError.protocolViolation(
+                "OCR returned malformed stats: \(error)"
+            )
+        }
     }
 }
 

@@ -5,13 +5,14 @@ and close every resource deterministically.
 
 ## Add the package
 
-After an artifact-backed source tag has been published:
+After grant reviewers acting as the authorized publisher have published artifact
+revision `artifacts-sdk-0.17.0-r2` and source release `v0.2.0`:
 
 ```swift
 dependencies: [
     .package(
         url: "https://github.com/Jainakin/qvac-swift.git",
-        exact: "0.1.0"
+        exact: "0.2.0"
     ),
 ],
 targets: [
@@ -24,13 +25,14 @@ targets: [
 ]
 ```
 
-`0.1.0` and its checksum-pinned `artifacts-sdk-0.17.0-r1` binary closure are
-published and remain valid baseline URL-installation evidence. The repository's
-canonical `Package.swift` stays URL-backed between releases; `Package.swift.dev`
-is activated only in disposable development/CI checkouts. For a future release,
-the publisher commits the generated URL manifest for a new artifact revision,
-publishes those exact immutable assets after candidate CI passes, and then runs
-the guarded public-URL preflight before creating a new SemVer tag.
+`v0.2.0` is the intended grant-handoff source release and is not published by this
+handoff. Grant reviewers—not the implementation team—publish the checksum-pinned
+`artifacts-sdk-0.17.0-r2` binary closure first, then create `v0.2.0` only after the
+guarded public-URL preflight passes. The historical `v0.1.0` and
+`artifacts-sdk-0.17.0-r1` pair remains valid baseline URL-installation evidence but
+does not expose the final stream API documented here. The repository's canonical
+`Package.swift` stays URL-backed between releases; `Package.swift.dev` is activated
+only in disposable development/CI checkouts.
 
 The minimum platforms are iOS 17 and macOS 14 on arm64.
 
@@ -113,9 +115,19 @@ intentionally unbounded operation protected by an external watchdog.
 
 ## Errors
 
-RPC and worker failures are surfaced as `QVACError`. Cooperative Swift task
-cancellation remains `CancellationError`, while a bounded high-level observer that
-falls behind reports `QVACStreamBufferOverflow`:
+High-level RPC and worker failures are surfaced as `QVACError`. Cooperative Swift
+task cancellation remains `CancellationError`. The intentionally low-level
+`wireProgressStream`, `wireServerStream`, and `wireDuplex` escape hatches instead
+preserve `QVACResponse.error` as a union value; callers of those APIs must continue
+the same response iterator to EOF so a following profiling trailer is consumed.
+Batch-aware public run views use the single-consumer `QVACBufferedStream`. They
+queue at most 64 whole worker batches and apply the client's
+`maximumBufferedStreamBytes` budget across queued plus partially consumed data.
+Lossless views preserve each accepted worker frame atomically and report
+`QVACStreamBufferOverflow` if they fall behind;
+observational progress views coalesce older snapshots under the same count and byte
+ceilings. An indivisible batch larger than the byte budget fails only its view, while
+the authoritative result continues independently:
 
 ```swift
 do {

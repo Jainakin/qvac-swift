@@ -12,11 +12,110 @@ enum QVACPullMapDecision<Element: Sendable>: Sendable {
     /// metadata as another domain value. Any actual domain value observed while
     /// draining is a protocol violation.
     case emitThenDrain([Element])
+    /// Drain the logical terminal response to transport EOF, then surface its
+    /// retained domain error. A drain timeout or post-terminal domain value wins.
+    case failThenDrain(QVACError)
     case skip
-    case finish
+}
+
+/// Single-consumer iterator ownership shared by eager and pull-mapped response drivers.
+///
+/// Terminal draining has to continue on the exact iterator that decoded the logical
+/// terminal response; creating a second iterator would violate `QVACResponseStream`'s
+/// contract and cancel the live RPC lease.
+final class QVACResponseStreamIteratorBox<Element: Sendable>: @unchecked Sendable {
+    private var iterator: QVACResponseStream<Element>.AsyncIterator
+
+    init(_ source: QVACResponseStream<Element>) {
+        iterator = source.makeAsyncIterator()
+    }
+
+    func next() async throws -> Element? {
+        try await iterator.next()
+    }
 }
 
 extension QVACClient {
+    /// Convert an error envelope without throwing before a pull-mapped terminal can
+    /// drain. Malformed numeric codes remain protocol violations, but are retained
+    /// until the profiling trailer and transport EOF have been consumed.
+    static func retainedWireError(_ response: ErrorResponse) -> QVACError {
+        do {
+            return QVACError.fromWire(
+                code: try checkedWireErrorCode(response.code),
+                message: response.message
+            )
+        } catch let error as QVACError {
+            return error
+        } catch {
+            return .protocolViolation("malformed error response: \(error)")
+        }
+    }
+
+    /// Drain the metadata-only record that can follow a logical terminal response.
+    ///
+    /// The typed stream driver removes profiling trailers, so `nil` is the only valid
+    /// result of this pull. A domain response after terminal is a protocol violation;
+    /// a worker that never closes is bounded independently of the request's timeout.
+    static func drainResponseStreamAfterTerminal<Element: Sendable>(
+        _ iterator: QVACResponseStreamIteratorBox<Element>,
+        operation: String,
+        timeout: Duration = .seconds(5)
+    ) async throws {
+        do {
+            let trailingValue = try await withThrowingTaskGroup(of: Element?.self) { group in
+                group.addTask { try await iterator.next() }
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    throw BareRPCRequestTimeout(timeout: timeout)
+                }
+                defer { group.cancelAll() }
+                guard let firstCompleted = try await group.next() else {
+                    throw QVACError.protocolViolation(
+                        "terminal response drain had no active task"
+                    )
+                }
+                return firstCompleted
+            }
+            if trailingValue != nil {
+                throw QVACError.protocolViolation(
+                    "response stream received a domain response after its terminal frame"
+                )
+            }
+        } catch {
+            throw publicRPCError(error, operation: operation)
+        }
+    }
+
+    /// Resolve a recognized logical terminal frame without abandoning its transport.
+    ///
+    /// Terminal validation is intentionally evaluated before the drain and retained as
+    /// a `Result`: this remembers declared server failures, cancellation outcomes, and
+    /// malformed terminal payloads while still pulling the *same* iterator to EOF so a
+    /// following profiling trailer is decoded. The drain is awaited before the retained
+    /// terminal outcome is observed, which makes a post-terminal domain response or a
+    /// bounded-drain timeout authoritative over the terminal outcome.
+    static func resolveResponseStreamTerminal<Element: Sendable, Output>(
+        _ iterator: QVACResponseStreamIteratorBox<Element>,
+        operation: String,
+        timeout: Duration = .seconds(5),
+        resolution: () throws -> Output
+    ) async throws -> Output {
+        let terminalResult: Result<Output, Error>
+        do {
+            terminalResult = .success(try resolution())
+        } catch {
+            terminalResult = .failure(error)
+        }
+
+        try await drainResponseStreamAfterTerminal(
+            iterator,
+            operation: operation,
+            timeout: timeout
+        )
+        return try terminalResult.get()
+    }
+
     /// Map a single public sequence without an eager bridge task or second queue.
     /// Backpressure therefore reaches the byte-bounded transport unchanged.
     static func pullMap<Input: Sendable, Output: Sendable>(
@@ -65,19 +164,7 @@ private final class QVACPullStreamTermination: @unchecked Sendable {
 }
 
 private actor QVACPullMappedStreamDriver<Input: Sendable, Output: Sendable> {
-    private final class IteratorBox: @unchecked Sendable {
-        var iterator: QVACResponseStream<Input>.AsyncIterator
-
-        init(_ source: QVACResponseStream<Input>) {
-            iterator = source.makeAsyncIterator()
-        }
-
-        func next() async throws -> Input? {
-            try await iterator.next()
-        }
-    }
-
-    private let iterator: IteratorBox
+    private let iterator: QVACResponseStreamIteratorBox<Input>
     private let termination: QVACPullStreamTermination
     private let operation: String
     private let endOfSourceError: @Sendable () -> Error?
@@ -97,7 +184,7 @@ private actor QVACPullMappedStreamDriver<Input: Sendable, Output: Sendable> {
         terminalDrainTimeout: Duration,
         transform: @escaping @Sendable (Input) throws -> QVACPullMapDecision<Output>
     ) {
-        iterator = IteratorBox(source)
+        iterator = QVACResponseStreamIteratorBox(source)
         self.termination = termination
         self.operation = operation
         self.endOfSourceError = endOfSourceError
@@ -117,6 +204,7 @@ private actor QVACPullMappedStreamDriver<Input: Sendable, Output: Sendable> {
         let termination = termination
         return try await withTaskCancellationHandler(operation: {
             do {
+                try Task.checkCancellation()
                 if pendingIndex < pending.count {
                     let output = pending[pendingIndex]
                     pendingIndex += 1
@@ -124,6 +212,7 @@ private actor QVACPullMappedStreamDriver<Input: Sendable, Output: Sendable> {
                         pending.removeAll(keepingCapacity: true)
                         pendingIndex = 0
                     }
+                    try Task.checkCancellation()
                     return output
                 }
                 if finishAfterPending {
@@ -141,68 +230,54 @@ private actor QVACPullMappedStreamDriver<Input: Sendable, Output: Sendable> {
                     }
                     switch try transform(input) {
                     case .emit(let output):
+                        try Task.checkCancellation()
                         return output
                     case .emitMany(let outputs):
                         guard let first = outputs.first else { continue }
+                        try Task.checkCancellation()
                         if outputs.count > 1 {
                             pending = Array(outputs.dropFirst())
                         }
                         return first
                     case .emitThenDrain(let outputs):
-                        try await drainSourceAfterTerminal()
+                        try await QVACClient.drainResponseStreamAfterTerminal(
+                            iterator,
+                            operation: operation,
+                            timeout: terminalDrainTimeout
+                        )
                         guard let first = outputs.first else {
                             finished = true
                             termination.run()
                             return nil
                         }
+                        try Task.checkCancellation()
                         if outputs.count > 1 {
                             pending = Array(outputs.dropFirst())
                         }
                         finishAfterPending = true
                         return first
+                    case .failThenDrain(let error):
+                        try await QVACClient.drainResponseStreamAfterTerminal(
+                            iterator,
+                            operation: operation,
+                            timeout: terminalDrainTimeout
+                        )
+                        throw error
                     case .skip:
                         continue
-                    case .finish:
-                        finished = true
-                        termination.run()
-                        return nil
                     }
                 }
             } catch {
                 finished = true
+                pending.removeAll(keepingCapacity: false)
+                pendingIndex = 0
+                finishAfterPending = false
                 termination.run()
                 throw QVACClient.publicRPCError(error, operation: operation)
             }
         }, onCancel: {
             termination.run()
         })
-    }
-
-    /// Profiling trailers are metadata-only and immediately follow the worker's
-    /// logical terminal record. Bound the final pull so a malformed worker that
-    /// sends `done` but never closes the response cannot hang a normal loop.
-    private func drainSourceAfterTerminal() async throws {
-        let iterator = iterator
-        let timeout = terminalDrainTimeout
-        let trailingValue = try await withThrowingTaskGroup(of: Input?.self) { group in
-            group.addTask { try await iterator.next() }
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                throw BareRPCRequestTimeout(timeout: timeout)
-            }
-            defer { group.cancelAll() }
-            guard let firstCompleted = try await group.next() else {
-                throw QVACError.protocolViolation(
-                    "terminal response drain had no active task"
-                )
-            }
-            return firstCompleted
-        }
-        if trailingValue != nil {
-            throw QVACError.protocolViolation(
-                "mapped response stream received a domain response after its terminal frame"
-            )
-        }
     }
 
     deinit { termination.run() }

@@ -4,7 +4,9 @@ import { readFileSync } from 'node:fs'
 const targetPattern = /^[A-Za-z0-9._@-]+$/
 const hashPattern = /^[0-9a-f]{64}$/
 const commitPattern = /^[0-9a-f]{40}$/
-const artifactTagPattern = /^artifacts-sdk-0\.17\.0-r[1-9][0-9]*$/
+const hardenedArtifactTagPattern = /^artifacts-sdk-0\.17\.0-r(?:[2-9]|[1-9][0-9]+)$/
+const legacyArtifactTag = 'artifacts-sdk-0.17.0-r1'
+const legacySourceCommit = '85ac16212e43ec4572c96f04bf278cd67e52eb7f'
 const authoritativeCommit = 'e8b440665a053a9efe852f04c3601da44f0d55d8'
 
 function fail(message) {
@@ -16,8 +18,22 @@ export function sha256(path) {
 }
 
 export function validateReleaseManifest(manifest) {
-  if (manifest?.schemaVersion !== 2 || manifest?.mode !== 'release') fail('expected schemaVersion 2 release manifest')
-  if (!artifactTagPattern.test(manifest.artifactTag ?? '')) fail(`invalid artifactTag: ${manifest.artifactTag}`)
+  if (manifest?.mode !== 'release') fail('expected release manifest')
+  if (manifest.schemaVersion === 2) {
+    if (manifest.artifactTag !== legacyArtifactTag || manifest.sourceCommit !== legacySourceCommit) {
+      fail(`schema v2 is accepted only for immutable ${legacyArtifactTag} at ${legacySourceCommit}`)
+    }
+    if (manifest.runtimeResolutionInventory !== undefined || manifest.sdkProvenance !== undefined
+        || manifest.privacyAudit !== undefined) {
+      fail('historical schema v2 must not claim schema-v3 evidence bindings')
+    }
+  } else if (manifest.schemaVersion === 3) {
+    if (!hardenedArtifactTagPattern.test(manifest.artifactTag ?? '')) {
+      fail(`schema v3 requires an r2-or-later artifactTag, got ${manifest.artifactTag}`)
+    }
+  } else {
+    fail(`unsupported release manifest schemaVersion: ${manifest?.schemaVersion}`)
+  }
   if (!commitPattern.test(manifest.sourceCommit ?? '')) fail(`invalid sourceCommit: ${manifest.sourceCommit}`)
   if (manifest.sdk?.version !== '0.17.0') fail(`expected SDK 0.17.0, got ${manifest.sdk?.version}`)
   if (manifest.sdk?.sourceCommit !== authoritativeCommit) fail(`expected authoritative SDK commit ${authoritativeCommit}`)
@@ -62,16 +78,45 @@ export function validateReleaseManifest(manifest) {
   }
   if (!targets.has('BareKit')) fail('release is missing BareKit')
   for (const addon of bundle.addonTargets) if (!targets.has(addon)) fail(`release is missing bundle addon ${addon}`)
+  if (manifest.schemaVersion === 2) {
+    const legacyReleaseBase = `https://github.com/Jainakin/qvac-swift/releases/download/${legacyArtifactTag}/`
+    if (expectedBase !== legacyReleaseBase) {
+      fail(`historical schema v2 must use the immutable release base ${legacyReleaseBase}`)
+    }
+  }
 
   const expectedBundleURL = `${expectedBase}worker.mobile.bundle`
   if (bundle.url !== expectedBundleURL) fail(`worker URL must be ${expectedBundleURL}`)
 
-  const notices = manifest.notices
-  if (notices?.assetName !== 'THIRD_PARTY_NOTICES.md') fail('unexpected third-party notices asset name')
-  if (!Number.isSafeInteger(notices?.size) || notices.size <= 0) fail('invalid third-party notices size')
-  if (!hashPattern.test(notices?.sha256 ?? '')) fail('invalid third-party notices SHA-256')
-  const expectedNoticesURL = `${expectedBase}THIRD_PARTY_NOTICES.md`
-  if (notices.url !== expectedNoticesURL) fail(`third-party notices URL must be ${expectedNoticesURL}`)
+  const validateBoundAsset = (asset, assetName, label, maximumSize) => {
+    if (asset?.assetName !== assetName) fail(`unexpected ${label} asset name`)
+    if (!Number.isSafeInteger(asset?.size) || asset.size <= 0) fail(`invalid ${label} size`)
+    if (maximumSize !== undefined && asset.size > maximumSize) fail(`${label} is unexpectedly large`)
+    if (!hashPattern.test(asset?.sha256 ?? '')) fail(`invalid ${label} SHA-256`)
+    const expectedURL = `${expectedBase}${assetName}`
+    if (asset.url !== expectedURL) fail(`${label} URL must be ${expectedURL}`)
+    return asset
+  }
+
+  validateBoundAsset(manifest.notices, 'THIRD_PARTY_NOTICES.md', 'third-party notices')
+  if (manifest.schemaVersion === 3) {
+    validateBoundAsset(
+      manifest.privacyAudit,
+      'privacy-manifest-audit.json',
+      'privacy manifest audit',
+      16 * 1024 * 1024,
+    )
+    const runtimeResolutionInventory = validateBoundAsset(
+      manifest.runtimeResolutionInventory,
+      'runtime-resolution-inventory.json',
+      'runtime resolution inventory',
+      16 * 1024 * 1024,
+    )
+    validateBoundAsset(manifest.sdkProvenance, 'qvac-sdk-provenance.json', 'SDK provenance', 16 * 1024 * 1024)
+    if (runtimeResolutionInventory.sha256 !== manifest.sdk.runtimeInventorySHA256) {
+      fail('runtime resolution inventory checksum does not match sdk.runtimeInventorySHA256')
+    }
+  }
   return manifest
 }
 

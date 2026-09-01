@@ -15,7 +15,7 @@ final class RAGAndPluginSmokeTests: XCTestCase {
     func test_ragIngest_envelope_carries_operation_and_documents() throws {
         var req = RagRequest(operation: "ingest")
         req.modelId = "m"
-        req.documents = [.string("doc1"), .string("doc2")]
+        req.documents = .array([.string("doc1"), .string("doc2")])
         let envelope = QVACRequest.rag(req)
         let obj = try wirePayload(envelope)
         XCTAssertEqual(obj["type"] as? String, "rag")

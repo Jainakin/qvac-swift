@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Compute the minimal native link closure and, after deterministic packaging,
-// produce the immutable schema-v2 release manifest consumed by Package.swift.
+// produce the immutable schema-v3 release manifest consumed by Package.swift.
 
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
@@ -219,7 +219,9 @@ if (mode === 'link-set' || mode === 'development') {
       || !artifactTag || !repository || !sourceCommit) {
     fail('usage: compute-manifest.mjs release <link-set.json> <bundle> <asset-dir> <out.json> --artifact-tag <tag> --repository <owner/repo> --source-commit <sha>')
   }
-  if (!/^artifacts-sdk-0\.17\.0-r[1-9][0-9]*$/.test(artifactTag)) fail(`invalid artifact tag: ${artifactTag}`)
+  if (!/^artifacts-sdk-0\.17\.0-r(?:[2-9]|[1-9][0-9]+)$/.test(artifactTag)) {
+    fail(`invalid hardened artifact tag: ${artifactTag}; schema v3 starts at r2`)
+  }
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) fail(`invalid repository: ${repository}`)
   if (!/^[0-9a-f]{40}$/.test(sourceCommit)) fail(`invalid source commit: ${sourceCommit}`)
 
@@ -235,7 +237,34 @@ if (mode === 'link-set' || mode === 'development') {
   const noticesPath = join(assetsDir, noticesAssetName)
   const noticesMetadata = requireRegularAsset(noticesPath, `staged ${noticesAssetName}`)
 
+  const privacyAuditAssetName = 'privacy-manifest-audit.json'
+  const privacyAuditSourcePath = join(repoRoot, 'tools/release/privacy-manifest-audit.json')
+  const privacyAuditPath = join(assetsDir, privacyAuditAssetName)
+  const privacyAuditMetadata = requireRegularAsset(privacyAuditPath, `staged ${privacyAuditAssetName}`)
+  const privacyAuditSHA256 = sha256(privacyAuditPath)
+  if (privacyAuditSHA256 !== sha256(privacyAuditSourcePath)) {
+    fail(`staged ${privacyAuditAssetName} changed`)
+  }
+
   const inventoryPath = join(repoRoot, 'tools/runtime/resolution-inventory.json')
+  const provenancePath = join(repoRoot, 'tools/provenance/qvac-sdk.lock.json')
+  const runtimeResolutionInventoryAssetName = 'runtime-resolution-inventory.json'
+  const runtimeResolutionInventoryPath = join(assetsDir, runtimeResolutionInventoryAssetName)
+  const runtimeResolutionInventoryMetadata = requireRegularAsset(
+    runtimeResolutionInventoryPath,
+    `staged ${runtimeResolutionInventoryAssetName}`,
+  )
+  const sdkProvenanceAssetName = 'qvac-sdk-provenance.json'
+  const sdkProvenancePath = join(assetsDir, sdkProvenanceAssetName)
+  const sdkProvenanceMetadata = requireRegularAsset(sdkProvenancePath, `staged ${sdkProvenanceAssetName}`)
+  const runtimeInventorySHA256 = sha256(runtimeResolutionInventoryPath)
+  const sdkProvenanceSHA256 = sha256(sdkProvenancePath)
+  if (runtimeInventorySHA256 !== sha256(inventoryPath)) {
+    fail(`staged ${runtimeResolutionInventoryAssetName} changed`)
+  }
+  if (sdkProvenanceSHA256 !== sha256(provenancePath)) {
+    fail(`staged ${sdkProvenanceAssetName} changed`)
+  }
   const artifacts = linkSet.targets.map(target => {
     if (!/^[A-Za-z0-9._@-]+$/.test(target)) fail(`unsafe target: ${target}`)
     const assetName = `${target}.xcframework.zip`
@@ -265,7 +294,7 @@ if (mode === 'link-set' || mode === 'development') {
   })
 
   const manifest = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     mode: 'release',
     artifactTag,
     sourceCommit,
@@ -273,7 +302,7 @@ if (mode === 'link-set' || mode === 'development') {
       version: provenance.sdkVersion,
       sourceCommit: provenance.source.commit,
       npmIntegrity: provenance.npm.integrity,
-      runtimeInventorySHA256: sha256(inventoryPath),
+      runtimeInventorySHA256,
     },
     bundle: {
       assetName: 'worker.mobile.bundle',
@@ -290,6 +319,24 @@ if (mode === 'link-set' || mode === 'development') {
       url: `https://github.com/${repository}/releases/download/${artifactTag}/${noticesAssetName}`,
       size: noticesMetadata.size,
       sha256: sha256(noticesPath),
+    },
+    privacyAudit: {
+      assetName: privacyAuditAssetName,
+      url: `https://github.com/${repository}/releases/download/${artifactTag}/${privacyAuditAssetName}`,
+      size: privacyAuditMetadata.size,
+      sha256: privacyAuditSHA256,
+    },
+    runtimeResolutionInventory: {
+      assetName: runtimeResolutionInventoryAssetName,
+      url: `https://github.com/${repository}/releases/download/${artifactTag}/${runtimeResolutionInventoryAssetName}`,
+      size: runtimeResolutionInventoryMetadata.size,
+      sha256: runtimeInventorySHA256,
+    },
+    sdkProvenance: {
+      assetName: sdkProvenanceAssetName,
+      url: `https://github.com/${repository}/releases/download/${artifactTag}/${sdkProvenanceAssetName}`,
+      size: sdkProvenanceMetadata.size,
+      sha256: sdkProvenanceSHA256,
     },
     artifacts,
   }

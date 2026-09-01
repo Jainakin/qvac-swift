@@ -90,8 +90,11 @@ jobs:
           node tools/release/test-release-source-binding.mjs
           node tools/release/validate-release-version.mjs --self-test
           tools/ci/run-required-suite.sh --self-test
+          tools/ci/run-unit-tests.sh --self-test
           node tools/ci/package-manifest-mode.mjs --self-test
           node tools/release/generate-third-party-notices.mjs --self-test
+          node tools/release/verify-privacy-manifests.mjs --check
+          node tools/release/verify-privacy-manifests.mjs --self-test
 
   unit:
     name: Unit tests · macOS arm64
@@ -119,15 +122,12 @@ jobs:
             "$RUNNER_TEMP/artifacts.development.json" "$RUNNER_TEMP/Package.swift"
           cmp "$RUNNER_TEMP/Package.swift" Package.swift.dev
           node tools/ci/package-manifest-mode.mjs --activate-development
-      - name: Build and test
+      - name: Build and run fail-closed unit-test inventory
         run: |
           test "$(uname -m)" = arm64
           swift package dump-package >/dev/null
           swift build -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
-          swift test \
-            -Xswiftc -warnings-as-errors \
-            -Xswiftc -strict-concurrency=complete \
-            --filter QVACClientUnitTests
+          tools/ci/run-unit-tests.sh
 
   documentation:
     name: DocC · warnings are errors

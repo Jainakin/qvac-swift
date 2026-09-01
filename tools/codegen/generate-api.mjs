@@ -90,6 +90,8 @@ function typedMethod(method) {
       const progressMethod = method.progress ? `
 
     /// Invoke the conditional progress transport declared for \`${method.name}\`.
+    /// This wire-union stream preserves \`QVACResponse.error\`; continue the same
+    /// iterator to EOF to consume a following profiling trailer.
     func ${swiftMethod}Progress(
         _ request: ${requestType},
         rpcOptions: QVACRPCOptions = .init()
@@ -117,13 +119,15 @@ function typedMethod(method) {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<${responseType}> {
         let source = try await wireServerStream(.${requestCase}(request), rpcOptions: rpcOptions)
-        return Self.pullMap(source) { response in
-            guard case .${requestCase}(let value) = response else {
-                throw QVACError.protocolViolation(
-                    "expected ${method.name} response, got \\(response.discriminator)"
-                )
+        return Self.pullMap(source, operation: "${method.name}") { response in
+            switch response {
+            case .${requestCase}(let value):
+                return .emit(value)
+            case .error(let error):
+                return .failThenDrain(Self.retainedWireError(error))
+            default:
+                try Self.rejectUnexpectedResponse(response, expected: "${method.name}")
             }
-            return .emit(value)
         }
     }`
     case 'duplex':
@@ -235,6 +239,10 @@ public extension QVACClient {
     /// Invoke the conditional progress transport of a request/reply method. This is
     /// available only when the manifest declares progress and the request satisfies
     /// its exact \`withProgress\`/operation condition.
+    ///
+    /// This low-level wire-union API yields \`QVACResponse.error\` as a domain
+    /// element. Continue iteration to EOF to consume a following profiling trailer.
+    /// Higher-level progress-run APIs perform that drain and then throw \`QVACError\`.
     func wireProgressStream(
         _ request: QVACRequest,
         rpcOptions: QVACRPCOptions = .init()
@@ -254,6 +262,11 @@ public extension QVACClient {
     }
 
     /// Invoke any contract method declared as a server stream.
+    ///
+    /// This low-level wire-union API yields \`QVACResponse.error\` as a domain
+    /// element. Continue iteration to EOF to consume a following profiling trailer.
+    /// Concrete generated and high-level APIs perform that drain and then throw
+    /// \`QVACError\`.
     func wireServerStream(
         _ request: QVACRequest,
         rpcOptions: QVACRPCOptions = .init()
@@ -263,6 +276,11 @@ public extension QVACClient {
     }
 
     /// Open any contract method declared as a duplex stream.
+    ///
+    /// The returned low-level response union yields \`QVACResponse.error\` as a
+    /// domain element. Continue its response iterator to EOF to consume a following
+    /// profiling trailer. Concrete generated APIs drain that trailer and throw
+    /// \`QVACError\`.
     func wireDuplex(
         _ request: QVACRequest,
         rpcOptions: QVACRPCOptions = .init()

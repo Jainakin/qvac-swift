@@ -97,7 +97,34 @@ public extension QVACClient {
                 }
             ) { response in
                 if let error = response.error {
-                    throw QVACError.server(.transcriptionFailed, message: error)
+                    return .failThenDrain(
+                        QVACError.server(.transcriptionFailed, message: error)
+                    )
+                }
+                if response.done == true {
+                    do {
+                        var terminalEvents: [TranscribeStreamEvent] = []
+                        if let rawSegment = response.segment {
+                            terminalEvents.append(.segment(
+                                try TranscribeSegment(from: rawSegment)
+                            ))
+                        }
+                        if let text = response.text, !text.isEmpty {
+                            terminalEvents.append(.text(text))
+                        }
+                        if let vad = response.vad { terminalEvents.append(.vad(vad)) }
+                        if let endOfTurn = response.endOfTurn {
+                            terminalEvents.append(.endOfTurn(endOfTurn))
+                        }
+                        terminalEvents.append(.done)
+                        return .emitThenDrain(terminalEvents)
+                    } catch let error as QVACError {
+                        return .failThenDrain(error)
+                    } catch {
+                        return .failThenDrain(.protocolViolation(
+                            "transcribeStream returned a malformed terminal frame: \(error)"
+                        ))
+                    }
                 }
                 var events: [TranscribeStreamEvent] = []
                 if let rawSegment = response.segment {
@@ -106,10 +133,6 @@ public extension QVACClient {
                 if let text = response.text, !text.isEmpty { events.append(.text(text)) }
                 if let vad = response.vad { events.append(.vad(vad)) }
                 if let endOfTurn = response.endOfTurn { events.append(.endOfTurn(endOfTurn)) }
-                if response.done == true {
-                    events.append(.done)
-                    return .emitThenDrain(events)
-                }
                 return .emitMany(events)
             }
         }
