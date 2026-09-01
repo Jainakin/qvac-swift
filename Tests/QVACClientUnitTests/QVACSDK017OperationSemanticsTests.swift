@@ -7,6 +7,17 @@ import XCTest
 final class QVACSDK017OperationSemanticsTests: XCTestCase {
     private final class BufferedPayloadProbe: @unchecked Sendable {}
 
+    /// Cross-toolchain weak storage for lifetime assertions. Swift 5.10 requires
+    /// local weak bindings to be `var`, while newer compilers diagnose an
+    /// otherwise-unmutated weak `var` under warnings-as-errors.
+    private final class WeakReference<Object: AnyObject>: @unchecked Sendable {
+        weak var value: Object?
+
+        init(_ value: Object?) {
+            self.value = value
+        }
+    }
+
     private final class BufferedIteratorHolder<Element: Sendable>: @unchecked Sendable {
         private let lock = NSLock()
         private var iterator: QVACBufferedStream<Element>.AsyncIterator?
@@ -4198,16 +4209,16 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
             maximumBufferedBytes: 1_024
         )
         var producerReference: BufferedPayloadProbe? = .init()
-        weak let lifetimeProbe = producerReference
+        let lifetimeProbe = WeakReference(producerReference)
         sink.yield(contentsOf: [try XCTUnwrap(producerReference)], estimatedBytes: 1)
         producerReference = nil
 
         var iterator = stream.makeAsyncIterator()
         var consumed = try await iterator.next()
-        XCTAssertTrue(consumed === lifetimeProbe)
+        XCTAssertTrue(consumed === lifetimeProbe.value)
         consumed = nil
         XCTAssertNil(
-            lifetimeProbe,
+            lifetimeProbe.value,
             "a consumed payload must not remain retained in an unaccounted queue slot"
         )
 
@@ -4416,8 +4427,8 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         )
         var firstReference: BufferedPayloadProbe? = .init()
         var secondReference: BufferedPayloadProbe? = .init()
-        weak let firstLifetime = firstReference
-        weak let secondLifetime = secondReference
+        let firstLifetime = WeakReference(firstReference)
+        let secondLifetime = WeakReference(secondReference)
         sink.yield(
             contentsOf: [
                 try XCTUnwrap(firstReference),
@@ -4430,15 +4441,15 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
 
         let holder = BufferedIteratorHolder(stream)
         var first = try await holder.next()
-        XCTAssertTrue(first === firstLifetime)
+        XCTAssertTrue(first === firstLifetime.value)
         first = nil
-        XCTAssertNotNil(firstLifetime)
-        XCTAssertNotNil(secondLifetime)
+        XCTAssertNotNil(firstLifetime.value)
+        XCTAssertNotNil(secondLifetime.value)
         XCTAssertEqual(sink.retainedBytesForTesting(), 6)
 
         holder.drop()
-        XCTAssertNil(firstLifetime)
-        XCTAssertNil(secondLifetime)
+        XCTAssertNil(firstLifetime.value)
+        XCTAssertNil(secondLifetime.value)
         XCTAssertEqual(sink.retainedBytesForTesting(), 0)
         guard case .terminated = sink.yield(contentsOf: [.init()], estimatedBytes: 1) else {
             return XCTFail("dropping the only iterator must terminate the producer sink")
