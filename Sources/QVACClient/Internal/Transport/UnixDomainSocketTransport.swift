@@ -103,6 +103,41 @@ private final class WorkerOutputCapture: @unchecked Sendable {
     }
 }
 
+/// Cancellation state shared with the one queue worker that owns `poll`/`accept`.
+///
+/// The cancellation handler deliberately does not close `listenFD`: another thread
+/// could reuse that descriptor number before the polling worker wakes, turning a
+/// well-intended wakeup into an unrelated-fd race. Polling in short bounded slices
+/// lets the owner observe cancellation promptly and leaves descriptor cleanup on the
+/// structured `connect` error path.
+private final class UDSAcceptCancellationState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancellationRequested = false
+    private var completionClaimed = false
+
+    func requestCancellation() {
+        lock.withLock {
+            guard !completionClaimed else { return }
+            cancellationRequested = true
+        }
+    }
+
+    func isCancellationRequested() -> Bool {
+        lock.withLock { cancellationRequested }
+    }
+
+    /// Linearize success/failure against task cancellation. The queue worker is the
+    /// only result producer; cancellation merely records intent. A `true` result
+    /// means cancellation won and the worker must resume with `CancellationError`.
+    func claimCompletion() -> Bool {
+        lock.withLock {
+            precondition(!completionClaimed, "UDS accept completion claimed twice")
+            completionClaimed = true
+            return cancellationRequested
+        }
+    }
+}
+
 // MARK: - Configuration
 
 struct UDSTransportConfiguration: Sendable {
@@ -336,6 +371,9 @@ final class UnixDomainSocketTransport: BareTransport, @unchecked Sendable {
                 diagnostics: { outputCapture.diagnosticSuffix() }
             )
             do {
+                // Cancellation can race with the successful accept linearization.
+                // Do not publish an otherwise valid descriptor to a canceled caller.
+                try Task.checkCancellation()
                 try configureConnectedSocket(acceptedFD)
                 clientFD = acceptedFD
             } catch {
@@ -350,6 +388,10 @@ final class UnixDomainSocketTransport: BareTransport, @unchecked Sendable {
             )
             outputCapture.stop()
             transport.cleanupListener()
+            // Prefer structured cancellation when it raced with poll/accept or
+            // bounded subprocess cleanup. The original transport error remains
+            // correct only for a caller that is still interested in the result.
+            try Task.checkCancellation()
             let context = "bare=\(config.bareExecutable.path), worker=\(config.workerScript.path), "
                 + "cwd=\(config.workingDirectory.path), pid=\(proc.processIdentifier)"
             if case SpawnError.workerCouldNotStart(let reason) = error {
@@ -768,54 +810,93 @@ final class UnixDomainSocketTransport: BareTransport, @unchecked Sendable {
         process: Process,
         diagnostics: @escaping @Sendable () -> String
     ) async throws -> Int32 {
+        let cancellation = UDSAcceptCancellationState()
+
         // One worker owns `listenFD` until it resumes the continuation. Checking
         // process exit from that same worker removes the former two-resolver race in
         // which cleanup could close/reuse the descriptor while poll/accept still used it.
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Int32, Error>) in
-            let q = DispatchQueue.global(qos: .userInitiated)
-            q.async {
-                let deadline = ProcessInfo.processInfo.systemUptime + timeout
-                while true {
-                    let remaining = deadline - ProcessInfo.processInfo.systemUptime
-                    if remaining <= 0 {
-                        let reason = "worker did not connect within \(timeout)s; \(diagnostics())"
-                        c.resume(throwing: SpawnError.workerCouldNotStart(reason: reason))
-                        return
-                    }
-                    if !process.isRunning {
-                        let reason = "worker exited code=\(process.terminationStatus) before connect; \(diagnostics())"
-                        c.resume(throwing: SpawnError.workerCouldNotStart(reason: reason))
-                        return
-                    }
-
-                    var pfd = pollfd(fd: listenFD, events: Int16(POLLIN), revents: 0)
-                    let pollMilliseconds = Int32(min(100, max(1, Int(remaining * 1_000))))
-                    let rc = withUnsafeMutablePointer(to: &pfd) { pointer in
-                        poll(pointer, 1, pollMilliseconds)
-                    }
-                    if rc == 0 { continue }
-                    if rc < 0 {
-                        if errno == EINTR { continue }
-                        c.resume(throwing: SpawnError.acceptFailed(errno: errno))
-                        return
-                    }
-
-                    var clientAddr = sockaddr_un()
-                    var len = socklen_t(MemoryLayout<sockaddr_un>.size)
-                    let fd = withUnsafeMutablePointer(to: &clientAddr) { address -> Int32 in
-                        address.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-                            Darwin.accept(listenFD, socketAddress, &len)
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Int32, Error>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+                    while true {
+                        if cancellation.isCancellationRequested() {
+                            _ = cancellation.claimCompletion()
+                            continuation.resume(throwing: CancellationError())
+                            return
                         }
+
+                        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                        if remaining <= 0 {
+                            if cancellation.claimCompletion() {
+                                continuation.resume(throwing: CancellationError())
+                            } else {
+                                let reason = "worker did not connect within \(timeout)s; \(diagnostics())"
+                                continuation.resume(
+                                    throwing: SpawnError.workerCouldNotStart(reason: reason)
+                                )
+                            }
+                            return
+                        }
+                        if !process.isRunning {
+                            if cancellation.claimCompletion() {
+                                continuation.resume(throwing: CancellationError())
+                            } else {
+                                let reason = "worker exited code=\(process.terminationStatus) "
+                                    + "before connect; \(diagnostics())"
+                                continuation.resume(
+                                    throwing: SpawnError.workerCouldNotStart(reason: reason)
+                                )
+                            }
+                            return
+                        }
+
+                        var pfd = pollfd(fd: listenFD, events: Int16(POLLIN), revents: 0)
+                        // Cancellation is observed within one 25 ms slice without
+                        // closing the descriptor from a competing thread.
+                        let pollMilliseconds = Int32(min(25, max(1, Int(remaining * 1_000))))
+                        let rc = withUnsafeMutablePointer(to: &pfd) { pointer in
+                            poll(pointer, 1, pollMilliseconds)
+                        }
+                        if rc == 0 { continue }
+                        if rc < 0 {
+                            if errno == EINTR { continue }
+                            if cancellation.claimCompletion() {
+                                continuation.resume(throwing: CancellationError())
+                            } else {
+                                continuation.resume(
+                                    throwing: SpawnError.acceptFailed(errno: errno)
+                                )
+                            }
+                            return
+                        }
+
+                        var clientAddr = sockaddr_un()
+                        var len = socklen_t(MemoryLayout<sockaddr_un>.size)
+                        let fd = withUnsafeMutablePointer(to: &clientAddr) { address -> Int32 in
+                            address.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                                socketAddress in
+                                Darwin.accept(listenFD, socketAddress, &len)
+                            }
+                        }
+                        if fd < 0, errno == EINTR { continue }
+
+                        if cancellation.claimCompletion() {
+                            if fd >= 0 { _ = Darwin.close(fd) }
+                            continuation.resume(throwing: CancellationError())
+                        } else if fd < 0 {
+                            continuation.resume(throwing: SpawnError.acceptFailed(errno: errno))
+                        } else {
+                            continuation.resume(returning: fd)
+                        }
+                        return
                     }
-                    if fd < 0 {
-                        if errno == EINTR { continue }
-                        c.resume(throwing: SpawnError.acceptFailed(errno: errno))
-                    } else {
-                        c.resume(returning: fd)
-                    }
-                    return
                 }
             }
+        } onCancel: {
+            cancellation.requestCancellation()
         }
     }
 

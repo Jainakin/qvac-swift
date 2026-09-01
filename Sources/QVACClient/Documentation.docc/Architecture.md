@@ -28,6 +28,28 @@ client config plus runtime context. The handshake has its own finite deadline an
 cancellation-safe pending state. A worker that crashes, starts in direct mode, or
 never replies cannot leave initialization waiting forever.
 
+Unexpected EOF, an inbound channel error, or an outbound write failure makes that
+transport generation terminal. Every operation already assigned to it fails once
+and is never replayed. The next new API call starts one shared reconnect attempt,
+waits for the old transport to finish closing, creates a fresh worker, and repeats
+`__init_config`; concurrent callers join the same attempt. A failed reconnect is
+fully closed and a later call may retry. A successful reconnect deliberately does
+not send any waiting application request: every caller that crossed the boundary
+receives ``QVACError/connectionReset``. Because the replacement is a new worker,
+loaded models and other in-memory session state are intentionally **not** restored.
+Each caller waits cancellation-safely without canceling the shared reconnect. A
+canceled sole waiter cannot install the replacement; the next non-canceled caller
+finishes the attempt and receives the reset signal. Reload the required state,
+then retry on the ready generation. Explicit `close()` remains terminal and
+disables reconnect.
+
+macOS process exit and `SIGKILL` are observed through socket EOF. iOS generation
+replacement is available when BareIPC exposes zero-byte EOF or a write failure,
+but it is not a general worklet-crash detector: the pinned BareKit runtime can
+leave host IPC descriptors open after a worklet exits itself (upstream BareKit
+issue 83). In that case per-request deadlines bound the caller's wait, and the
+application should close and recreate the client if it suspects the worklet ended.
+
 `close()` is serialized through one shared task. Concurrent callers join the same
 cleanup. macOS shuts down the socket, drains transport work, and waits for the child
 process. iOS first sends the SDK's bounded `__shutdown__` command so addon static
@@ -92,6 +114,11 @@ When a timeout or task cancellation wins, pending continuations are resumed exac
 once and removed, the correct bare-rpc stream directions are closed/destroyed, and
 blocked transport writes force connection teardown instead of leaking tasks behind
 the socket's serial writer.
+
+Rich duplex adapters eagerly consume the metadata-only record and response EOF
+before exposing a logical terminal event. That final drain has its own five-second
+ceiling, so a malformed worker that sends `done` without a trailer or stream end
+cannot turn a normal `for try await` loop into an unbounded wait.
 
 ## Error boundary
 

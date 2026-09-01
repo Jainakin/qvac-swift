@@ -23,18 +23,27 @@ permissions:
   attestations: read
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
-  group: artifact-release-${{ inputs.revision }}
+  # Serialize all revisions so two concurrently dispatched runs cannot publish
+  # rN values out of order after observing the same previous maximum.
+  group: artifact-release
   cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.22.0
@@ -56,6 +65,15 @@ jobs:
           fi
           ARTIFACT_TAG="artifacts-sdk-0.17.0-r$INPUT_REVISION"
           echo "ARTIFACT_TAG=$ARTIFACT_TAG" >> "$GITHUB_ENV"
+          MAX_ARTIFACT_REVISION="$(git ls-remote --tags --refs origin \
+            'refs/tags/artifacts-sdk-0.17.0-r*' | awk '
+              $2 ~ /^refs\/tags\/artifacts-sdk-0\.17\.0-r[1-9][0-9]*$/ {
+                value = $2
+                sub(/^refs\/tags\/artifacts-sdk-0\.17\.0-r/, "", value)
+                if ((value + 0) > maximum) maximum = value + 0
+              }
+              END { print maximum + 0 }
+            ')"
           REMOTE_REFS="$(git ls-remote --tags origin \
             "refs/tags/$ARTIFACT_TAG" "refs/tags/$ARTIFACT_TAG^{}")"
           TAG_TARGET="$(printf '%s\n' "$REMOTE_REFS" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')"
@@ -65,6 +83,11 @@ jobs:
           RELEASE_EXISTS=false
           if gh release view "$ARTIFACT_TAG" >/dev/null 2>&1; then
             RELEASE_EXISTS=true
+          fi
+          if [ -z "$TAG_TARGET" ] && [ "$RELEASE_EXISTS" != true ] && \
+             [ "$INPUT_REVISION" -le "$MAX_ARTIFACT_REVISION" ]; then
+            echo "::error::New artifact revision r$INPUT_REVISION must be greater than published r$MAX_ARTIFACT_REVISION"
+            exit 1
           fi
 
           if [ "$INPUT_PUBLISH" != "true" ]; then
@@ -182,6 +205,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ "$ARTIFACT_RELEASE_EXISTS" != true ]; then
+            CURRENT_MAX_REVISION="$(git ls-remote --tags --refs origin \
+              'refs/tags/artifacts-sdk-0.17.0-r*' | awk '
+                $2 ~ /^refs\/tags\/artifacts-sdk-0\.17\.0-r[1-9][0-9]*$/ {
+                  value = $2
+                  sub(/^refs\/tags\/artifacts-sdk-0\.17\.0-r/, "", value)
+                  if ((value + 0) > maximum) maximum = value + 0
+                }
+                END { print maximum + 0 }
+              ')"
+            REQUESTED_REVISION="${ARTIFACT_TAG##*-r}"
+            if [ "$REQUESTED_REVISION" -le "$CURRENT_MAX_REVISION" ] || \
+               gh release view "$ARTIFACT_TAG" >/dev/null 2>&1; then
+              echo "::error::Artifact publication state changed during verification; choose a new revision"
+              echo "requested=r$REQUESTED_REVISION current-max=r$CURRENT_MAX_REVISION"
+              exit 1
+            fi
+            REMOTE_MAIN="$(git ls-remote origin refs/heads/main | awk 'NF == 2 { print $1; exit }')"
+            if [ "$REMOTE_MAIN" != "$GITHUB_SHA" ]; then
+              echo "::error::main advanced during artifact verification; dispatch a new unused revision from the current commit"
+              echo "artifact-source=$GITHUB_SHA remote-main=$REMOTE_MAIN"
+              exit 1
+            fi
             gh release create "$ARTIFACT_TAG" tools/runtime/.build/release-assets/* \
               --target "$GITHUB_SHA" \
               --latest=false \
@@ -230,7 +275,7 @@ jobs:
             fi
           done
           if [ "$PUBLICATION_VERIFIED" != true ]; then
-            echo "::error::Could not verify the complete immutable $ARTIFACT_TAG publication within 60 seconds; rerun this revision to resume its non-mutating audit"
+            echo "::error::Could not verify the complete immutable $ARTIFACT_TAG publication within 60 seconds; rerun this same workflow run to resume its non-mutating audit"
             exit 1
           fi
           echo "Verified immutable release, attestation, tag/source binding, and every asset for $ARTIFACT_TAG"

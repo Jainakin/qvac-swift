@@ -12,16 +12,21 @@ The release system intentionally has two manifest modes:
   `tools/runtime/link-ios-artifacts.sh`.
 - A checksum-bound `artifact-manifest.json` is published with the GitHub artifact
   release. A release `Package.swift` is generated from that schema; every binary
-  target then has the exact release URL and SHA-256 checksum. The external
-  manifest is bound to the final Swift source commit and is not copied back into
-  that commit (which would change the commit identity).
+  target then has the exact release URL and SHA-256 checksum. The published
+  manifest is bound to the final Swift source commit; it remains a release asset
+  rather than a second committed source of truth.
 
-Until an unpublished artifact candidate has reproduced all final bytes, the
-canonical manifest remains the exact development manifest. Committing the URL
-manifest is a short, explicit release-candidate state: no source tag is allowed,
-and the artifact publication workflow must reproduce and publish those exact
-future URLs before the source-release workflow can run. Neither workflow invents
-URLs or reuses old 0.10 assets.
+Between releases, canonical `Package.swift` keeps the latest published 0.17 URL
+manifest, while CI activates `Package.swift.dev` only inside disposable checkouts
+for local-graph jobs. Committing a newly generated URL manifest for an unused
+`rN` creates a short, explicit candidate state. In that state, the iOS 17 CI gate
+records a local-graph worker handshake because the future URLs correctly return
+404; it never calls that candidate result URL-installation evidence. Artifact
+publication is then allowed only from the same green commit. The source-release
+workflow performs the mandatory anonymous public-URL iOS 17 handshake after the
+artifacts exist and before it creates any SemVer tag. This ordering removes a
+publish-before-test cycle without weakening the public-consumer gate. Neither
+workflow invents URLs or reuses old 0.10 assets.
 
 GitHub's repository-level **immutable releases** setting must be enabled before
 publishing any new artifact or source release. Choose the next unused artifact
@@ -108,17 +113,21 @@ not the new final commit.
 
 Push the URL-manifest commit and require the complete `CI` workflow to pass for
 that new exact SHA before enabling publication. A green run for the earlier
-development-manifest candidate is useful evidence, but it cannot authorize the
-URL-manifest commit because the commit identity changed.
+commit is useful evidence, but it cannot authorize the URL-manifest commit because
+the commit identity changed.
 
-The full CI workflow accepts exactly two canonical manifest states: the generated
-development manifest, or the strictly generated URL manifest for one immutable
-SDK 0.17 artifact tag. For a URL-manifest commit whose artifacts do not exist yet,
-CI first validates its target inventory, repository, tag, URLs, checksums, and
-generator formatting, then copies the verified `Package.swift.dev` only inside
-the ephemeral runner for compilation and tests. Artifact publication and source
-release still verify the canonical URL manifest and every remote byte; the local
-CI overlay is never committed or treated as release evidence.
+The repository validator recognizes the generated development manifest and the
+strictly generated URL manifest for one immutable SDK 0.17 artifact tag. Pushed
+`main` commits must keep the latter so the repository remains URL-installable;
+local-graph CI jobs activate the former only after verifying it in their
+disposable checkout. For a URL-manifest commit whose artifact release returns an
+authenticated GitHub API 404, CI validates its target inventory, repository, tag,
+URLs, checksums, and generator formatting, then runs its exact iOS 17 worker
+handshake against the verified local graph. Any API or non-404 response error
+fails closed. If the artifact release already exists, the same job instead
+resolves the pushed Git revision anonymously, verifies all 38 remote binaries,
+and runs the worker handshake. The candidate overlay is never committed or
+represented as URL evidence.
 
 ## 3. Publish artifacts from the final source commit
 
@@ -146,11 +155,20 @@ also verifies that the artifact tag, GitHub Release target, and manifest all
 resolve to the exact final source commit. If anything changes, use a new `rN`;
 never replace an existing release.
 
+Artifact publication is an irreversible producer boundary, not the final package
+acceptance gate. Do not create a source tag yet. The next workflow independently
+downloads the public artifacts and exercises the package URL on exact iOS 17
+before making the source version visible.
+
 Publication is retry-safe across GitHub's irreversible boundary. If a transient
 API or attestation failure occurs after an immutable release was published,
-rerunning the same revision rebuilds the candidate and resumes a read-only audit
-only when the existing tag, release target, source commit, native immutable state,
-attestation, and every asset all match. Partial or mismatched states fail closed.
+rerun the original workflow run for that revision; it rebuilds the candidate and
+resumes a read-only audit only when the existing tag, release target, source
+commit, native immutable state, attestation, and every asset all match. A new
+manual dispatch always resolves its selected `main`, so do not use a new dispatch
+to audit an older revision after `main` advances. The following tag-anchored Source
+Release workflow independently repeats the immutable attestation and byte checks.
+Partial or mismatched states fail closed.
 
 The following command is a read-only independent check of the published release:
 
@@ -168,20 +186,37 @@ embedded worker, and parses the package with SwiftPM. It never edits repository 
 
 ## 4. Verify first, then create a new source version
 
-Do **not** create or push a SemVer tag by hand. Dispatch the **Source Release**
-workflow from the exact verified `main` commit with:
+Do **not** create or push a SemVer tag by hand. After the immutable artifact
+release exists, dispatch the **Source Release** workflow with its Git ref selector
+set to the exact published artifact tag (for example,
+`artifacts-sdk-0.17.0-r2`) and with:
 
 - `version`: the next unused SemVer, without a `v` prefix (for example, `0.1.1`)
 - `artifact_tag`: the published artifact revision used by canonical
   `Package.swift` (for example, `artifacts-sdk-0.17.0-r2`)
 
-Before any source tag exists, the workflow verifies the artifact release
-attestation with `gh release verify`, binds the published artifact manifest and
-artifact tag to `GITHUB_SHA`, rejects a path-based/stale package, downloads and
-hashes every remote artifact, builds a clean external consumer from the public Git
-URL at that exact revision, and runs unit tests. It creates and pushes the SemVer
-tag and GitHub source release only after every gate passes, then verifies the
-source release attestation with `gh release verify`. A retry may use an
+The equivalent command is explicit about the immutable ref:
+
+```bash
+gh workflow run release.yml \
+  --ref artifacts-sdk-0.17.0-rN \
+  -f version=X.Y.Z \
+  -f artifact_tag=artifacts-sdk-0.17.0-rN
+```
+
+The artifact tag is the immutable release anchor, so ordinary pushes to `main`
+during this verification cannot strand an already-published artifact revision.
+Before any source tag exists, the workflow verifies that its selected Git ref and
+the artifact release tag both resolve to `GITHUB_SHA`, verifies the artifact
+release attestation with `gh release verify`, binds the published artifact manifest
+to that commit, rejects a path-based/stale package, downloads and hashes every
+remote artifact, builds a clean external consumer from the public Git URL at that
+exact revision, runs unit tests, and performs a fresh anonymous install plus
+`__init_config`, heartbeat, and close on an exact iOS 17.0 Simulator.
+It creates the annotated SemVer tag through the GitHub API and creates the GitHub
+source release only after every gate passes, then verifies the source release
+attestation with `gh release verify`. Stable versions become latest; valid SemVer
+prereleases remain prereleases and never become latest. A retry may use an
 already-created tag only when it resolves to the same verified commit; tags are
 never moved or force-updated. Pull-request CI separately requires
 strict-concurrency compilation with warnings as errors, DocC with warnings as

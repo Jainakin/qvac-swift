@@ -7,7 +7,16 @@ import XCTest
 @testable import QVACClient
 
 #if canImport(Darwin)
+import Darwin
+
 final class QVACClientIntegrationTests: XCTestCase {
+
+    private struct WorkerPIDLookupFailed: Error, CustomStringConvertible {
+        let wrapperPID: Int32
+        var description: String {
+            "could not find native Bare worker child of launcher pid \(wrapperPID)"
+        }
+    }
 
     private static let nodeModulesDir: URL? = {
         if let p = ProcessInfo.processInfo.environment["QVAC_NODE_MODULES"] { return URL(fileURLWithPath: p) }
@@ -60,6 +69,51 @@ final class QVACClientIntegrationTests: XCTestCase {
         )
     }
 
+    /// `bare-runtime/bin/bare` is a Node launcher that owns the native Bare
+    /// executable as its direct child. Resolve that child so crash recovery is
+    /// tested by killing the process that actually owns the worker VM/socket,
+    /// not merely its launcher.
+    private func nativeWorkerPID(
+        for transport: UnixDomainSocketTransport,
+        timeout: Duration = .seconds(2)
+    ) async throws -> Int32 {
+        let wrapperPID = transport.__testWorkerPID()
+        guard wrapperPID > 0 else { throw WorkerPIDLookupFailed(wrapperPID: wrapperPID) }
+        if let bareBin = Self.bareBin,
+           let executable = try? FileHandle(forReadingFrom: bareBin) {
+            defer { try? executable.close() }
+            let prefix = try executable.read(upToCount: 2)
+            if prefix != Data("#!".utf8) {
+                // A caller supplied the native Mach-O directly, so the Process
+                // owned by the transport is already the actual worker.
+                return wrapperPID
+            }
+        }
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            let lookup = Process()
+            lookup.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+            lookup.arguments = ["-P", String(wrapperPID)]
+            let stdout = Pipe()
+            lookup.standardOutput = stdout
+            lookup.standardError = Pipe()
+            try lookup.run()
+            lookup.waitUntilExit()
+            if lookup.terminationStatus == 0,
+               let data = try stdout.fileHandleForReading.readToEnd(),
+               let output = String(data: data, encoding: .utf8),
+               let pid = output.split(whereSeparator: \.isWhitespace)
+                .compactMap({ Int32($0) }).first,
+               pid > 0 {
+                return pid
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw WorkerPIDLookupFailed(wrapperPID: wrapperPID)
+    }
+
     // MARK: - heartbeat
 
     func test_heartbeat_returns_worker_uptime() async throws {
@@ -69,6 +123,64 @@ final class QVACClientIntegrationTests: XCTestCase {
             rpcOptions: .init(timeout: .seconds(30))
         )
         XCTAssertGreaterThan(hb.number, 0)
+    }
+
+    func test_transport_end_reports_state_loss_then_accepts_retry_on_fresh_worker() async throws {
+        let client = try await makeClient()
+        addTeardownBlock { await client.close() }
+        _ = try await client.heartbeat(
+            rpcOptions: .init(timeout: .seconds(30))
+        )
+
+        let initialRPC = await client.rpc
+        let initialTransportValue = await client.transport
+        let initialTransport = try XCTUnwrap(
+            initialTransportValue as? UnixDomainSocketTransport
+        )
+        let initialPID = try await nativeWorkerPID(for: initialTransport)
+        XCTAssertEqual(
+            Darwin.kill(initialPID, SIGKILL),
+            0,
+            "the test must terminate the live Bare worker, not close the client transport"
+        )
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(5))
+        while clock.now < deadline {
+            if !(await initialRPC.isOpen()) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let initialGenerationRemainedOpen = await initialRPC.isOpen()
+        XCTAssertFalse(initialGenerationRemainedOpen)
+
+        do {
+            _ = try await client.heartbeat(
+                rpcOptions: .init(timeout: .seconds(30))
+            )
+            XCTFail("the first call crossing reconnect must report lost worker state")
+        } catch let error as QVACError {
+            guard case .connectionReset = error else {
+                return XCTFail("expected connectionReset, got \(error)")
+            }
+        }
+        let recoveredGeneration = await client.__testConnectionGeneration()
+        let replacementTransportValue = await client.transport
+        let replacementTransport = try XCTUnwrap(
+            replacementTransportValue as? UnixDomainSocketTransport
+        )
+        let replacementPID = try await nativeWorkerPID(for: replacementTransport)
+        let heartbeat = try await client.heartbeat(
+            rpcOptions: .init(timeout: .seconds(30))
+        )
+        XCTAssertGreaterThan(heartbeat.number, 0)
+        XCTAssertEqual(recoveredGeneration, 2)
+        XCTAssertGreaterThan(replacementPID, 0)
+        XCTAssertNotEqual(
+            replacementPID,
+            initialPID,
+            "reconnect must own a newly spawned worker process"
+        )
+        XCTAssertEqual(Darwin.kill(replacementPID, 0), 0)
     }
 
     // MARK: - cancel for nonexistent operation throws typed error

@@ -1242,7 +1242,8 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
             metadata: true,
             windowTimesteps: 128,
             hopTimesteps: 64,
-            emit: "delta"
+            emit: "delta",
+            rpcOptions: .init(timeout: nil)
         )
         var frames = try await Self.waitForFrames(3, on: transport)
         let (id, request) = try Self.duplexRequest(in: frames)
@@ -1296,7 +1297,8 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
             emitVadEvents: true,
             endOfTurnSilenceMs: 400,
             vadRunIntervalMs: 50,
-            parakeetStreamingConfig: .object(["leftContext": .number(4)])
+            parakeetStreamingConfig: .object(["leftContext": .number(4)]),
+            rpcOptions: .init(timeout: nil)
         )
         let frames = try await Self.waitForFrames(3, on: transport)
         let (id, request) = try Self.duplexRequest(in: frames)
@@ -1338,7 +1340,8 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
             modelId: "llm",
             history: [.user("weather")],
             tools: [.object(["name": .string("forecast")])],
-            maxToolTurns: 4
+            maxToolTurns: 4,
+            rpcOptions: .init(timeout: nil)
         )
         var frames = try await Self.waitForFrames(3, on: transport)
         let (id, request) = try Self.duplexRequest(in: frames)
@@ -1404,13 +1407,173 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         await client.close()
     }
 
+    func test_completion_orchestration_drains_profiling_trailer_after_done() async throws {
+        let transport = MockTransport()
+        let profiling = ProfilingCounter()
+        let client = QVACClient(
+            testing: transport,
+            profilingMetadataHandler: { _ in profiling.increment() }
+        )
+        let session = try await client.completionOrchestrate(
+            modelId: "llm",
+            history: [.user("hello")],
+            tools: [],
+            rpcOptions: .init(timeout: nil, profiling: .init(
+                enabled: true,
+                includeServerBreakdown: true
+            ))
+        )
+        let frames = try await Self.waitForFrames(3, on: transport)
+        let (id, _) = try Self.duplexRequest(in: frames)
+        try await session.end()
+        await Self.feedDuplex(
+            id: id,
+            records: [
+                #"{"type":"completionOrchestrate","done":true}"#,
+                #"{"__profilingTrailer":true,"__profiling":{"id":"duplex-profile"}}"#,
+            ],
+            to: transport,
+            open: true,
+            end: true
+        )
+
+        var iterator = session.events.makeAsyncIterator()
+        let terminalEvent = try await iterator.next()
+        XCTAssertEqual(terminalEvent, .done(stopReason: nil))
+        XCTAssertEqual(
+            profiling.value(),
+            1,
+            "the trailer must be captured before exposing the terminal event"
+        )
+        let end = try await iterator.next()
+        XCTAssertNil(end)
+        XCTAssertEqual(profiling.value(), 1)
+        await client.close()
+    }
+
+    func test_terminal_trailer_drain_has_a_finite_deadline() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let request = CompletionOrchestrateRequest(
+            history: [],
+            modelId: "llm",
+            stream: true,
+            tools: []
+        )
+        let raw: QVACDuplexSession<CompletionOrchestrateResponse> = try await client.duplexTyped(
+            .completionOrchestrate(request),
+            rpcOptions: .init(timeout: nil)
+        )
+        let frames = try await Self.waitForFrames(3, on: transport)
+        let (id, _) = try Self.duplexRequest(in: frames)
+        try await raw.end()
+        await Self.feedDuplex(
+            id: id,
+            records: [#"{"type":"completionOrchestrate","done":true}"#],
+            to: transport,
+            open: true,
+            end: false
+        )
+
+        let mapped: QVACResponseStream<Bool> = QVACClient.pullMap(
+            raw.responses,
+            operation: "completionOrchestrate",
+            onTermination: { raw.destroy() },
+            terminalDrainTimeout: .milliseconds(50)
+        ) { frame in
+            frame.done == true ? .emitThenDrain([true]) : .skip
+        }
+        var iterator = mapped.makeAsyncIterator()
+        do {
+            _ = try await iterator.next()
+            XCTFail("done without a profiling trailer or stream end must not hang")
+        } catch let error as QVACError {
+            guard case .requestTimedOut(let operation, let timeout) = error else {
+                return XCTFail("expected requestTimedOut, got \(error)")
+            }
+            XCTAssertEqual(operation, "completionOrchestrate")
+            XCTAssertEqual(timeout, .milliseconds(50))
+        }
+        try await Self.waitForNoInFlight(await client.rpc)
+        await client.close()
+    }
+
+    func test_tts_duplex_done_without_audio_still_drains_profiling_trailer() async throws {
+        let transport = MockTransport()
+        let profiling = ProfilingCounter()
+        let client = QVACClient(
+            testing: transport,
+            profilingMetadataHandler: { _ in profiling.increment() }
+        )
+        let session = try await client.textToSpeechStream(
+            modelId: "tts-model",
+            rpcOptions: .init(timeout: nil, profiling: .init(
+                enabled: true,
+                includeServerBreakdown: true
+            ))
+        )
+        let frames = try await Self.waitForFrames(3, on: transport)
+        let (id, _) = try Self.duplexRequest(in: frames)
+        try await session.end()
+        await Self.feedDuplex(
+            id: id,
+            records: [
+                #"{"type":"textToSpeechStream","buffer":[],"done":true}"#,
+                #"{"__profilingTrailer":true,"__profiling":{"id":"tts-profile"}}"#,
+            ],
+            to: transport,
+            open: true,
+            end: true
+        )
+
+        var chunks: [QVACClient.TtsStreamChunk] = []
+        for try await chunk in session.chunks { chunks.append(chunk) }
+        XCTAssertTrue(chunks.isEmpty)
+        XCTAssertEqual(profiling.value(), 1)
+        await client.close()
+    }
+
+    func test_completion_orchestration_rejects_domain_frame_after_done() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let session = try await client.completionOrchestrate(
+            modelId: "llm",
+            history: [.user("hello")],
+            tools: [],
+            rpcOptions: .init(timeout: nil)
+        )
+        let frames = try await Self.waitForFrames(3, on: transport)
+        let (id, _) = try Self.duplexRequest(in: frames)
+        try await session.end()
+        await Self.feedDuplex(
+            id: id,
+            records: [
+                #"{"type":"completionOrchestrate","done":true}"#,
+                #"{"type":"completionOrchestrate","turn":2,"events":[]}"#,
+            ],
+            to: transport,
+            open: true,
+            end: true
+        )
+
+        var iterator = session.events.makeAsyncIterator()
+        do {
+            _ = try await iterator.next()
+            XCTFail("a domain response after done must fail before terminal exposure")
+        } catch {
+            assertProtocolViolation(error)
+        }
+        await client.close()
+    }
+
     func test_completion_orchestration_rejects_remote_end_without_done() async throws {
         let transport = MockTransport()
         let client = QVACClient(testing: transport)
         let session = try await client.completionOrchestrate(
             modelId: "llm",
             history: [.user("hello")],
-            tools: []
+            tools: [],
+            rpcOptions: .init(timeout: nil)
         )
         let frames = try await Self.waitForFrames(3, on: transport)
         let (id, _) = try Self.duplexRequest(in: frames)
@@ -1574,7 +1737,7 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         let duplex = try await client.wireBciTranscribeStream(.init(
             modelId: "bci",
             requestId: "request-17"
-        ))
+        ), rpcOptions: .init(timeout: nil))
         var frames = try await Self.waitForFrames(3, on: transport)
         let (id, wire) = try Self.duplexRequest(in: frames)
         XCTAssertEqual(wire["requestId"] as? String, "request-17")
@@ -2117,7 +2280,8 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         let session = try await client.completionOrchestrate(
             modelId: "llm",
             history: [.user("weather")],
-            tools: []
+            tools: [],
+            rpcOptions: .init(timeout: nil)
         )
         _ = try await Self.waitForFrames(3, on: transport)
         let consumer = Task { for try await _ in session.events {} }
@@ -2142,7 +2306,10 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
     func test_duplex_outer_event_cancellation_destroys_both_halves_without_leak() async throws {
         let transport = MockTransport()
         let client = QVACClient(testing: transport)
-        let session = try await client.bciTranscribeStream(modelId: "bci-model")
+        let session = try await client.bciTranscribeStream(
+            modelId: "bci-model",
+            rpcOptions: .init(timeout: nil)
+        )
         _ = try await Self.waitForFrames(3, on: transport)
         let consumer = Task {
             for try await _ in session.events {}

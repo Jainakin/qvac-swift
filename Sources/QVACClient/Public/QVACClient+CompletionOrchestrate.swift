@@ -72,6 +72,7 @@ public extension QVACClient {
             let rawSession = raw
             return QVACClient.pullMap(
                 responses,
+                operation: "completionOrchestrate",
                 onTermination: { rawSession.destroy() },
                 endOfSourceError: {
                     QVACError.client(
@@ -94,7 +95,7 @@ public extension QVACClient {
                 }
                 if frame.done == true {
                     mapped.append(.done(stopReason: frame.stopReason))
-                    return .emitThenFinish(mapped)
+                    return .emitThenDrain(mapped)
                 }
                 return .emitMany(mapped)
             }

@@ -20,6 +20,14 @@ release immutability is enabled for subsequent publications. Every new artifact
 revision and source version remains additive: existing tags and assets are never
 moved or replaced.
 
+The current grant-handoff source contains additional post-`v0.1.0` review
+hardening: a finite default request deadline, generation-safe worker reconnect,
+rich-duplex profiling-trailer draining, stronger real RAG/profiling coverage, and
+an exact-revision iOS 17 URL-consumer runtime gate. It is intentionally not tagged
+or submitted to Swift Package Index here. The authorized grant publisher should
+create the next additive artifact revision and SemVer release from a fully green
+commit by following `docs/distribution.md`.
+
 For each release, canonical `Package.swift` is the public URL-backed manifest for
 that release's artifact revision; `Package.swift.dev` retains the exact local
 development graph.
@@ -63,10 +71,12 @@ Commit the application's `Package.resolved`. For deployments that require an
 explicit source-version pin, use `exact:` with the desired reviewed tag from the
 [`Releases`](https://github.com/Jainakin/qvac-swift/releases) page.
 
-Swift Package Index submission, indexing/hosted-documentation verification, and a
-current SDK 0.17.0 run of the SwiftUI example on a physical iPhone remain external
-submission evidence. They do not affect the integrity or URL installability of
-the published package.
+The repository-side Swift Package Index work is the publication guidance and CI
+configuration supplied by `.spi.yml` and `docs/swift-package-index.md`. Actual
+Index publication is intentionally reserved for the authorized publisher. A
+current SDK 0.17.0 run of the SwiftUI example on a physical iPhone also remains
+external grant evidence; neither external action affects package integrity or URL
+installability.
 
 ## Exact upstream identity
 
@@ -184,14 +194,32 @@ try await client.cancel(
 )
 ```
 
-`QVACRPCOptions()` deliberately leaves `timeout` unset, matching the executable
-0.17 JavaScript contract. Production applications should set an operation-specific
-deadline based on model size and expected output. Timeouts and task cancellation
-tear down pending RPC state and stream directions; they do not leave a permanently
-blocked request in the client multiplexer.
+`QVACRPCOptions()` applies a production-safe 60-second deadline, so an ordinary
+stuck request cannot hang forever. Production applications should still choose an
+operation-specific deadline based on model size and expected output. Pass
+`timeout: nil` only for an intentionally unbounded operation with its own external
+watchdog. Timeouts and task cancellation tear down pending RPC state and stream
+directions; they do not leave a permanently blocked request in the client
+multiplexer.
+
+If a worker transport dies, the next call single-flights a fresh worker and
+`__init_config`, but it is not silently sent to an empty runtime. Calls that cross
+that boundary receive `QVACError.connectionReset`; reload model/session state and
+retry on the ready connection. Failed in-flight requests are never replayed.
+
+On macOS, worker exit is transport-observable and live `SIGKILL` recovery is part
+of the test suite. On iOS, reconnect starts after BareIPC reports a zero-byte EOF or
+a write failure. The pinned BareKit runtime can keep the host IPC descriptors open
+when a worklet exits itself ([BareKit #83](https://github.com/holepunchto/bare-kit/issues/83)),
+so that specific exit is not observable as EOF. The finite request deadline still
+prevents an indefinite API wait; if an iOS timeout coincides with a suspected
+worklet exit, close and recreate `QVACClient` rather than assuming automatic state
+recovery.
 
 Profiling can be enabled per call. Metadata-only profiling trailer records are
-consumed separately and never decoded as ordinary response types:
+consumed separately and never decoded as ordinary response types. Rich duplex
+streams perform a bounded, eager terminal drain, so profiling is captured before a
+terminal event is exposed even if the consumer then leaves the loop:
 
 ```swift
 let options = QVACRPCOptions(
@@ -272,17 +300,38 @@ progress view is observational.
 
 ## Reproducible development setup
 
-The checked-in development manifest points at generated local xcframeworks. From a
-clean clone, select Node 22.22.0 and materialize the exact graph before building:
+Canonical `Package.swift` deliberately remains the checksum-pinned public URL
+manifest, so a normal clean clone exercises the same install path as a consumer:
+
+```bash
+node tools/ci/package-manifest-mode.mjs --check
+swift package dump-package >/dev/null
+swift build
+swift test
+```
+
+`Package.swift.dev` describes the generated local XCFramework graph. To reproduce
+that graph without changing the canonical manifest, select Node 22.22.0 and run:
 
 ```bash
 tools/codegen/bootstrap.sh
 tools/codegen/run.sh --generate-only
 tools/runtime/link-ios-artifacts.sh
-swift package dump-package >/dev/null
-swift build
-swift test
+node tools/release/compute-manifest.mjs development \
+  tools/runtime/.build/artifacts \
+  Sources/QVACClient/Resources/worker.mobile.bundle \
+  /tmp/qvac-artifacts.development.json
+cmp /tmp/qvac-artifacts.development.json \
+  tools/release/artifacts.development.json
+node tools/release/generate-package-manifest.mjs \
+  /tmp/qvac-artifacts.development.json /tmp/qvac-Package.swift.dev
+cmp /tmp/qvac-Package.swift.dev Package.swift.dev
 ```
+
+CI activates `Package.swift.dev` only in a disposable checkout for local-graph
+builds. If you intentionally need that mode in a disposable local checkout, run
+`CI=true node tools/ci/package-manifest-mode.mjs --activate-development` before
+SwiftPM; do not commit the resulting `Package.swift` replacement.
 
 The committed bundle is reproduced twice in distinct work roots and must be
 byte-identical:

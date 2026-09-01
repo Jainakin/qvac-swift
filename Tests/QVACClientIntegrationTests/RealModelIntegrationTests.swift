@@ -17,6 +17,23 @@ import XCTest
 #if canImport(Darwin)
 final class RealModelIntegrationTests: XCTestCase {
 
+    private final class ProfilingCapture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var metadata: [QVACProfilingMetadata] = []
+
+        func append(_ value: QVACProfilingMetadata) {
+            lock.lock()
+            metadata.append(value)
+            lock.unlock()
+        }
+
+        func snapshot() -> [QVACProfilingMetadata] {
+            lock.lock()
+            defer { lock.unlock() }
+            return metadata
+        }
+    }
+
     private static let bareBin: URL? = {
         if let p = ProcessInfo.processInfo.environment["QVAC_BARE_BIN"] { return URL(fileURLWithPath: p) }
         let c = URL(fileURLWithPath: "/opt/homebrew/bin/bare")
@@ -80,7 +97,9 @@ final class RealModelIntegrationTests: XCTestCase {
         }
     }
 
-    private func makeClient() async throws -> QVACClient {
+    private func makeClient(
+        profilingMetadataHandler: (@Sendable (QVACProfilingMetadata) -> Void)? = nil
+    ) async throws -> QVACClient {
         let modules = Self.nodeModulesDir!
         let cfg = QVACClient.Configuration.macOSSubprocess(UDSTransportConfiguration(
             bareExecutable: Self.bareBin!,
@@ -91,7 +110,8 @@ final class RealModelIntegrationTests: XCTestCase {
         ))
         return try await QVACClient(
             configuration: cfg,
-            initHandshakeTimeout: .seconds(60)
+            initHandshakeTimeout: .seconds(60),
+            profilingMetadataHandler: profilingMetadataHandler
         )
     }
 
@@ -187,6 +207,75 @@ final class RealModelIntegrationTests: XCTestCase {
                 )
             } catch {
                 XCTFail("completion failure cleanup could not unload model: \(error)")
+            }
+            throw operationError
+        }
+    }
+
+    /// QVAC 0.17 duplex handlers append profiling metadata after their logical
+    /// terminal response. Exercise that exact worker behavior through the rich
+    /// orchestration wrapper so a regression cannot hide behind the raw decoder.
+    func test_profiled_completion_orchestration_drains_server_trailer() async throws {
+        let profiling = ProfilingCapture()
+        let client = try await makeClient(
+            profilingMetadataHandler: { profiling.append($0) }
+        )
+        addTeardownBlock { await client.close() }
+        let modelURL = try await Self.fixture().localURL()
+
+        let modelId = try await loadFixtureModel(on: client, from: modelURL)
+        do {
+            let session = try await client.completionOrchestrate(
+                modelId: modelId,
+                history: [.user("Say hello in one word.")],
+                tools: [],
+                generationParams: .object(["predict": .number(8)]),
+                maxToolTurns: 1,
+                rpcOptions: .init(
+                    timeout: .seconds(60),
+                    profiling: .init(enabled: true, includeServerBreakdown: true)
+                )
+            )
+            try await session.end()
+
+            var sawDone = false
+            for try await event in session.events {
+                if case .done = event { sawDone = true }
+            }
+            XCTAssertTrue(sawDone, "completionOrchestrate must emit its logical done event")
+
+            let captured = profiling.snapshot()
+            XCTAssertEqual(captured.count, 1, "one profiled duplex call must emit one trailer")
+            let metadata = try XCTUnwrap(captured.first)
+            guard case .object(let envelope) = metadata.value else {
+                return XCTFail("profiling metadata must be a JSON object")
+            }
+            guard case .string(let profileID)? = envelope["id"] else {
+                return XCTFail("profiling metadata must include an id")
+            }
+            XCTAssertFalse(profileID.isEmpty)
+            guard case .object(let server)? = envelope["server"] else {
+                return XCTFail("profiled duplex trailer must include server timing data")
+            }
+            XCTAssertFalse(server.isEmpty)
+            guard case .number(let totalServerMs)? = server["totalServerMs"] else {
+                return XCTFail("server timing data must include totalServerMs")
+            }
+            XCTAssertTrue(totalServerMs.isFinite)
+            XCTAssertGreaterThanOrEqual(totalServerMs, 0)
+
+            try await client.unloadModel(
+                modelId: modelId,
+                rpcOptions: .init(timeout: .seconds(10))
+            )
+        } catch let operationError {
+            do {
+                try await client.unloadModel(
+                    modelId: modelId,
+                    rpcOptions: .init(timeout: .seconds(10))
+                )
+            } catch {
+                XCTFail("profiled orchestration cleanup could not unload model: \(error)")
             }
             throw operationError
         }

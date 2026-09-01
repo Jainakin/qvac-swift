@@ -467,9 +467,12 @@ actor BareRPCClient {
                     } catch is CancellationError {
                         // Cancellation already resolved and removed the pending entry.
                     } catch {
-                        if let self {
-                            await self.resolveSend(id: id, with: .failure(error))
-                        }
+                        // A write failure means the byte channel can no longer be
+                        // trusted for any operation, not merely this request. Make
+                        // the generation terminal and fail every in-flight waiter
+                        // exactly once; QVACClient may create a fresh generation for
+                        // a later (never replayed) request.
+                        await self?.connectionEnded(with: error)
                     }
                 }
             }
@@ -537,7 +540,7 @@ actor BareRPCClient {
                         // The cancellation/timeout path owns continuation resolution and
                         // sends teardown after this writer has stopped.
                     } catch {
-                        await self?.failStream(id: id, with: error, notifyRemote: false)
+                        await self?.connectionEnded(with: error)
                     }
                 }
                 armStreamTimeout(id: id)
@@ -611,7 +614,7 @@ actor BareRPCClient {
                         // The cancellation/timeout path owns continuation resolution and
                         // sends teardown after this writer has stopped.
                     } catch {
-                        await self?.failDuplex(id: id, with: error, notifyRemote: false)
+                        await self?.connectionEnded(with: error)
                     }
                 }
                 if let timeout {
@@ -821,7 +824,7 @@ actor BareRPCClient {
                 Task { [weak self] in await self?.cancelDuplexWrite(id: id) }
             }
         } catch {
-            failDuplex(id: id, with: error, notifyRemote: false)
+            connectionEnded(with: error)
             throw error
         }
     }
@@ -1036,9 +1039,13 @@ actor BareRPCClient {
     }
 
     private func sendTeardown(_ frames: Data, after setupWriteTask: Task<Void, Never>?) {
-        Task { [transport] in
+        Task { [transport, weak self] in
             if let setupWriteTask { await setupWriteTask.value }
-            try? await transport.write(frames)
+            do {
+                try await transport.write(frames)
+            } catch {
+                await self?.connectionEnded(with: error)
+            }
         }
     }
 
@@ -1100,6 +1107,16 @@ actor BareRPCClient {
 
     private func ensureOpen() throws {
         if closed { throw BareRPCConnectionClosed() }
+    }
+
+    /// Whether this transport generation can accept a new request.
+    ///
+    /// EOF, inbound failures, outbound channel failures, and explicit close all
+    /// synchronously flip this value before in-flight operations are failed. The
+    /// owning QVACClient uses it only before *new* calls; it never retries or
+    /// replays an operation that was already assigned to this generation.
+    func isOpen() -> Bool {
+        !closed
     }
 
     private func validate(timeout: Duration?) throws {

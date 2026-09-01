@@ -21,6 +21,24 @@ final class UnixDomainSocketTransportTests: XCTestCase {
         return url
     }
 
+    private func qvacOwnedTempDirectories() -> Set<String> {
+        Set((try? FileManager.default.contentsOfDirectory(atPath: NSTemporaryDirectory())) ?? [])
+            .filter { $0.hasPrefix("qvac-worker-") }
+    }
+
+    private func waitForFile(
+        at url: URL,
+        timeout: Duration = .seconds(2)
+    ) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if FileManager.default.fileExists(atPath: url.path) { return true }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
     func test_invalid_init_timeouts_are_rejected_without_spawning() async {
         for timeout in [TimeInterval.nan, -.infinity, -1, 0, .infinity] {
             let config = UDSTransportConfiguration(
@@ -133,6 +151,69 @@ final class UnixDomainSocketTransportTests: XCTestCase {
         let leaked = after.subtracting(before)
         XCTAssertTrue(leaked.isEmpty,
                       "accept-timeout leaked tempdir(s): \(leaked) under \(tmpRoot)")
+    }
+
+    func test_cancelled_connect_promptly_reaps_worker_listener_and_owned_tempdir() async throws {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qvac-connect-pid-\(UUID().uuidString)")
+        let workerScript = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qvac-cancel-worker-\(UUID().uuidString).sh")
+        try Data("""
+        trap '' TERM
+        printf '%s' "$$" > '\(marker.path)'
+        exec /bin/sleep 30
+        """.utf8).write(to: workerScript, options: .atomic)
+        defer {
+            try? FileManager.default.removeItem(at: marker)
+            try? FileManager.default.removeItem(at: workerScript)
+        }
+
+        let before = qvacOwnedTempDirectories()
+        let config = UDSTransportConfiguration(
+            bareExecutable: URL(fileURLWithPath: "/bin/sh"),
+            workerScript: workerScript,
+            workingDirectory: FileManager.default.temporaryDirectory,
+            initTimeout: 30
+        )
+        let connection = Task {
+            try await UnixDomainSocketTransport.connect(config)
+        }
+
+        guard try await waitForFile(at: marker) else {
+            connection.cancel()
+            _ = try? await connection.value
+            return XCTFail("sleeping worker never published its PID")
+        }
+        let during = qvacOwnedTempDirectories().subtracting(before)
+        XCTAssertEqual(during.count, 1, "connect must own exactly one temporary listener")
+        let pidText = try String(contentsOf: marker, encoding: .utf8)
+        let workerPID = try XCTUnwrap(Int32(pidText))
+
+        let clock = ContinuousClock()
+        let cancellationStarted = clock.now
+        connection.cancel()
+        do {
+            _ = try await connection.value
+            XCTFail("expected connect cancellation")
+        } catch is CancellationError {
+            // Expected. Cleanup completes before the canceled connect returns.
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+        XCTAssertLessThan(
+            cancellationStarted.duration(to: clock.now),
+            .seconds(2),
+            "cancellation must not wait for the 30-second accept timeout"
+        )
+
+        let after = qvacOwnedTempDirectories()
+        XCTAssertTrue(
+            after.subtracting(before).isEmpty,
+            "cancelled connect leaked owned temp directories: \(after.subtracting(before))"
+        )
+        errno = 0
+        XCTAssertEqual(Darwin.kill(workerPID, 0), -1, "cancelled worker PID still exists")
+        XCTAssertEqual(errno, ESRCH, "cancelled worker must be reaped, errno=\(errno)")
     }
 
     func test_worker_exits_immediately_surfaces_clearly() async {

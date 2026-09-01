@@ -94,9 +94,15 @@ final class QVACRuntimeContractTests: XCTestCase {
     }
 
     func test_timeout_validation_matches_017_minimum() throws {
-        // @qvac/sdk 0.17 makes timeout an optional per-call override. Undefined
-        // deliberately means no deadline; Swift mirrors that exact default.
-        XCTAssertNil(QVACRPCOptions().timeout)
+        // @qvac/sdk 0.17 permits an optional per-call override. Swift keeps the
+        // wire-compatible explicit-nil escape hatch while making ordinary calls
+        // bounded so a missing worker reply cannot hang an application forever.
+        XCTAssertEqual(QVACRPCOptions().timeout, .seconds(60))
+        XCTAssertEqual(
+            try QVACClient.validatedRPCOptions(.init()),
+            QVACRPCOptions.defaultTimeout
+        )
+        XCTAssertNil(QVACRPCOptions(timeout: nil).timeout)
         XCTAssertNil(try QVACClient.validatedTimeout(nil))
         XCTAssertEqual(
             try QVACClient.validatedTimeout(.milliseconds(100)),
@@ -115,7 +121,7 @@ final class QVACRuntimeContractTests: XCTestCase {
                 healthCheckTimeout: .milliseconds(100),
                 forceNewConnection: true
             )),
-            nil
+            QVACRPCOptions.defaultTimeout
         )
         XCTAssertThrowsError(try QVACClient.validatedRPCOptions(QVACRPCOptions(
             healthCheckTimeout: .milliseconds(99)

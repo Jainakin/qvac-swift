@@ -48,9 +48,16 @@ public struct QVACProfilingMetadata: Sendable, Equatable {
 /// - duplex calls use it while opening the two stream directions. Once opened,
 ///   a duplex session is intentionally long-lived and has no total deadline.
 ///
-/// Pass `nil` to disable the deadline. Values below 100 milliseconds are rejected
-/// by the public client, matching the upstream SDK schema.
+/// Calls use ``defaultTimeout`` unless the caller supplies an operation-specific
+/// value. Pass `nil` explicitly to disable the deadline for an intentionally
+/// long-lived operation. Values below 100 milliseconds are rejected by the
+/// public client, matching the upstream SDK schema.
 public struct QVACRPCOptions: Sendable, Equatable {
+    /// Production-safe deadline used when an operation does not provide one.
+    /// Streaming operations interpret this as an inactivity timeout, not as a
+    /// limit on their total duration.
+    public static let defaultTimeout: Duration = .seconds(60)
+
     public var timeout: Duration?
     /// Accepted for 0.17 schema parity. The local SDK path does not perform the
     /// delegated-connection health probe, so this is a validated no-op.
@@ -61,7 +68,7 @@ public struct QVACRPCOptions: Sendable, Equatable {
     public var profiling: QVACProfilingOptions?
 
     public init(
-        timeout: Duration? = nil,
+        timeout: Duration? = Self.defaultTimeout,
         healthCheckTimeout: Duration? = nil,
         forceNewConnection: Bool? = nil,
         profiling: QVACProfilingOptions? = nil

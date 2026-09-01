@@ -10,13 +10,25 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
 env:
   QVAC_NODE_VERSION: 22.22.0
+  # macos-14 runners retire on 2026-11-02. Keep the build reproducible on the
+  # supported Apple-silicon image while Package.swift continues to enforce the
+  # macOS 14 / iOS 17 deployment floors.
+  DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
 
 jobs:
   codegen:
     name: Pinned contract, codegen freshness, and <30s generation
-    runs-on: macos-14
+    runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -53,7 +65,7 @@ jobs:
 
   runtime-artifact:
     name: Exact 0.17 portable worker reproducibility
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -76,14 +88,16 @@ jobs:
           tools/runtime/test-path-safety.sh
           node tools/release/test-archive-reproducibility.mjs
           node tools/release/test-release-source-binding.mjs
+          node tools/release/validate-release-version.mjs --self-test
           tools/ci/run-required-suite.sh --self-test
           node tools/ci/package-manifest-mode.mjs --self-test
           node tools/release/generate-third-party-notices.mjs --self-test
 
   unit:
     name: Unit tests · macOS arm64
-    runs-on: macos-14
+    runs-on: macos-15
     needs: [codegen]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -107,6 +121,7 @@ jobs:
           node tools/ci/package-manifest-mode.mjs --activate-development
       - name: Build and test
         run: |
+          test "$(uname -m)" = arm64
           swift package dump-package >/dev/null
           swift build -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
           swift test \
@@ -116,7 +131,7 @@ jobs:
 
   documentation:
     name: DocC · warnings are errors
-    runs-on: macos-14
+    runs-on: macos-15
     needs: [unit]
     timeout-minutes: 20
     steps:
@@ -158,7 +173,7 @@ jobs:
 
   integration-live:
     name: Live worker · all no-model RPC suites
-    runs-on: macos-14
+    runs-on: macos-15
     needs: [unit, runtime-artifact]
     timeout-minutes: 20
     steps:
@@ -178,13 +193,13 @@ jobs:
           QVAC_NODE_MODULES: ${{ github.workspace }}/tools/runtime/node_modules
           QVAC_WORKER_SCRIPT: ${{ github.workspace }}/tools/runtime/node_modules/@qvac/sdk/dist/server/worker.js
         run: |
-          tools/ci/run-required-suite.sh QVACClientIntegrationTests 5
+          tools/ci/run-required-suite.sh QVACClientIntegrationTests 6
           tools/ci/run-required-suite.sh LiveWorkerIntegrationTests 5
           tools/ci/run-required-suite.sh AllRPCTypesRoundTripTests 1
 
   integration-models:
     name: First inference <10m; pinned models; KR-2 streaming benchmark
-    runs-on: macos-14
+    runs-on: macos-15
     needs: [unit, runtime-artifact]
     timeout-minutes: 120
     steps:
@@ -218,7 +233,7 @@ jobs:
           fi
           set +e
           perl -e 'alarm shift; exec @ARGV or die "exec failed: $!\n"' \
-            "$REMAINING" tools/ci/run-required-suite.sh RealModelIntegrationTests 3
+            "$REMAINING" tools/ci/run-required-suite.sh RealModelIntegrationTests 4
           STATUS="$?"
           set -e
           if [ "$STATUS" -eq 142 ]; then
@@ -288,7 +303,7 @@ jobs:
           xcodebuild -scheme QVACClient \
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath "$RUNNER_TEMP/qvac-package-dd" build
-      - name: Run external-package smoke test on a hosted iOS Simulator
+      - name: Run local-graph worker smoke test on a hosted iOS Simulator
         working-directory: Tests/QVACiOSSmokeHarness
         run: |
           swift package dump-package >/dev/null
@@ -296,15 +311,206 @@ jobs:
             -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
             -derivedDataPath "$RUNNER_TEMP/qvac-ios-smoke-dd" \
             CODE_SIGNING_ALLOWED=NO \
-            -only-testing:QVACiOSSmokeTests test
+            -parallel-testing-enabled NO \
+            -only-testing:QVACiOSSmokeTests/QVACiOSSmokeTests/testBundledWorkerHandshakeHeartbeatAndIdempotentClose \
+            test 2>&1 | tee "$RUNNER_TEMP/qvac-ios-smoke.log"
+          ../../tools/ci/assert-ios-smoke-log.sh \
+            "$RUNNER_TEMP/qvac-ios-smoke.log" \
+            QVACiOSSmokeTests
+          xcodebuild -scheme QVACiOSSmokeHarness-Package \
+            -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
+            -derivedDataPath "$RUNNER_TEMP/qvac-ios-smoke-dd" \
+            CODE_SIGNING_ALLOWED=NO \
+            -parallel-testing-enabled NO \
+            -only-testing:QVACiOSSmokeTests/BareIPCReadableDrainTests/testResponseBytesAreDeliveredBeforeObservableZeroByteEOF \
+            test 2>&1 | tee "$RUNNER_TEMP/qvac-ios-eof-adapter.log"
+          ../../tools/ci/assert-ios-smoke-log.sh \
+            "$RUNNER_TEMP/qvac-ios-eof-adapter.log" \
+            QVACiOSSmokeTests \
+            BareIPCReadableDrainTests \
+            testResponseBytesAreDeliveredBeforeObservableZeroByteEOF
+      - name: Install checksum-pinned XcodeGen
+        run: |
+          XCODEGEN_VERSION=2.46.0
+          XCODEGEN_SHA256=4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
+          XCODEGEN_ARCHIVE="$RUNNER_TEMP/xcodegen-$XCODEGEN_VERSION.zip"
+          XCODEGEN_ROOT="$RUNNER_TEMP/xcodegen-$XCODEGEN_VERSION"
+          curl --fail --location --silent --show-error \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --max-time 300 \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/$XCODEGEN_VERSION/xcodegen.zip" \
+            --output "$XCODEGEN_ARCHIVE"
+          printf '%s  %s\n' "$XCODEGEN_SHA256" "$XCODEGEN_ARCHIVE" | shasum -a 256 -c -
+          mkdir -p "$XCODEGEN_ROOT"
+          ditto -x -k "$XCODEGEN_ARCHIVE" "$XCODEGEN_ROOT"
+          QVAC_XCODEGEN="$XCODEGEN_ROOT/xcodegen/bin/xcodegen"
+          test -x "$QVAC_XCODEGEN"
+          test "$("$QVAC_XCODEGEN" --version)" = "Version: $XCODEGEN_VERSION"
+          echo "QVAC_XCODEGEN=$QVAC_XCODEGEN" >> "$GITHUB_ENV"
       - name: Build QVACChat on iOS and macOS
         run: |
-          brew install xcodegen
           cd Examples/QVACChat
-          xcodegen generate
+          "$QVAC_XCODEGEN" generate
           xcodebuild -project QVACChat.xcodeproj -scheme QVACChat-iOS \
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath "$RUNNER_TEMP/qvac-chat-ios-dd" build
           xcodebuild -project QVACChat.xcodeproj -scheme QVACChat-macOS \
             -destination 'platform=macOS' \
             -derivedDataPath "$RUNNER_TEMP/qvac-chat-macos-dd" build
+
+  ios17-url-runtime:
+    name: iOS 17.0 · candidate/public package runtime gate
+    if: github.event_name == 'push'
+    runs-on: macos-15
+    needs: [runtime-artifact]
+    timeout-minutes: 90
+    env:
+      QVAC_IOS_RUNTIME_VERSION: "17.0"
+      QVAC_IOS_RUNTIME_ID: com.apple.CoreSimulator.SimRuntime.iOS-17-0
+      QVAC_IOS_DEVICE_TYPE_ID: com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/runtime/package-lock.json
+      - name: Resolve the canonical artifact publication phase
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          MANIFEST_MODE="$(node tools/ci/package-manifest-mode.mjs --check)"
+          if [[ ! "$MANIFEST_MODE" =~ canonical\ mode=release\ tag=(artifacts-sdk-0\.17\.0-r[1-9][0-9]*)$ ]]; then
+            echo "::error::The pushed main revision must use a generated URL manifest"
+            echo "$MANIFEST_MODE"
+            exit 1
+          fi
+          ARTIFACT_TAG="${BASH_REMATCH[1]}"
+          RESPONSE="$RUNNER_TEMP/qvac-artifact-release-response.json"
+          HTTP_STATUS=transport-error
+          for ATTEMPT in 1 2 3; do
+            if HTTP_STATUS="$(curl --silent --show-error \
+              --connect-timeout 30 \
+              --max-time 120 \
+              --output "$RESPONSE" \
+              --write-out '%{http_code}' \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$ARTIFACT_TAG")"; then
+              if [ "$HTTP_STATUS" = 200 ] || [ "$HTTP_STATUS" = 404 ]; then
+                break
+              fi
+            else
+              HTTP_STATUS=transport-error
+            fi
+            if [ "$ATTEMPT" -lt 3 ]; then
+              sleep 5
+            fi
+          done
+
+          case "$HTTP_STATUS" in
+            200)
+              jq -e --arg tag "$ARTIFACT_TAG" \
+                '.tag_name == $tag and .draft == false' "$RESPONSE" >/dev/null
+              ARTIFACT_PHASE=published
+              ;;
+            404)
+              ARTIFACT_PHASE=candidate
+              ;;
+            *)
+              echo "::error::Could not determine artifact publication phase (HTTP $HTTP_STATUS)"
+              exit 1
+              ;;
+          esac
+
+          echo "QVAC_ARTIFACT_PHASE=$ARTIFACT_PHASE" >> "$GITHUB_ENV"
+          echo "QVAC_ARTIFACT_TAG=$ARTIFACT_TAG" >> "$GITHUB_ENV"
+          jq -n \
+            --arg phase "$ARTIFACT_PHASE" \
+            --arg tag "$ARTIFACT_TAG" \
+            --arg revision "$GITHUB_SHA" \
+            '{phase: $phase, artifactTag: $tag, sourceRevision: $revision}' \
+            > "$RUNNER_TEMP/qvac-ios17-runtime-mode.json"
+          echo "Canonical artifact phase: $ARTIFACT_PHASE ($ARTIFACT_TAG)"
+      - name: Pin Xcode and install the exact minimum iOS runtime
+        timeout-minutes: 40
+        run: |
+          test "$(xcodebuild -version | sed -n '1p')" = 'Xcode 16.4'
+          test "$(xcodebuild -version | sed -n '2p')" = 'Build version 16F6'
+          if ! xcrun simctl list -j runtimes | jq -e --arg id "$QVAC_IOS_RUNTIME_ID" \
+            'any(.runtimes[]; .identifier == $id and .isAvailable == true)' >/dev/null; then
+            for ATTEMPT in 1 2; do
+              if xcodebuild -downloadPlatform iOS -buildVersion "$QVAC_IOS_RUNTIME_VERSION"; then
+                break
+              fi
+              if [ "$ATTEMPT" = 2 ]; then
+                echo "::error::Could not install iOS $QVAC_IOS_RUNTIME_VERSION Simulator runtime"
+                exit 1
+              fi
+            done
+          fi
+          xcrun simctl list -j runtimes | jq -e --arg id "$QVAC_IOS_RUNTIME_ID" \
+            'any(.runtimes[]; .identifier == $id and .isAvailable == true)' >/dev/null
+      - name: Create and boot a fresh pinned simulator
+        run: |
+          xcrun simctl list -j devicetypes | jq -e --arg id "$QVAC_IOS_DEVICE_TYPE_ID" \
+            'any(.devicetypes[]; .identifier == $id)' >/dev/null
+          UDID="$(xcrun simctl create \
+            "qvac-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            "$QVAC_IOS_DEVICE_TYPE_ID" \
+            "$QVAC_IOS_RUNTIME_ID")"
+          echo "QVAC_SIMULATOR_UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+      - name: Run the phase-appropriate iOS 17 worker smoke
+        run: |
+          if [ "$QVAC_ARTIFACT_PHASE" = published ]; then
+            tools/ci/test-ios-url-consumer.sh \
+              "https://github.com/${GITHUB_REPOSITORY}.git" \
+              --revision "$GITHUB_SHA" \
+              "$QVAC_SIMULATOR_UDID" \
+              "$RUNNER_TEMP/qvac-ios17-runtime.xcresult"
+          else
+            echo "[ios17-runtime] $QVAC_ARTIFACT_TAG is not published; running the exact candidate's verified local graph"
+            tools/runtime/link-ios-artifacts.sh
+            CI=true node tools/ci/package-manifest-mode.mjs --activate-development
+            (
+              cd Tests/QVACiOSSmokeHarness
+              swift package dump-package >/dev/null
+              xcodebuild \
+                -scheme QVACiOSSmokeHarness-Package \
+                -destination "platform=iOS Simulator,id=$QVAC_SIMULATOR_UDID" \
+                -destination-timeout 180 \
+                -derivedDataPath "$RUNNER_TEMP/qvac-ios17-candidate-dd" \
+                -parallel-testing-enabled NO \
+                -only-testing:QVACiOSSmokeTests/QVACiOSSmokeTests/testBundledWorkerHandshakeHeartbeatAndIdempotentClose \
+                -resultBundlePath "$RUNNER_TEMP/qvac-ios17-runtime.xcresult" \
+                test
+            ) 2>&1 | tee "$RUNNER_TEMP/qvac-ios17-runtime.log"
+            tools/ci/assert-ios-smoke-log.sh \
+              "$RUNNER_TEMP/qvac-ios17-runtime.log" \
+              QVACiOSSmokeTests
+            echo "[ios17-runtime] candidate graph handshake passed; public-URL proof remains a mandatory source-release preflight"
+          fi
+      - name: Tear down pinned simulator
+        if: always()
+        run: |
+          if [ -n "${QVAC_SIMULATOR_UDID:-}" ]; then
+            xcrun simctl shutdown "$QVAC_SIMULATOR_UDID" || true
+            xcrun simctl delete "$QVAC_SIMULATOR_UDID" || true
+          fi
+      - name: Upload iOS 17 package-runtime evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ios17-package-runtime-evidence
+          path: |
+            ${{ runner.temp }}/qvac-ios17-runtime-mode.json
+            ${{ runner.temp }}/qvac-ios17-runtime.xcresult
+            ${{ runner.temp }}/qvac-ios17-runtime.log
+          if-no-files-found: warn

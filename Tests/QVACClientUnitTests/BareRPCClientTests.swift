@@ -3,6 +3,9 @@
 
 import XCTest
 @testable import QVACClient
+#if os(macOS)
+import Darwin
+#endif
 
 final class BareRPCClientTests: XCTestCase {
 
@@ -126,6 +129,69 @@ final class BareRPCClientTests: XCTestCase {
         func closes() -> Int { closeCount }
     }
 
+    private struct ReconnectProbeError: Error, Sendable {}
+
+    /// Repeatable, countable transport factory used by the public-client
+    /// reconnection tests. Each successful invocation transfers one transport
+    /// generation to QVACClient.
+    private actor SequencedTransportFactory {
+        struct Failure: Error, Sendable, Equatable {
+            let invocation: Int
+        }
+
+        private var transports: [MockTransport]
+        private var failingInvocations: Set<Int>
+        private var invocationCount = 0
+
+        init(
+            transports: [MockTransport],
+            failingInvocations: Set<Int> = []
+        ) {
+            self.transports = transports
+            self.failingInvocations = failingInvocations
+        }
+
+        func make() throws -> BareTransport {
+            invocationCount += 1
+            if failingInvocations.remove(invocationCount) != nil {
+                throw Failure(invocation: invocationCount)
+            }
+            guard !transports.isEmpty else {
+                throw Failure(invocation: invocationCount)
+            }
+            return transports.removeFirst()
+        }
+
+        func calls() -> Int { invocationCount }
+    }
+
+    #if os(macOS)
+    /// Returns an in-memory first generation and creates a real UDS transport for
+    /// the reconnect. This covers cancellation while the factory itself is still
+    /// blocked in `poll`, before a replacement BareRPCClient exists.
+    private actor InitialThenUDSTransportFactory {
+        private let initial: MockTransport
+        private let reconnectConfiguration: UDSTransportConfiguration
+        private var invocationCount = 0
+
+        init(
+            initial: MockTransport,
+            reconnectConfiguration: UDSTransportConfiguration
+        ) {
+            self.initial = initial
+            self.reconnectConfiguration = reconnectConfiguration
+        }
+
+        func make() async throws -> BareTransport {
+            invocationCount += 1
+            if invocationCount == 1 { return initial }
+            return try await UnixDomainSocketTransport.connect(reconnectConfiguration)
+        }
+
+        func calls() -> Int { invocationCount }
+    }
+    #endif
+
     actor CompletionFlag {
         private var value = false
         func set() { value = true }
@@ -137,6 +203,23 @@ final class BareRPCClientTests: XCTestCase {
         func wait() async { await withCheckedContinuation { waiter = $0 } }
         func isWaiting() -> Bool { waiter != nil }
         func release() { waiter?.resume(); waiter = nil }
+    }
+
+    actor FirstInvocationGate {
+        private var invocationCount = 0
+        private var waiter: CheckedContinuation<Void, Never>?
+
+        func pauseFirst() async {
+            invocationCount += 1
+            guard invocationCount == 1 else { return }
+            await withCheckedContinuation { waiter = $0 }
+        }
+
+        func isWaiting() -> Bool { waiter != nil }
+        func release() {
+            waiter?.resume()
+            waiter = nil
+        }
     }
 
     /// Captures the first REQUEST id from outbound bytes (across multiple writes).
@@ -235,6 +318,135 @@ final class BareRPCClientTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(5))
         }
         XCTFail("timed out waiting for gated transport counts \(expected); got \(await transport.counts())")
+    }
+
+    private static func waitForFactoryCalls(
+        _ expected: Int,
+        on factory: SequencedTransportFactory,
+        timeout: Duration = .seconds(1)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await factory.calls() >= expected { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("timed out waiting for \(expected) transport-factory calls")
+    }
+
+    private static func waitUntilClosed(
+        _ rpc: BareRPCClient,
+        timeout: Duration = .seconds(1)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if !(await rpc.isOpen()) { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("timed out waiting for RPC generation to close")
+    }
+
+    private static func waitForFirstInvocation(
+        on gate: FirstInvocationGate,
+        timeout: Duration = .seconds(1)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await gate.isWaiting() { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("timed out waiting for the first post-isOpen caller")
+    }
+
+    private static func waitForReconnectWaiters(
+        _ expected: Int,
+        on client: QVACClient,
+        timeout: Duration = .seconds(2)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await client.__testReconnectWaiterCount() == expected { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let actual = await client.__testReconnectWaiterCount()
+        XCTFail("timed out waiting for \(expected) reconnect waiters; got \(actual)")
+    }
+
+    #if os(macOS)
+    private static func waitForFile(
+        at url: URL,
+        timeout: Duration = .seconds(2)
+    ) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if FileManager.default.fileExists(atPath: url.path) { return true }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    private static func qvacOwnedTempDirectories() -> Set<String> {
+        Set((try? FileManager.default.contentsOfDirectory(atPath: NSTemporaryDirectory())) ?? [])
+            .filter { $0.hasPrefix("qvac-worker-") }
+    }
+    #endif
+
+    private static func replyToInit(
+        on transport: MockTransport,
+        minimumFrameCount: Int = 1,
+        success: Bool = true
+    ) async throws {
+        let frames = try await waitForFrames(minimumFrameCount, on: transport)
+        guard let request = frames.compactMap({ frame -> (UInt64, Data)? in
+            guard case .request(let id, _, _, let payload) = frame,
+                  let payload,
+                  let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+                  object["type"] as? String == "__init_config" else { return nil }
+            return (id, payload)
+        }).last else {
+            return XCTFail("expected __init_config request")
+        }
+        let replyObject: [String: Any] = success
+            ? ["success": true]
+            : ["success": false, "error": "reconnect rejected"]
+        let reply = try JSONSerialization.data(
+            withJSONObject: replyObject,
+            options: [.sortedKeys]
+        )
+        await transport.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+            id: request.0,
+            stream: [],
+            payload: .success(reply)
+        ))
+    }
+
+    private static func replyToHeartbeats(
+        on transport: MockTransport,
+        expectedCount: Int,
+        minimumFrameCount: Int,
+        number: Double = 42
+    ) async throws {
+        let frames = try await waitForFrames(minimumFrameCount, on: transport)
+        let ids = frames.compactMap { frame -> UInt64? in
+            guard case .request(let id, _, _, let payload) = frame,
+                  let payload,
+                  let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+                  object["type"] as? String == "heartbeat" else { return nil }
+            return id
+        }
+        XCTAssertEqual(ids.count, expectedCount)
+        let response = Data("{\"number\":\(number),\"type\":\"heartbeat\"}".utf8)
+        for id in ids {
+            await transport.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+                id: id,
+                stream: [],
+                payload: .success(response)
+            ))
+        }
     }
 
     // MARK: - send (single-shot RPC)
@@ -1710,6 +1922,741 @@ final class BareRPCClientTests: XCTestCase {
         let closeCount = await mock.closes()
         XCTAssertEqual(closeCount, 1)
     }
+
+    // MARK: - Connection generations and reconnect
+
+    func test_transport_write_failure_invalidates_rpc_generation() async {
+        let transport = FailingWriteTransport()
+        let rpc = BareRPCClient(transport: transport)
+
+        do {
+            _ = try await rpc.send(command: 1, data: Data("request".utf8))
+            XCTFail("expected channel write failure")
+        } catch is FailingWriteTransport.Failure {
+            // Expected: the original operation observes the original failure.
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        let remainedOpen = await rpc.isOpen()
+        XCTAssertFalse(remainedOpen)
+        await rpc.close()
+        let transportCloseCount = await transport.closes()
+        XCTAssertEqual(transportCloseCount, 1)
+    }
+
+    func test_qvac_client_reconnect_single_flights_and_never_replays_failed_request() async throws {
+        let first = MockTransport()
+        let second = MockTransport()
+        let factory = SequencedTransportFactory(transports: [first, second])
+
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { try await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(1),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        let client = try await initialization.value
+        let initialGeneration = await client.__testConnectionGeneration()
+        XCTAssertEqual(initialGeneration, 1)
+
+        let failedRequest = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        _ = try await Self.waitForFrames(2, on: first)
+        await first.feedError(ReconnectProbeError())
+        do {
+            _ = try await failedRequest.value
+            XCTFail("expected the in-flight request to fail")
+        } catch let error as QVACError {
+            guard case .transport = error else {
+                return XCTFail("expected transport failure, got \(error)")
+            }
+        }
+        let callsAfterFailure = await factory.calls()
+        XCTAssertEqual(callsAfterFailure, 1, "failed calls must never be replayed")
+
+        let firstNewRequest = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        let secondNewRequest = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.waitForFactoryCalls(2, on: factory)
+        let callsDuringReconnect = await factory.calls()
+        XCTAssertEqual(callsDuringReconnect, 2, "concurrent callers must share one reconnect attempt")
+        try await Self.replyToInit(on: second)
+        for request in [firstNewRequest, secondNewRequest] {
+            do {
+                _ = try await request.value
+                XCTFail("a call crossing reconnect must report lost worker state")
+            } catch let error as QVACError {
+                guard case .connectionReset = error else {
+                    return XCTFail("expected connectionReset, got \(error)")
+                }
+            }
+        }
+
+        let recoveredGeneration = await client.__testConnectionGeneration()
+        XCTAssertEqual(recoveredGeneration, 2)
+
+        let retry = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.replyToHeartbeats(
+            on: second,
+            expectedCount: 1,
+            minimumFrameCount: 2
+        )
+        let heartbeat = try await retry.value
+        let finalFactoryCalls = await factory.calls()
+        XCTAssertEqual(heartbeat.number, 42)
+        XCTAssertEqual(finalFactoryCalls, 2)
+
+        let secondFrames = Self.frames(in: await second.outbound())
+        let secondRequests = secondFrames.compactMap { frame -> String? in
+            guard case .request(_, _, _, let payload) = frame,
+                  let payload,
+                  let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any]
+            else { return nil }
+            return object["type"] as? String
+        }
+        XCTAssertEqual(secondRequests, ["__init_config", "heartbeat"])
+        await client.close()
+    }
+
+    func test_cancelled_sole_reconnect_waiter_cannot_hide_successful_state_loss() async throws {
+        let first = MockTransport()
+        let replacement = MockTransport()
+        let factory = SequencedTransportFactory(transports: [first, replacement])
+
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { try await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(1),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        let client = try await initialization.value
+        let initialRPC = await client.rpc
+        await first.feedError(ReconnectProbeError())
+        try await Self.waitUntilClosed(initialRPC)
+
+        let cancelledWaiter = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.waitForFactoryCalls(2, on: factory)
+        _ = try await Self.waitForFrames(1, on: replacement)
+
+        let clock = ContinuousClock()
+        let cancellationStarted = clock.now
+        cancelledWaiter.cancel()
+        do {
+            _ = try await cancelledWaiter.value
+            XCTFail("the canceled reconnect waiter must not continue")
+        } catch is CancellationError {
+            // Expected. The shared reconnect remains available to a later caller.
+        } catch {
+            return XCTFail("expected CancellationError, got \(error)")
+        }
+        XCTAssertLessThan(
+            cancellationStarted.duration(to: clock.now),
+            .milliseconds(250),
+            "waiting on a shared reconnect must remain caller-cancelable"
+        )
+        let generationBeforeInstall = await client.__testConnectionGeneration()
+        XCTAssertEqual(generationBeforeInstall, 1)
+
+        try await Self.replyToInit(on: replacement)
+        do {
+            _ = try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+            XCTFail("the next non-canceled caller must observe state loss")
+        } catch let error as QVACError {
+            guard case .connectionReset = error else {
+                return XCTFail("expected connectionReset, got \(error)")
+            }
+        }
+
+        let retry = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.replyToHeartbeats(
+            on: replacement,
+            expectedCount: 1,
+            minimumFrameCount: 2,
+            number: 23
+        )
+        let heartbeat = try await retry.value
+        XCTAssertEqual(heartbeat.number, 23)
+        let recoveredGeneration = await client.__testConnectionGeneration()
+        let finalFactoryCalls = await factory.calls()
+        XCTAssertEqual(recoveredGeneration, 2)
+        XCTAssertEqual(finalFactoryCalls, 2)
+        await client.close()
+    }
+
+    func test_cancelled_sole_reconnect_waiter_preserves_failed_attempt_for_observation() async throws {
+        let first = MockTransport()
+        let rejected = MockTransport()
+        let recovered = MockTransport()
+        let factory = SequencedTransportFactory(transports: [first, rejected, recovered])
+
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { try await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(1),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        let client = try await initialization.value
+        let initialRPC = await client.rpc
+        await first.feedError(ReconnectProbeError())
+        try await Self.waitUntilClosed(initialRPC)
+
+        let cancelledWaiter = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.waitForFactoryCalls(2, on: factory)
+        _ = try await Self.waitForFrames(1, on: rejected)
+
+        let clock = ContinuousClock()
+        let cancellationStarted = clock.now
+        cancelledWaiter.cancel()
+        do {
+            _ = try await cancelledWaiter.value
+            XCTFail("the canceled reconnect waiter must not continue")
+        } catch is CancellationError {
+            // Expected. Cancellation does not discard the shared attempt.
+        } catch {
+            return XCTFail("expected CancellationError, got \(error)")
+        }
+        XCTAssertLessThan(
+            cancellationStarted.duration(to: clock.now),
+            .milliseconds(250),
+            "waiting on a shared reconnect must remain caller-cancelable"
+        )
+
+        try await Self.replyToInit(on: rejected, success: false)
+        do {
+            _ = try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+            XCTFail("the later caller must observe the shared reconnect failure")
+        } catch let error as QVACError {
+            guard case .transport = error else {
+                return XCTFail("expected transport error, got \(error)")
+            }
+        }
+        let callsAfterObservedFailure = await factory.calls()
+        let rejectedCloseCount = await rejected.closes()
+        XCTAssertEqual(callsAfterObservedFailure, 2)
+        XCTAssertEqual(rejectedCloseCount, 1)
+
+        let recoveredCall = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.waitForFactoryCalls(3, on: factory)
+        try await Self.replyToInit(on: recovered)
+        do {
+            _ = try await recoveredCall.value
+            XCTFail("the successful retry must report lost worker state")
+        } catch let error as QVACError {
+            guard case .connectionReset = error else {
+                return XCTFail("expected connectionReset, got \(error)")
+            }
+        }
+
+        let retry = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.replyToHeartbeats(
+            on: recovered,
+            expectedCount: 1,
+            minimumFrameCount: 2,
+            number: 29
+        )
+        let heartbeat = try await retry.value
+        XCTAssertEqual(heartbeat.number, 29)
+        let recoveredGeneration = await client.__testConnectionGeneration()
+        XCTAssertEqual(recoveredGeneration, 2)
+        await client.close()
+    }
+
+    func test_cancelled_reconnect_joiners_are_unregistered_from_shared_completion_hub() async throws {
+        let first = MockTransport()
+        let replacement = MockTransport()
+        let factory = SequencedTransportFactory(transports: [first, replacement])
+
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { try await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(2),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        let client = try await initialization.value
+        let initialRPC = await client.rpc
+        await first.feedError(ReconnectProbeError())
+        try await Self.waitUntilClosed(initialRPC)
+
+        let retainedJoiner = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.waitForFactoryCalls(2, on: factory)
+        _ = try await Self.waitForFrames(1, on: replacement)
+
+        let joinerCount = 128
+        let canceledJoiners: [Task<HeartbeatResponse, Error>] = (0..<joinerCount).map { _ in
+            Task {
+                try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+            }
+        }
+        try await Self.waitForReconnectWaiters(joinerCount + 1, on: client)
+
+        for joiner in canceledJoiners { joiner.cancel() }
+        for joiner in canceledJoiners {
+            do {
+                _ = try await joiner.value
+                XCTFail("canceled reconnect joiner unexpectedly completed")
+            } catch is CancellationError {
+                // Expected.
+            } catch {
+                XCTFail("expected CancellationError, got \(error)")
+            }
+        }
+        try await Self.waitForReconnectWaiters(1, on: client)
+
+        try await Self.replyToInit(on: replacement)
+        do {
+            _ = try await retainedJoiner.value
+            XCTFail("retained reconnect joiner must observe state loss")
+        } catch let error as QVACError {
+            guard case .connectionReset = error else {
+                return XCTFail("expected connectionReset, got \(error)")
+            }
+        }
+        let finalWaiterCount = await client.__testReconnectWaiterCount()
+        let finalFactoryCalls = await factory.calls()
+        XCTAssertEqual(finalWaiterCount, 0)
+        XCTAssertEqual(finalFactoryCalls, 2)
+        await client.close()
+    }
+
+    func test_invalid_local_options_do_not_start_reconnect_on_dead_generation() async throws {
+        let first = MockTransport()
+        let unusedReplacement = MockTransport()
+        let factory = SequencedTransportFactory(transports: [first, unusedReplacement])
+
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { try await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(1),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        let client = try await initialization.value
+        let initialRPC = await client.rpc
+        await first.feedError(ReconnectProbeError())
+        try await Self.waitUntilClosed(initialRPC)
+        let invalid = QVACRPCOptions(timeout: .milliseconds(99))
+
+        do {
+            let _: QVACResponse = try await client.sendTyped(
+                .heartbeat(HeartbeatRequest()),
+                rpcOptions: invalid
+            )
+            XCTFail("invalid unary options unexpectedly succeeded")
+        } catch let error as QVACError {
+            guard case .invalidArgument = error else {
+                return XCTFail("expected invalidArgument, got \(error)")
+            }
+        }
+        do {
+            let _: QVACResponseStream<QVACResponse> = try await client.streamTyped(
+                .heartbeat(HeartbeatRequest()),
+                rpcOptions: invalid
+            )
+            XCTFail("invalid stream options unexpectedly succeeded")
+        } catch let error as QVACError {
+            guard case .invalidArgument = error else {
+                return XCTFail("expected invalidArgument, got \(error)")
+            }
+        }
+        do {
+            let _: QVACDuplexSession<QVACResponse> = try await client.duplexTyped(
+                .heartbeat(HeartbeatRequest()),
+                rpcOptions: invalid
+            )
+            XCTFail("invalid duplex options unexpectedly succeeded")
+        } catch let error as QVACError {
+            guard case .invalidArgument = error else {
+                return XCTFail("expected invalidArgument, got \(error)")
+            }
+        }
+
+        let finalFactoryCalls = await factory.calls()
+        let unusedOutbound = await unusedReplacement.outbound()
+        XCTAssertEqual(finalFactoryCalls, 1)
+        XCTAssertTrue(unusedOutbound.isEmpty)
+        await client.close()
+    }
+
+    func test_stale_isOpen_result_cannot_escape_an_installed_replacement() async throws {
+        let first = MockTransport()
+        let second = MockTransport()
+        let factory = SequencedTransportFactory(transports: [first, second])
+
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { try await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(1),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        let client = try await initialization.value
+        let firstRPC = await client.rpc
+
+        // Suspend caller A immediately after it caches generation 1 as open.
+        // Caller B will replace that generation completely before A resumes.
+        let gate = FirstInvocationGate()
+        await client.__testSetAfterOpenCheckHook { await gate.pauseFirst() }
+        let staleResultCaller = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.waitForFirstInvocation(on: gate)
+
+        await first.feedError(ReconnectProbeError())
+        try await Self.waitUntilClosed(firstRPC)
+
+        let reconnectingCaller = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.waitForFactoryCalls(2, on: factory)
+        try await Self.replyToInit(on: second)
+        do {
+            _ = try await reconnectingCaller.value
+            XCTFail("the reconnecting caller must observe state loss")
+        } catch let error as QVACError {
+            guard case .connectionReset = error else {
+                return XCTFail("expected connectionReset, got \(error)")
+            }
+        }
+        let installedGeneration = await client.__testConnectionGeneration()
+        XCTAssertEqual(installedGeneration, 2)
+
+        await gate.release()
+        do {
+            _ = try await staleResultCaller.value
+            XCTFail("a caller holding a stale isOpen result must observe state loss")
+        } catch let error as QVACError {
+            guard case .connectionReset = error else {
+                return XCTFail("expected connectionReset, got \(error)")
+            }
+        }
+        await client.__testSetAfterOpenCheckHook(nil)
+
+        let retry = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.replyToHeartbeats(
+            on: second,
+            expectedCount: 1,
+            minimumFrameCount: 2,
+            number: 12
+        )
+        let retryHeartbeat = try await retry.value
+        XCTAssertEqual(retryHeartbeat.number, 12)
+        let finalFactoryCalls = await factory.calls()
+        XCTAssertEqual(finalFactoryCalls, 2)
+        await client.close()
+    }
+
+    func test_failed_reconnect_is_cleaned_up_and_later_call_can_retry() async throws {
+        let first = MockTransport()
+        let rejected = MockTransport()
+        let recovered = MockTransport()
+        let factory = SequencedTransportFactory(transports: [first, rejected, recovered])
+
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { try await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(1),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        let client = try await initialization.value
+
+        let initialRPC = await client.rpc
+        await first.feedError(ReconnectProbeError())
+        try await Self.waitUntilClosed(initialRPC)
+
+        let rejectedCall = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.waitForFactoryCalls(2, on: factory)
+        try await Self.replyToInit(on: rejected, success: false)
+        do {
+            _ = try await rejectedCall.value
+            XCTFail("expected rejected reconnect handshake")
+        } catch let error as QVACError {
+            guard case .transport = error else {
+                return XCTFail("expected transport error, got \(error)")
+            }
+        }
+        let rejectedCloseCount = await rejected.closes()
+        XCTAssertEqual(rejectedCloseCount, 1, "failed generation leaked its transport")
+
+        let recoveredCall = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.waitForFactoryCalls(3, on: factory)
+        try await Self.replyToInit(on: recovered)
+        do {
+            _ = try await recoveredCall.value
+            XCTFail("a successful retrying reconnect must report lost state")
+        } catch let error as QVACError {
+            guard case .connectionReset = error else {
+                return XCTFail("expected connectionReset, got \(error)")
+            }
+        }
+
+        let retry = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.replyToHeartbeats(
+            on: recovered,
+            expectedCount: 1,
+            minimumFrameCount: 2,
+            number: 7
+        )
+        let recoveredHeartbeat = try await retry.value
+        let recoveredGeneration = await client.__testConnectionGeneration()
+        XCTAssertEqual(recoveredHeartbeat.number, 7)
+        XCTAssertEqual(recoveredGeneration, 2)
+        await client.close()
+    }
+
+    func test_explicit_close_is_terminal_and_never_starts_reconnect() async throws {
+        let first = MockTransport()
+        let unusedReplacement = MockTransport()
+        let factory = SequencedTransportFactory(transports: [first, unusedReplacement])
+
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { try await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(1),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        let client = try await initialization.value
+        let initialRPC = await client.rpc
+        await first.feedError(ReconnectProbeError())
+        try await Self.waitUntilClosed(initialRPC)
+
+        await client.close()
+        do {
+            _ = try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+            XCTFail("expected terminal close")
+        } catch let error as QVACError {
+            guard case .transport(let reason, _) = error else {
+                return XCTFail("expected transport error, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("client is closed"))
+        }
+        let finalFactoryCalls = await factory.calls()
+        let unusedCloseCount = await unusedReplacement.closes()
+        XCTAssertEqual(finalFactoryCalls, 1)
+        XCTAssertEqual(unusedCloseCount, 0)
+    }
+
+    func test_explicit_close_racing_active_reconnect_joins_and_closes_replacement() async throws {
+        let first = MockTransport()
+        let reconnecting = MockTransport()
+        let factory = SequencedTransportFactory(transports: [first, reconnecting])
+
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { try await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(5),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        let client = try await initialization.value
+        let initialRPC = await client.rpc
+        await first.feedError(ReconnectProbeError())
+        try await Self.waitUntilClosed(initialRPC)
+
+        let requestWaitingForReconnect = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.waitForFactoryCalls(2, on: factory)
+        let reconnectFrames = try await Self.waitForFrames(1, on: reconnecting)
+        guard case .request(_, _, _, let reconnectPayload) = reconnectFrames[0],
+              let reconnectPayload,
+              let reconnectObject = try? JSONSerialization.jsonObject(
+                with: reconnectPayload
+              ) as? [String: Any] else {
+            requestWaitingForReconnect.cancel()
+            return XCTFail("expected reconnect __init_config request")
+        }
+        XCTAssertEqual(reconnectObject["type"] as? String, "__init_config")
+
+        let clock = ContinuousClock()
+        let closeStarted = clock.now
+        await client.close()
+        XCTAssertLessThan(
+            closeStarted.duration(to: clock.now),
+            .seconds(1),
+            "close must cancel and join a pending reconnect handshake"
+        )
+
+        do {
+            _ = try await requestWaitingForReconnect.value
+            XCTFail("the request waiting for reconnect must not proceed")
+        } catch let error as QVACError {
+            guard case .transport(let reason, _) = error else {
+                return XCTFail("expected terminal transport error, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("client is closed"))
+        }
+
+        let reconnectCloseCount = await reconnecting.closes()
+        XCTAssertEqual(reconnectCloseCount, 1)
+        let reconnectRequestTypes = Self.frames(in: await reconnecting.outbound()).compactMap {
+            frame -> String? in
+            guard case .request(_, _, _, let payload) = frame,
+                  let payload,
+                  let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any]
+            else { return nil }
+            return object["type"] as? String
+        }
+        XCTAssertEqual(
+            reconnectRequestTypes,
+            ["__init_config"],
+            "no application request may cross a reconnect cancelled by close"
+        )
+
+        do {
+            _ = try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+            XCTFail("later calls must remain terminal")
+        } catch let error as QVACError {
+            guard case .transport(let reason, _) = error else {
+                return XCTFail("expected terminal transport error, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("client is closed"))
+        }
+        let finalFactoryCalls = await factory.calls()
+        XCTAssertEqual(finalFactoryCalls, 2)
+    }
+
+    #if os(macOS)
+    func test_explicit_close_cancels_reconnect_while_uds_factory_is_accepting() async throws {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qvac-reconnect-pid-\(UUID().uuidString)")
+        let workerScript = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qvac-reconnect-worker-\(UUID().uuidString).sh")
+        try Data("""
+        trap '' TERM
+        printf '%s' "$$" > '\(marker.path)'
+        exec /bin/sleep 30
+        """.utf8).write(to: workerScript, options: .atomic)
+        defer {
+            try? FileManager.default.removeItem(at: marker)
+            try? FileManager.default.removeItem(at: workerScript)
+        }
+
+        let before = Self.qvacOwnedTempDirectories()
+        let first = MockTransport()
+        let reconnectConfiguration = UDSTransportConfiguration(
+            bareExecutable: URL(fileURLWithPath: "/bin/sh"),
+            workerScript: workerScript,
+            workingDirectory: FileManager.default.temporaryDirectory,
+            initTimeout: 30
+        )
+        let factory = InitialThenUDSTransportFactory(
+            initial: first,
+            reconnectConfiguration: reconnectConfiguration
+        )
+
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { try await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(1),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        let client = try await initialization.value
+        let initialRPC = await client.rpc
+        await first.feedError(ReconnectProbeError())
+        try await Self.waitUntilClosed(initialRPC)
+
+        let requestWaitingForReconnect = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        guard try await Self.waitForFile(at: marker) else {
+            requestWaitingForReconnect.cancel()
+            await client.close()
+            _ = try? await requestWaitingForReconnect.value
+            return XCTFail("reconnect worker never entered UDS accept")
+        }
+        let during = Self.qvacOwnedTempDirectories().subtracting(before)
+        XCTAssertEqual(during.count, 1, "reconnect must own exactly one temporary listener")
+        let pidText = try String(contentsOf: marker, encoding: .utf8)
+        let workerPID = try XCTUnwrap(Int32(pidText))
+
+        let clock = ContinuousClock()
+        let closeStarted = clock.now
+        await client.close()
+        XCTAssertLessThan(
+            closeStarted.duration(to: clock.now),
+            .seconds(2),
+            "close must cancel UDS accept instead of waiting for its 30-second timeout"
+        )
+
+        do {
+            _ = try await requestWaitingForReconnect.value
+            XCTFail("the reconnecting request must not proceed after explicit close")
+        } catch let error as QVACError {
+            guard case .transport(let reason, _) = error else {
+                return XCTFail("expected terminal transport error, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("client is closed"))
+        } catch {
+            XCTFail("expected terminal QVACError, got \(error)")
+        }
+
+        let finalFactoryCalls = await factory.calls()
+        let finalGeneration = await client.__testConnectionGeneration()
+        XCTAssertEqual(finalFactoryCalls, 2)
+        XCTAssertEqual(finalGeneration, 1, "a canceled reconnect must not install a generation")
+        XCTAssertTrue(
+            Self.qvacOwnedTempDirectories().subtracting(before).isEmpty,
+            "close leaked reconnect temp directories"
+        )
+        errno = 0
+        XCTAssertEqual(Darwin.kill(workerPID, 0), -1, "reconnect worker PID still exists")
+        XCTAssertEqual(errno, ESRCH, "reconnect worker must be reaped, errno=\(errno)")
+    }
+    #endif
 }
 
 // MARK: - Tiny thread-safe atomic counter for use in @Sendable closures

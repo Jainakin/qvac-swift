@@ -24,10 +24,13 @@ targets: [
 ]
 ```
 
-Do not select `0.1.0` until that tag exists. An unpublished development checkout
-uses local generated xcframeworks and is not a valid URL dependency. The release
-preflight creates a checksum-pinned URL manifest only after every immutable binary
-archive is visible and verified.
+`0.1.0` and its checksum-pinned `artifacts-sdk-0.17.0-r1` binary closure are
+published and remain valid baseline URL-installation evidence. The repository's
+canonical `Package.swift` stays URL-backed between releases; `Package.swift.dev`
+is activated only in disposable development/CI checkouts. For a future release,
+the publisher commits the generated URL manifest for a new artifact revision,
+publishes those exact immutable assets after candidate CI passes, and then runs
+the guarded public-URL preflight before creating a new SemVer tag.
 
 The minimum platforms are iOS 17 and macOS 14 on arm64.
 
@@ -104,8 +107,9 @@ response deadline, server streams use a next-frame inactivity deadline, and dupl
 operations apply the deadline while opening the session. Values below 100 ms are
 rejected.
 
-The exact 0.17 behavior leaves the timeout unset by default. Set an explicit value
-for production calls based on the expected model and output size.
+Ordinary calls use a production-safe 60-second deadline. Set an explicit value
+based on the expected model and output size; pass `timeout: nil` only for an
+intentionally unbounded operation protected by an external watchdog.
 
 ## Errors
 
@@ -118,6 +122,8 @@ do {
     _ = try await run.final.value
 } catch let error as QVACError {
     switch error {
+    case .connectionReset:
+        reloadModelsAndRetry()
     case .requestTimedOut(let operation, _):
         print("Timed out: \(operation)")
     case .server(let code, let message):
@@ -132,6 +138,12 @@ do {
 
 Profiling-only trailer records are removed before response decoding. Malformed
 non-trailers, unknown discriminators, and truncated NDJSON still fail explicitly.
+
+On iOS, a transport-observable BareIPC EOF or write failure participates in the
+generation-safe reconnect flow. Current BareKit may not report a worklet's own exit
+as EOF; if a bounded request times out and the worklet is suspected to have ended,
+close and recreate the client. Do not retry stateful work automatically unless you
+know whether the worker processed it.
 
 Live RPC responses are exposed as `QVACResponseStream`. They are single-consumer
 sequences: use one `for try await` loop or iterator. Breaking the loop tears down

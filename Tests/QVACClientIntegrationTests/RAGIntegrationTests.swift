@@ -112,7 +112,7 @@ final class RAGIntegrationTests: XCTestCase {
 
     // MARK: - Full RAG pipeline (needs embedding model)
 
-    func test_full_RAG_ingest_search_delete_workspace_cycle() async throws {
+    func test_full_RAG_ingest_save_search_delete_cycle() async throws {
         let client = try await makeClient()
         addTeardownBlock { await client.close() }
         let workspace = "qvac-swift-test-\(UUID().uuidString)"
@@ -125,6 +125,8 @@ final class RAGIntegrationTests: XCTestCase {
             rpcOptions: .init(timeout: .seconds(600))
         )
         let modelId = try await load.result.value
+        var workspaceMayExist = false
+        var modelIsLoaded = true
 
         do {
             // 2. Ingest 3 short documents.
@@ -139,65 +141,148 @@ final class RAGIntegrationTests: XCTestCase {
                 workspace: workspace,
                 rpcOptions: .init(timeout: .seconds(120))
             )
+            workspaceMayExist = true
             let ingestResult = try await ingest.result.value
             XCTAssertGreaterThan(ingestResult.processed.count, 0)
 
-            // 3. Search for a programming-language query — should rank Swift first.
+            // 3. Exercise the segregated embed -> saveEmbeddings path with an
+            // explicit document id, then prove deleteEmbeddings accepts that id.
+            let manualDocumentID = "manual-\(UUID().uuidString)"
+            let embed = try await client.embed(
+                modelId: modelId,
+                text: "Rust is a systems programming language.",
+                rpcOptions: .init(timeout: .seconds(120))
+            )
+            let vector = try await embed.result.value.embedding
+            XCTAssertFalse(vector.isEmpty)
+            let save = try await client.ragSaveEmbeddings(
+                documents: [.init(
+                    id: manualDocumentID,
+                    content: "Rust is a systems programming language.",
+                    embedding: vector,
+                    embeddingModelId: modelId,
+                    metadata: ["source": .string("qvac-swift-live-test")]
+                )],
+                modelId: modelId,
+                workspace: workspace,
+                rpcOptions: .init(timeout: .seconds(120))
+            )
+            let saveResults = try await save.result.value
+            XCTAssertEqual(saveResults.count, 1)
+            XCTAssertEqual(saveResults[0].status, .fulfilled)
+            XCTAssertEqual(saveResults[0].id, manualDocumentID)
+            let beforeDelete = try await client.ragSearch(
+                modelId: modelId,
+                query: "Rust is a systems programming language.",
+                topK: 10,
+                n: 3,
+                workspace: workspace,
+                rpcOptions: .init(timeout: .seconds(120))
+            )
+            XCTAssertTrue(
+                beforeDelete.contains { $0.id == manualDocumentID },
+                "saved embedding must be retrievable by its explicit document id"
+            )
+            try await client.ragDeleteEmbeddings(
+                ids: [manualDocumentID],
+                modelId: modelId,
+                workspace: workspace,
+                rpcOptions: .init(timeout: .seconds(120))
+            )
+            let afterDelete = try await client.ragSearch(
+                modelId: modelId,
+                query: "Rust is a systems programming language.",
+                topK: 10,
+                n: 3,
+                workspace: workspace,
+                rpcOptions: .init(timeout: .seconds(120))
+            )
+            XCTAssertFalse(
+                afterDelete.contains { $0.id == manualDocumentID },
+                "deleted embedding must no longer be returned"
+            )
+
+            // 4. Search for one ingested document and assert identity/content,
+            // not rank: centroid initialization is intentionally randomized.
             let results = try await client.ragSearch(
                 modelId: modelId,
-                query: "what programming language",
-                topK: 3,
+                query: "Swift is a programming language by Apple.",
+                topK: 10,
                 n: 3,
                 workspace: workspace,
                 rpcOptions: .init(timeout: .seconds(120))
             )
             XCTAssertGreaterThan(results.count, 0)
-            XCTAssertTrue(results.first?.content.lowercased().contains("swift") ?? false,
-                          "expected first result to mention swift; got \(results.first?.content ?? "<nil>")")
+            XCTAssertTrue(
+                results.contains { $0.content.lowercased().contains("swift") },
+                "expected an ingested result to mention Swift; got \(results)"
+            )
 
-            // 4. List workspaces — should contain ours.
+            // 5. List workspaces — should contain ours.
             let workspaces = try await client.ragListWorkspaces(
                 rpcOptions: .init(timeout: .seconds(120))
             )
             XCTAssertTrue(workspaces.contains { $0.name == workspace })
 
-            // 5. Close/delete and unload are part of the required success path.
+            // 6. Close, explicitly delete, verify absence, and unload. Keeping
+            // close and deletion separate proves both public operations.
             try await client.ragCloseWorkspace(
                 workspace: workspace,
-                deleteOnClose: true,
+                deleteOnClose: false,
                 rpcOptions: .init(timeout: .seconds(10))
             )
+            let closedWorkspaces = try await client.ragListWorkspaces(
+                rpcOptions: .init(timeout: .seconds(10))
+            )
+            XCTAssertTrue(
+                closedWorkspaces.contains { $0.name == workspace && !$0.open },
+                "closed workspace must remain listed as closed until explicit deletion"
+            )
+            try await client.ragDeleteWorkspace(
+                workspace: workspace,
+                rpcOptions: .init(timeout: .seconds(10))
+            )
+            workspaceMayExist = false
+            let remainingWorkspaces = try await client.ragListWorkspaces(
+                rpcOptions: .init(timeout: .seconds(10))
+            )
+            XCTAssertFalse(remainingWorkspaces.contains { $0.name == workspace })
             try await client.unloadModel(
                 modelId: modelId,
                 rpcOptions: .init(timeout: .seconds(10))
             )
+            modelIsLoaded = false
         } catch let operationError {
-            do {
-                try await client.ragCloseWorkspace(
-                    workspace: workspace,
-                    deleteOnClose: true,
-                    rpcOptions: .init(timeout: .seconds(10))
-                )
-            } catch let closeError {
+            if workspaceMayExist {
                 do {
-                    try await client.ragDeleteWorkspace(
+                    try await client.ragCloseWorkspace(
                         workspace: workspace,
+                        deleteOnClose: true,
+                        rpcOptions: .init(timeout: .seconds(10))
+                    )
+                } catch let closeError {
+                    do {
+                        try await client.ragDeleteWorkspace(
+                            workspace: workspace,
+                            rpcOptions: .init(timeout: .seconds(10))
+                        )
+                    } catch {
+                        XCTFail(
+                            "RAG failure cleanup could neither close/delete workspace "
+                            + "(close: \(closeError), delete: \(error))"
+                        )
+                    }
+                }
+            }
+            if modelIsLoaded {
+                do {
+                    try await client.unloadModel(
+                        modelId: modelId,
                         rpcOptions: .init(timeout: .seconds(10))
                     )
                 } catch {
-                    XCTFail(
-                        "RAG failure cleanup could neither close/delete workspace "
-                        + "(close: \(closeError), delete: \(error))"
-                    )
+                    XCTFail("RAG failure cleanup could not unload model: \(error)")
                 }
-            }
-            do {
-                try await client.unloadModel(
-                    modelId: modelId,
-                    rpcOptions: .init(timeout: .seconds(10))
-                )
-            } catch {
-                XCTFail("RAG failure cleanup could not unload model: \(error)")
             }
             throw operationError
         }

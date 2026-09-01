@@ -150,4 +150,56 @@ final class QVACRAGErrorParityTests: XCTestCase {
         try await operation.value
         await client.close()
     }
+
+    func test_save_embeddings_matches_017_request_and_result_shapes() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let run = try await client.ragSaveEmbeddings(
+            documents: [.init(
+                id: "document-1",
+                content: "A pre-embedded document",
+                embedding: [0.25, -0.5, 0.75],
+                embeddingModelId: "embedding-model",
+                metadata: ["source": .string("unit-test")]
+            )],
+            modelId: "embedding-model",
+            workspace: "documents"
+        )
+        let request = try await Self.waitForRequest(on: transport)
+
+        XCTAssertEqual(request.body["operation"] as? String, "saveEmbeddings")
+        XCTAssertEqual(request.body["modelId"] as? String, "embedding-model")
+        XCTAssertEqual(request.body["workspace"] as? String, "documents")
+        XCTAssertEqual(request.body["requestId"] as? String, run.requestId)
+        let documents = try XCTUnwrap(request.body["documents"] as? [[String: Any]])
+        XCTAssertEqual(documents.count, 1)
+        XCTAssertEqual(documents[0]["id"] as? String, "document-1")
+        XCTAssertEqual(documents[0]["content"] as? String, "A pre-embedded document")
+        XCTAssertEqual(documents[0]["embeddingModelId"] as? String, "embedding-model")
+        XCTAssertEqual(documents[0]["embedding"] as? [Double], [0.25, -0.5, 0.75])
+        XCTAssertEqual(
+            (documents[0]["metadata"] as? [String: Any])?["source"] as? String,
+            "unit-test"
+        )
+
+        try await Self.feedReply(
+            id: request.id,
+            response: .rag(.init(
+                operation: "saveEmbeddings",
+                success: true,
+                processed: [.object([
+                    "status": .string("fulfilled"),
+                    "id": .string("document-1"),
+                ])]
+            )),
+            to: transport
+        )
+
+        let results = try await run.result.value
+        XCTAssertEqual(results.count, 1)
+        XCTAssertEqual(results[0].status, .fulfilled)
+        XCTAssertEqual(results[0].id, "document-1")
+        XCTAssertNil(results[0].error)
+        await client.close()
+    }
 }

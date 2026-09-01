@@ -87,6 +87,7 @@ public extension QVACClient {
             let rawSession = raw
             return QVACClient.pullMap(
                 inner,
+                operation: "transcribeStream",
                 onTermination: { rawSession.destroy() },
                 endOfSourceError: {
                     QVACError.client(
@@ -107,7 +108,7 @@ public extension QVACClient {
                 if let endOfTurn = response.endOfTurn { events.append(.endOfTurn(endOfTurn)) }
                 if response.done == true {
                     events.append(.done)
-                    return .emitThenFinish(events)
+                    return .emitThenDrain(events)
                 }
                 return .emitMany(events)
             }

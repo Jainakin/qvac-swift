@@ -121,7 +121,8 @@ final class LiveWorkerIntegrationTests: XCTestCase {
         )
         var sawProgress = false
         var sawCompletion = false
-        for try await raw in stream.chunks {
+        var succeeded = false
+        responseLoop: for try await raw in stream.chunks {
             // The wire format is NDJSON inside each STREAM-DATA frame; the chunk may contain
             // one or several lines.
             let text = String(data: raw, encoding: .utf8) ?? ""
@@ -133,15 +134,14 @@ final class LiveWorkerIntegrationTests: XCTestCase {
                 if obj["type"] as? String == "modelProgress" { sawProgress = true }
                 if obj["type"] as? String == "downloadAsset" {
                     sawCompletion = true
-                    if let ok = obj["success"] as? Bool, ok {
-                        return // success path
-                    }
+                    succeeded = obj["success"] as? Bool == true
+                    break responseLoop
                 }
             }
-            if sawCompletion { return }
         }
         XCTAssertTrue(sawProgress, "expected at least one modelProgress event")
         XCTAssertTrue(sawCompletion, "expected a downloadAsset completion event")
+        XCTAssertTrue(succeeded, "expected downloadAsset to complete successfully")
     }
 
     /// Exercise both native 0.17 cancel arms. A missing request id is an idempotent

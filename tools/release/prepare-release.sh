@@ -63,4 +63,4 @@ node "$SCRIPT_DIR/verify-release.mjs" "$MANIFEST" \
 swift package --package-path "$REPO_ROOT" dump-package >/dev/null
 
 echo "[prepare-release] published artifacts, canonical URL manifest, and source commit are identical"
-echo "[prepare-release] run the Source Release workflow from this exact main commit; it verifies again before creating a SemVer tag"
+echo "[prepare-release] dispatch Source Release from ref $ARTIFACT_TAG with artifact_tag=$ARTIFACT_TAG; it verifies again before creating a SemVer tag"

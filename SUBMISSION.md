@@ -1,6 +1,6 @@
 # QVAC Swift Client — SDK 0.17.0 submission evidence
 
-This document is the current reviewer handoff for the published Swift client. It
+This document is the current reviewer handoff for the Swift client source. It
 supersedes the historical SDK 0.10 planning and audit snapshots in `PLAN.md` and
 `AUDIT.md`.
 
@@ -10,12 +10,20 @@ Published `0.1.x` releases target the exact `@qvac/sdk@0.17.0` contract at npm
 
 ## Executive status
 
-All seven engineering-review changes were implemented and first published from
-exact source commit `85ac16212e43ec4572c96f04bf278cd67e52eb7f`. The source,
-generated API, worker, native dependency closure, tests, example, and guarded
-release automation formed the first production Swift package, `v0.1.0`. Later
-documentation, Index-configuration, or release-metadata follow-ups do not add a
-0.10 migration layer or silently change that 0.17 contract.
+The exact 0.17 source, generated API, worker, native dependency closure, tests,
+example, and guarded release automation formed the baseline production Swift
+package, `v0.1.0`, from commit
+`85ac16212e43ec4572c96f04bf278cd67e52eb7f`. The current source handoff adds the
+remaining review and grant hardening after that immutable baseline: a finite
+default request deadline, generation-safe worker reconnect, rich-duplex
+profiling-trailer draining, stronger RAG/profiling tests, and an exact-revision
+iOS 17 runtime-consumer gate. It still targets only 0.17 and deliberately adds no
+0.10 compatibility or migration layer.
+
+No new artifact release, source tag, GitHub Release, or Swift Package Index
+submission is created as part of this handoff. The authorized grant publisher
+owns those publication operations and can use the guarded additive-release process
+in `docs/distribution.md` after the final source commit is green.
 
 In `v0.1.0`, canonical `Package.swift` is the checksum-pinned public URL manifest
 for its 38 XCFramework archives. The archives, worker, manifest, provenance,
@@ -49,10 +57,10 @@ accepted that attestation and published the bound notice byte.
 | # | Reviewer request | Resolution and evidence |
 |---|---|---|
 | 1 | Default missing `modelConfig` | The shared load-model request builder normalizes an omitted value to `{}` for both unary and progress calls. Unit and real-model tests exercise the omitted configuration path. |
-| 2 | Add per-request timeouts | Every public operation accepts trailing `rpcOptions: QVACRPCOptions`. Unary calls use a total deadline, server streams use a resettable inactivity deadline, and duplex calls use a setup deadline. Timeout and task cancellation remove pending RPC state and close the appropriate stream directions. The default remains `nil`, exactly matching the executable 0.17 contract; production examples set operation-specific bounds. |
-| 3 | Handle profiling trailers | `QVACNDJSONDecoder` incrementally handles fragmented/coalesced records, CRLF, EOF residuals, size limits, and top-level `__profilingTrailer: true` records. A profiling trailer is separated from typed responses; malformed non-trailers still fail decoding. |
+| 2 | Add per-request timeouts | Every public operation accepts trailing `rpcOptions: QVACRPCOptions`. Unary calls use a total deadline, server streams use a resettable inactivity deadline, and duplex calls use a setup deadline. Ordinary calls now default to a finite 60-second deadline; explicit `timeout: nil` remains available only for intentionally unbounded work protected by an external watchdog. Timeout and task cancellation remove pending RPC state and close the appropriate stream directions. |
+| 3 | Handle profiling trailers | `QVACNDJSONDecoder` incrementally handles fragmented/coalesced records, CRLF, EOF residuals, size limits, and top-level `__profilingTrailer: true` records. Profiling trailers are separated from typed responses; rich duplex wrappers perform a bounded drain to EOF before exposing their logical terminal event, so the following trailer is captured even if the consumer then stops. A typed frame after logical completion is rejected as a protocol violation, while malformed non-trailers still fail decoding. Synthetic and real 0.17 model tests cover this path. |
 | 4 | Pin code generation | `tools/provenance/qvac-sdk.lock.json` binds the npm tarball, integrity, shasum, release commit, and every contract input hash. Generation consumes the committed language-neutral 0.17 contract. Bootstrap independently exports the published npm contract and rejects semantic drift. Node, npm dependencies, generated output, and provenance are all locked and CI-verified. |
-| 5 | Fix real-model tests | The missing/floating fixture was replaced with checksum-, size-, filename-, and revision-pinned LLM and RAG fixtures. Required-suite wrappers reject missing configuration, skips, zero executed tests, or wrong suite names. The final local runs completed LLM 3/3 and RAG 2/2 with zero skips. |
+| 5 | Fix real-model tests | The missing/floating fixture was replaced with checksum-, size-, filename-, and revision-pinned LLM and RAG fixtures. Required-suite wrappers reject missing configuration, skips, zero executed tests, or wrong suite names. The current local runs completed LLM 4/4 and RAG 2/2 with zero skips. |
 | 6 | Add upscale and URL installation | The exact 0.17 upscale API, rich `Data` result surface, alias normalization, progress/terminal behavior, large-frame support, unit tests, and a checksum-pinned real Real-ESRGAN test are implemented. The first 38 checksum-bound XCFramework archives are public in `artifacts-sdk-0.17.0-r1`; `v0.1.0` and its checksum-pinned root manifest remain installable directly from the Git URL. |
 | 7 | Bring the client to the current SDK | Generated request/response unions, exact wire entry points, and live coverage now match all 39 SDK 0.17 methods, 43 response leaves, 136 error codes, and 12 public model-type aliases. New 0.17 operations include audio/video/upscale, BCI, VLA, orchestration, classification, finetune, system/model-registry, lifecycle, logging, and provider APIs. |
 
@@ -79,14 +87,33 @@ accepted that attestation and published the bound notice byte.
   the connection instead of permanently wedging later calls. Parent-side worker
   pipe writers are closed immediately after spawn, so early worker exit cannot
   leave startup cleanup waiting forever on an EOF that the parent prevents.
+- Unexpected EOF, inbound failure, or outbound write failure invalidates one
+  transport generation. In-flight work fails once and is never replayed; the next
+  new call single-flights a fresh worker and `__init_config`. Calls that cross a
+  successful reconnect receive typed `connectionReset` before any application
+  request is sent, making lost model/session state explicit. Failed reconnects
+  close completely and remain retryable, and explicit close is terminal. Live
+  `SIGKILL` recovery is verified on macOS. On iOS the same path requires an
+  observable BareIPC EOF/write failure; pinned BareKit can retain IPC descriptors
+  after worklet self-exit, so a timed-out caller must close/recreate the client.
 - iOS shutdown sends bounded `__shutdown__` before terminating the worklet, and
   all concurrent close callers join the same cleanup operation.
 - Errors leaving public request and sequence boundaries are normalized to
   `QVACError`, except Swift task cancellation, which remains `CancellationError`.
 
-## Verification of the released commit
+The unreleased review delta was revalidated locally on 2026-09-01: the strict
+unit suite passed 234/234, all 12 required no-model live tests passed, and all
+seven required pinned-model tests passed with zero skips. Those model tests
+include the real profiled completion trailer, full RAG ingest/save/search/delete/
+close lifecycle, and public upscale path. The iOS Simulator passed both the real
+bundled-worker handshake/heartbeat/close smoke and the observable-EOF adapter
+ordering test. The source commit remains subject to
+the same exact-SHA hosted matrix before grant handoff; local results are not
+presented as a substitute for that independent run.
 
-The local acceptance results below were obtained on 2026-08-31. The streaming
+## Verification evidence
+
+The detailed baseline results below were obtained on 2026-08-31. The streaming
 benchmark was first accepted from clean source commit
 `f753e8c6c438b421050bc7411720a2aa382ec91e`, then repeated by the complete hosted
 matrix for exact released commit
@@ -182,16 +209,18 @@ generated output freshness, reproduces the worker twice, exercises a hosted iOS
 Simulator XCTest, builds the SwiftUI example for iOS and macOS, and uploads the
 benchmark evidence.
 
-CI validates both legitimate repository phases: the exact path-based development
-manifest and a strictly generated checksum-pinned URL release manifest. Before URL
-publication, it used `Package.swift.dev` only as an ephemeral build overlay;
-publication and source-release gates independently verified the canonical URL
-manifest and every remote byte. This kept the final release commit testable
-without weakening its public distribution contract.
+Repository tooling validates both the exact path-based development graph and the
+strictly generated checksum-pinned URL manifest, while pushed `main` remains in
+URL-manifest mode. If a newly referenced artifact revision has not yet been
+published, the iOS 17 CI job records candidate mode and tests the verified local
+graph without claiming URL proof. After immutable artifact publication, the
+source-release workflow must resolve the exact public Git revision, verify all 38
+remote artifacts, and complete a real iOS 17 worker handshake before it may create
+a SemVer tag. This makes the publication sequence non-circular and fail-closed.
 
 ## Grant acceptance and key results
 
-| Requirement | Released status |
+| Requirement | Current source status and prior release evidence |
 |---|---|
 | Code generation produces compilable Swift with zero manual generated edits | Implemented; exact-release-SHA CI reproduced the generated output and required no diff |
 | macOS 14 arm64 and iOS 17 arm64 compilation | Implemented; local macOS strict build plus clean iOS device/simulator builds passed |
@@ -200,25 +229,28 @@ without weakening its public distribution contract.
 | Incremental `AsyncSequence` streams | Implemented, bounded, cancellation-aware, and lifecycle-tested |
 | Real cancellation acknowledgement | Required real-model test passes without a silent skip; the worker's valid pre-start `cancelled: 0` acknowledgement is handled while cancellation is proven by the terminal result |
 | Clean close and worker termination | Deterministic unit/integration coverage passes, including concurrent close and blocked I/O |
+| Worker/socket reconnection | Implemented with generation isolation, no replay, single-flight reconnect, typed state-loss notification before retry, retryable cleanup, and terminal explicit close; deterministic race tests and a live native-worker macOS `SIGKILL` recovery test cover it. iOS replacement requires a BareIPC-observable EOF/write failure; current BareKit self-exit can remain unobservable, so bounded timeout plus explicit client recreation is the documented containment path. |
 | Typed SDK errors | All 136 exact 0.17 codes plus registry/model-registry categories are generated and mapped |
 | Clone to first inference under 10 minutes | Passed in the exact-release-SHA CI run under the hard 600-second limit |
 | Streaming overhead below 5% | Passed on real public completion streams; the server-normalized mean delivery-factor and raw p99 co-primary intact-block 95% upper bounds are strictly below 1.05, with raw end-to-end metrics retained and no retries or exclusions |
 | Code generation under 30 seconds | Passed twice at 0.25 seconds and remains a fixed CI gate |
 | Physical iPhone example | Source and generic device build are ready; a current 0.17 run on an actual iPhone remains required evidence |
-| SwiftPM URL tag and Swift Package Index | The checksum-bound `r1` artifacts, `v0.1.0`, and anonymous URL-consumer verification are complete. Root SPI hosted-DocC configuration and guidance are present in the post-release repository follow-up; actual Index submission, build verification, maintainer claim, and badges remain external. Because `v0.1.0` predates `.spi.yml`, it remains valid install evidence but is not a configured versioned-DocC tag. A later release containing `.spi.yml` is eligible for that evidence without moving or replacing `v0.1.0`; every indexed tag must be verified independently. |
+| SwiftPM URL and Swift Package Index | The checksum-bound `r1` artifacts and `v0.1.0` prove baseline URL installation. CI accepts a handoff commit only after anonymously resolving that exact public Git revision with all 38 remote artifacts and completing a live iOS 17 worker handshake. Root SPI hosted-DocC configuration and publication guidance are complete. Actual additive release and Index publication remain publisher-owned and are intentionally not performed here. |
 
 ## Remaining external submission evidence
 
-The production package and baseline releases are complete. Two grant-facing
+The production source, baseline release evidence, Swift Package Index
+configuration, and publication guidance are complete. Two ownership-boundary
 actions remain external and cannot be represented as completed without their own
 evidence:
 
 1. Run the SwiftUI example on a physical iPhone with SDK 0.17.0 and retain the
    device/build/log evidence for the grant reviewer.
-2. Submit the public Git URL to Swift Package Index; verify the indexed platforms,
-   product, release, build results, and hosted documentation; claim maintainer
-   ownership; and only then add the generated compatibility badges.
+2. When the grant publisher is ready, create the next additive artifact/source
+   release from the final green commit and perform/verify Swift Package Index
+   publication if the live Index listing is part of acceptance.
 
-The exact `artifacts-sdk-0.17.0-r1` and `v0.1.0` evidence remain public. Update
-this status only after separate evidence proves Swift Package Index submission or
-a current 0.17 physical-iPhone run; neither is represented as completed here.
+The exact `artifacts-sdk-0.17.0-r1` and `v0.1.0` evidence remain public. No new
+artifact release, source release, or Swift Package Index submission is part of
+this handoff; those operations are reserved for the authorized grant publisher.
+Update this status only from actual physical-device and publication evidence.

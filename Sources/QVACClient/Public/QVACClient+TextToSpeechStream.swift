@@ -80,6 +80,7 @@ public extension QVACClient {
             let rawSession = raw
             return QVACClient.pullMap(
                 inner,
+                operation: "textToSpeechStream",
                 onTermination: { rawSession.destroy() },
                 endOfSourceError: {
                     QVACError.client(
@@ -97,7 +98,7 @@ public extension QVACClient {
                     )
                     : nil
                 if response.done == true {
-                    return .emitThenFinish(chunk.map { [$0] } ?? [])
+                    return .emitThenDrain(chunk.map { [$0] } ?? [])
                 }
                 return chunk.map(QVACPullMapDecision.emit) ?? .skip
             }

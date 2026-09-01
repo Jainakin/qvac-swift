@@ -111,6 +111,7 @@ public extension QVACClient {
             let rawSession = raw
             return QVACClient.pullMap(
                 responses,
+                operation: "bciTranscribeStream",
                 onTermination: { rawSession.destroy() },
                 endOfSourceError: {
                     QVACError.client(
@@ -131,7 +132,7 @@ public extension QVACClient {
                 }
                 if frame.done == true {
                     events.append(.done(stats: frame.stats))
-                    return .emitThenFinish(events)
+                    return .emitThenDrain(events)
                 }
                 return .emitMany(events)
             }

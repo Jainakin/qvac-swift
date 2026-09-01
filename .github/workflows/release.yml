@@ -17,18 +17,28 @@ permissions:
   attestations: read
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: source-release
   cancel-in-progress: false
 
 jobs:
   verify-and-release:
-    runs-on: macos-14
-    timeout-minutes: 60
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      QVAC_IOS_RUNTIME_VERSION: "17.0"
+      QVAC_IOS_RUNTIME_ID: com.apple.CoreSimulator.SimRuntime.iOS-17-0
+      QVAC_IOS_DEVICE_TYPE_ID: com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.22.0
@@ -38,26 +48,32 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_ARTIFACT_TAG: ${{ inputs.artifact_tag }}
         run: |
-          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo "::error::Source releases may only be dispatched from main"
-            exit 1
-          fi
-          if [[ ! "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::version must be a SemVer without the v prefix"
+          if ! node tools/release/validate-release-version.mjs "$INPUT_VERSION"; then
+            echo "::error::version must be a valid SemVer without v or build metadata"
             exit 1
           fi
           if [[ ! "$INPUT_ARTIFACT_TAG" =~ ^artifacts-sdk-0\.17\.0-r[1-9][0-9]*$ ]]; then
             echo "::error::artifact_tag must be artifacts-sdk-0.17.0-rN"
             exit 1
           fi
+          if [ "$GITHUB_REF" != "refs/tags/$INPUT_ARTIFACT_TAG" ]; then
+            echo "::error::Dispatch Source Release from the exact immutable artifact tag $INPUT_ARTIFACT_TAG"
+            echo "selected-ref=$GITHUB_REF"
+            exit 1
+          fi
           VERSION_TAG="v$INPUT_VERSION"
+          SOURCE_PRERELEASE=false
+          if [[ "$INPUT_VERSION" == *-* ]]; then
+            SOURCE_PRERELEASE=true
+          fi
           echo "VERSION_TAG=$VERSION_TAG" >> "$GITHUB_ENV"
+          echo "SOURCE_VERSION=$INPUT_VERSION" >> "$GITHUB_ENV"
           echo "ARTIFACT_TAG=$INPUT_ARTIFACT_TAG" >> "$GITHUB_ENV"
+          echo "SOURCE_PRERELEASE=$SOURCE_PRERELEASE" >> "$GITHUB_ENV"
           gh release verify --help >/dev/null
 
           CHECKED_OUT="$(git rev-parse HEAD)"
           EVENT_COMMIT="$(git rev-parse "$GITHUB_SHA^{commit}")"
-          REMOTE_MAIN="$(git ls-remote origin refs/heads/main | awk 'NF == 2 { print $1; exit }')"
           if [ "$CHECKED_OUT" != "$EVENT_COMMIT" ]; then
             echo "::error::Checked-out commit and GITHUB_SHA must be identical"
             echo "checkout=$CHECKED_OUT event=$EVENT_COMMIT"
@@ -104,7 +120,7 @@ jobs:
               --jq '[.draft, .prerelease, .immutable] | @tsv')"
             IFS=$'\t' read -r IS_DRAFT IS_PRERELEASE IS_IMMUTABLE <<< "$RELEASE_STATE"
             if [ "$IS_DRAFT" != false ] || \
-               [ "$IS_PRERELEASE" != false ] || \
+               [ "$IS_PRERELEASE" != "$SOURCE_PRERELEASE" ] || \
                [ "$IS_IMMUTABLE" != true ]; then
               echo "::error::Existing $VERSION_TAG is not a published immutable source release"
               echo "draft=$IS_DRAFT prerelease=$IS_PRERELEASE immutable=$IS_IMMUTABLE"
@@ -113,10 +129,21 @@ jobs:
             SOURCE_RELEASE_EXISTS=true
             echo "Resuming verification of existing immutable source release $VERSION_TAG"
           fi
-          if [ "$REMOTE_MAIN" != "$EVENT_COMMIT" ] && [ "$SOURCE_TAG_EXISTS" != true ]; then
-            echo "::error::Current remote main must equal the release commit before the source tag is created"
-            echo "release=$EVENT_COMMIT remote-main=$REMOTE_MAIN"
-            exit 1
+          if [ "$SOURCE_RELEASE_EXISTS" != true ]; then
+            EXISTING_VERSIONS="$RUNNER_TEMP/qvac-existing-source-versions.txt"
+            git ls-remote --tags --refs origin 'refs/tags/v*' | awk \
+              -v requested="$INPUT_VERSION" '
+                $2 ~ /^refs\/tags\/v/ {
+                  value = $2
+                  sub(/^refs\/tags\/v/, "", value)
+                  if (value != requested) print value
+                }
+              ' > "$EXISTING_VERSIONS"
+            if ! node tools/release/validate-release-version.mjs \
+              "$INPUT_VERSION" "$EXISTING_VERSIONS"; then
+              echo "::error::A new source version must have greater SemVer precedence than every existing source tag"
+              exit 1
+            fi
           fi
           echo "SOURCE_TAG_EXISTS=$SOURCE_TAG_EXISTS" >> "$GITHUB_ENV"
           echo "SOURCE_RELEASE_EXISTS=$SOURCE_RELEASE_EXISTS" >> "$GITHUB_ENV"
@@ -175,14 +202,75 @@ jobs:
             --revision "$GITHUB_SHA"
       - name: Unit tests through the verified URL manifest
         run: swift test --filter QVACClientUnitTests
+      - name: Pin Xcode and install the exact minimum iOS runtime
+        timeout-minutes: 40
+        run: |
+          test "$(xcodebuild -version | sed -n '1p')" = 'Xcode 16.4'
+          test "$(xcodebuild -version | sed -n '2p')" = 'Build version 16F6'
+          if ! xcrun simctl list -j runtimes | jq -e --arg id "$QVAC_IOS_RUNTIME_ID" \
+            'any(.runtimes[]; .identifier == $id and .isAvailable == true)' >/dev/null; then
+            for ATTEMPT in 1 2; do
+              if xcodebuild -downloadPlatform iOS -buildVersion "$QVAC_IOS_RUNTIME_VERSION"; then
+                break
+              fi
+              if [ "$ATTEMPT" = 2 ]; then
+                echo "::error::Could not install iOS $QVAC_IOS_RUNTIME_VERSION Simulator runtime"
+                exit 1
+              fi
+            done
+          fi
+          xcrun simctl list -j runtimes | jq -e --arg id "$QVAC_IOS_RUNTIME_ID" \
+            'any(.runtimes[]; .identifier == $id and .isAvailable == true)' >/dev/null
+      - name: Create and boot a fresh pinned simulator
+        run: |
+          xcrun simctl list -j devicetypes | jq -e --arg id "$QVAC_IOS_DEVICE_TYPE_ID" \
+            'any(.devicetypes[]; .identifier == $id)' >/dev/null
+          UDID="$(xcrun simctl create \
+            "qvac-source-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            "$QVAC_IOS_DEVICE_TYPE_ID" \
+            "$QVAC_IOS_RUNTIME_ID")"
+          echo "QVAC_SIMULATOR_UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+      - name: Prove the public revision and worker on exact iOS 17 before tagging
+        run: |
+          tools/ci/test-ios-url-consumer.sh \
+            "https://github.com/${GITHUB_REPOSITORY}.git" \
+            --revision "$GITHUB_SHA" \
+            "$QVAC_SIMULATOR_UDID" \
+            "$RUNNER_TEMP/qvac-source-release-ios.xcresult"
+      - name: Tear down the release-preflight simulator
+        if: always()
+        run: |
+          if [ -n "${QVAC_SIMULATOR_UDID:-}" ]; then
+            xcrun simctl shutdown "$QVAC_SIMULATOR_UDID" || true
+            xcrun simctl delete "$QVAC_SIMULATOR_UDID" || true
+          fi
+      - name: Upload source-release URL evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: source-release-ios17-url-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/qvac-source-release-ios.xcresult
+            ${{ runner.temp }}/qvac-source-release-ios.log
+          if-no-files-found: warn
       - name: Create the immutable source tag and release only after all gates pass
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          REMOTE_MAIN="$(git ls-remote origin refs/heads/main | awk 'NF == 2 { print $1; exit }')"
-          if [ "$SOURCE_TAG_EXISTS" != true ] && [ "$REMOTE_MAIN" != "$GITHUB_SHA" ]; then
-            echo "::error::main advanced during verification; dispatch again from the new commit"
-            exit 1
+          if [ "$SOURCE_RELEASE_EXISTS" != true ]; then
+            EXISTING_VERSIONS="$RUNNER_TEMP/qvac-final-source-versions.txt"
+            git ls-remote --tags --refs origin 'refs/tags/v*' | awk \
+              -v requested="$SOURCE_VERSION" '
+                $2 ~ /^refs\/tags\/v/ {
+                  value = $2
+                  sub(/^refs\/tags\/v/, "", value)
+                  if (value != requested) print value
+                }
+              ' > "$EXISTING_VERSIONS"
+            node tools/release/validate-release-version.mjs \
+              "$SOURCE_VERSION" "$EXISTING_VERSIONS"
           fi
           if [ "$SOURCE_RELEASE_EXISTS" != true ] && \
              gh release view "$VERSION_TAG" >/dev/null 2>&1; then
@@ -201,10 +289,21 @@ jobs:
             exit 1
           fi
           if [ -z "$SOURCE_COMMIT" ]; then
-            git config user.name github-actions
-            git config user.email github-actions@github.com
-            git tag -a "$VERSION_TAG" "$GITHUB_SHA" -m "QVACClient $VERSION_TAG"
-            git push origin "refs/tags/$VERSION_TAG"
+            TAG_OBJECT_SHA="$(gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/git/tags" \
+              -f tag="$VERSION_TAG" \
+              -f message="QVACClient $VERSION_TAG" \
+              -f object="$GITHUB_SHA" \
+              -f type=commit \
+              --jq .sha)"
+            if [[ ! "$TAG_OBJECT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::GitHub did not return a valid annotated tag object"
+              exit 1
+            fi
+            gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$VERSION_TAG" \
+              -f sha="$TAG_OBJECT_SHA" >/dev/null
           fi
 
           REMOTE_REFS="$(git ls-remote --tags origin \
@@ -219,12 +318,22 @@ jobs:
           fi
           if [ "$SOURCE_RELEASE_EXISTS" != true ]; then
             RELEASE_NOTES="Production SwiftPM release for exact @qvac/sdk 0.17.0. Immutable binary artifacts and provenance: https://github.com/$GITHUB_REPOSITORY/releases/tag/$ARTIFACT_TAG"
-            gh release create "$VERSION_TAG" \
-              --verify-tag \
-              --latest \
-              --title "QVACClient $VERSION_TAG" \
-              --notes "$RELEASE_NOTES" \
-              --generate-notes
+            if [ "$SOURCE_PRERELEASE" = true ]; then
+              gh release create "$VERSION_TAG" \
+                --verify-tag \
+                --prerelease \
+                --latest=false \
+                --title "QVACClient $VERSION_TAG" \
+                --notes "$RELEASE_NOTES" \
+                --generate-notes
+            else
+              gh release create "$VERSION_TAG" \
+                --verify-tag \
+                --latest \
+                --title "QVACClient $VERSION_TAG" \
+                --notes "$RELEASE_NOTES" \
+                --generate-notes
+            fi
           fi
 
           verify_published_source() {
@@ -240,7 +349,7 @@ jobs:
             IFS=$'\t' read -r IS_DRAFT IS_PRERELEASE IS_IMMUTABLE <<< "$RELEASE_STATE"
             [ "$VERIFIED_COMMIT" = "$GITHUB_SHA" ] && \
               [ "$IS_DRAFT" = false ] && \
-              [ "$IS_PRERELEASE" = false ] && \
+              [ "$IS_PRERELEASE" = "$SOURCE_PRERELEASE" ] && \
               [ "$IS_IMMUTABLE" = true ]
           }
 

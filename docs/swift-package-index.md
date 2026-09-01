@@ -68,6 +68,8 @@ a valid root manifest, Swift 5 or later, a SemVer release, a protocol-qualified
 5. Record the indexed package/documentation URLs and successful build evidence in
    `SUBMISSION.md`; do not infer completion merely from submitting the form.
 
-Artifact/source publication is complete. Index submission, build verification,
-maintainer claiming, and badges require external account/service actions and are
-intentionally not represented as complete until that evidence exists.
+The repository-side Index preparation is complete: this document and `.spi.yml`
+provide the required guidance and hosted-DocC configuration. Actual Index
+submission, build verification, maintainer claiming, and badges remain
+publisher-owned operations; perform them only with explicit publication authority
+and do not describe them as complete without the resulting evidence.

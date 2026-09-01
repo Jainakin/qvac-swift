@@ -449,7 +449,23 @@ fixing, all addressed in this section.
 - **`AllRPCTypesRoundTripTests` only exercises error paths** (every call hits "model not loaded" / "nonexistent workspace") — by design, to avoid downloading models in CI. Success-path wire format is exercised by `RealModelIntegrationTests` + `RAGIntegrationTests` (with real models). The combination is sufficient for AC-4 coverage.
 - **HuggingFace as a CI dependency** — `integration-macos-real-model` and `integration-macos-rag` download HF GGUF files each run. If HF rate-limits or goes down, those jobs fail. No mitigation today; acceptable risk because (a) the same jobs gracefully skip on missing `HF_TOKEN`, (b) we can mirror to a stable URL if it becomes a recurring issue.
 - **`tetherto/qvac` as a CI dependency** — `codegen-freshness` sparse-clones the upstream repo each run. Same shape as HF risk. Acceptable for now; could mirror.
-- **No coverage for "worker crash, then reconnect"** or "stream backpressure" — not grant-required; deferred.
+- **Worker crash / reconnect — done**: EOF, inbound failures, and outbound channel
+  failures now invalidate the active transport generation. The failed in-flight
+  operation is never replayed; the next new call single-flights a fresh worker plus
+  `__init_config`. Every call crossing a successful reconnect receives typed
+  `connectionReset` before application work is sent, making the loss of loaded
+  model/session state explicit; a later retry uses the ready generation. Failed
+  reconnects are closed and retryable, and explicit `close()` remains terminal.
+  Deterministic tests cover concurrency, no-replay, cleanup/retry, state-loss
+  signaling, and terminal close; a live macOS test terminates the real worker with
+  `SIGKILL`, observes `connectionReset`, and verifies a retry succeeds on generation
+  2 with a different native Bare PID. On iOS, the adapter now distinguishes
+  would-block (`nil`) from observable peer EOF (zero-byte data) and preserves queued
+  response bytes before finishing the stream. This is deliberately not described as
+  general iOS crash recovery: pinned BareKit can retain the IPC descriptors after a
+  worklet self-exit (upstream issue #83), leaving no EOF for the host to observe.
+- **Stream backpressure** — bounded host-side transport and per-operation queues are
+  covered; wire-level PAUSE/RESUME policy remains outside this grant's API scope.
 - **iOS bundle supply chain** — `Sources/QVACClient/Resources/worker.mobile.bundle.js` is release-time vendored from `@qvac/sdk`. The release.yml workflow tries to regenerate it with `continue-on-error: true`; if upstream `bare-pack` breaks, the committed bundle is kept. Inherent supply-chain trust on the SDK at the version we pinned. Documented in DocC `Security.md`; no further mitigation planned for this milestone.
 
 ---

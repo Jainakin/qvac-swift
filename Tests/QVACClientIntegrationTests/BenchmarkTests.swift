@@ -419,7 +419,11 @@ final class BenchmarkTests: XCTestCase {
             ]),
             kvCache: .bool(workload.completion.kvCache),
             captureThinking: workload.completion.captureThinking,
-            emitRawDeltas: workload.completion.emitRawDeltas
+            emitRawDeltas: workload.completion.emitRawDeltas,
+            // The benchmark's owned process watchdog is the symmetric deadline
+            // for both the Swift and JavaScript clients. Opt out of the SDK's
+            // production default so timeout policy cannot bias either arm.
+            rpcOptions: .init(timeout: nil)
         )
 
         var arrivals: [Double] = []

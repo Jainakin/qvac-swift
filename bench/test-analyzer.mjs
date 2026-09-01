@@ -326,8 +326,9 @@ try {
       && !nodeCompletionBody.includes('rpcOptions'),
   'Node measured completion must rely solely on the common process watchdog')
   assert.ok(swiftCompletionBody.includes('let run = try await client.completion(')
-      && !swiftCompletionBody.includes('rpcOptions:'),
-  'Swift measured completion must rely solely on the common process watchdog')
+      && /rpcOptions: \.init\(timeout: nil\)/.test(swiftCompletionBody)
+      && [...swiftCompletionBody.matchAll(/rpcOptions:/g)].length === 1,
+  'Swift measured completion must explicitly disable its production deadline and rely solely on the common process watchdog')
   assert.equal(canonicalWorkload.schema_version, 3)
   assert.equal(
     canonicalWorkload.measurement.normalized_mean_factor_formula,

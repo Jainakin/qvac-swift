@@ -56,6 +56,8 @@ public actor QVACClient {
     /// `iOSWithBundledResource`; transport implementation types are not part
     /// of the SDK's public API.
     public struct Configuration: Sendable {
+        typealias TransportFactory = @Sendable () async throws -> BareTransport
+
         enum Storage: Sendable {
         #if os(macOS)
             case macOSSubprocess(UDSTransportConfiguration)
@@ -66,6 +68,10 @@ public actor QVACClient {
             /// Internal-only seam that still exercises the production initializer,
             /// including handshake validation and public error normalization.
             case testing(BareTransport, shutdownBeforeClose: Bool)
+            /// Repeatable internal seam used to prove generation replacement,
+            /// single-flight reconnect, and failed-attempt cleanup without a real
+            /// subprocess or BareKit worklet.
+            case testingFactory(TransportFactory, shutdownBeforeClose: Bool)
         }
 
         let storage: Storage
@@ -93,6 +99,16 @@ public actor QVACClient {
             shutdownBeforeClose: Bool = false
         ) -> Self {
             Self(storage: .testing(transport, shutdownBeforeClose: shutdownBeforeClose))
+        }
+
+        static func testing(
+            factory: @escaping TransportFactory,
+            shutdownBeforeClose: Bool = false
+        ) -> Self {
+            Self(storage: .testingFactory(
+                factory,
+                shutdownBeforeClose: shutdownBeforeClose
+            ))
         }
 
         /// macOS convenience — prefers the lockfile-local
@@ -275,18 +291,37 @@ public actor QVACClient {
 
     // MARK: - State
 
-    let transport: BareTransport
-    let rpc: BareRPCClient
+    private struct RPCConnection: Sendable {
+        let transport: BareTransport
+        let rpc: BareRPCClient
+    }
+
+    private struct ReconnectAttempt: Sendable {
+        let id: UInt64
+        let task: Task<RPCConnection, Error>
+        let resultHub: QVACSharedTaskResultHub<RPCConnection>
+    }
+
+    private(set) var transport: BareTransport
+    private(set) var rpc: BareRPCClient
     let maximumWireMessageBytes: Int
     let maximumBufferedStreamBytes: Int
     private let shutdownBeforeClose: Bool
     private let shutdownTimeout: Duration
     private let logger: BareRPCLogger?
     private let profilingMetadataHandler: (@Sendable (QVACProfilingMetadata) -> Void)?
+    private let transportFactory: Configuration.TransportFactory?
+    private let runtimeContext: QVACRuntimeContext?
+    private let workerConfig: JSONValue?
+    private let initHandshakeTimeout: Duration
     private var commandCounter: UInt64 = 0
     private var initialized = false
     private var closed = false
     private var closeTask: Task<Void, Never>?
+    private var connectionGeneration: UInt64 = 1
+    private var nextReconnectAttemptID: UInt64 = 1
+    private var reconnectAttempt: ReconnectAttempt?
+    private var afterOpenCheckTestHook: (@Sendable () async -> Void)?
 
     // MARK: - Lifecycle
 
@@ -312,6 +347,10 @@ public actor QVACClient {
         self.shutdownTimeout = shutdownTimeout
         self.logger = logger
         self.profilingMetadataHandler = profilingMetadataHandler
+        self.transportFactory = nil
+        self.runtimeContext = nil
+        self.workerConfig = nil
+        self.initHandshakeTimeout = .seconds(60)
         self.rpc = BareRPCClient(
             validatedTransport: transport,
             maximumWireMessageBytes: maximumWireMessageBytes,
@@ -357,49 +396,78 @@ public actor QVACClient {
         self.maximumBufferedStreamBytes = bufferLimit
         self.logger = logger
         self.profilingMetadataHandler = profilingMetadataHandler
+        self.runtimeContext = runtimeContext
+        self.workerConfig = config
+        self.initHandshakeTimeout = initHandshakeTimeout
         let log = logger ?? NoOpRPCLogger()
         log.log(.info, "QVACClient init: starting transport")
 
+        let initialTransport: BareTransport
+        let reconnectFactory: Configuration.TransportFactory?
         switch configuration.storage {
         #if os(macOS)
         case .macOSSubprocess(let cfg):
             self.shutdownBeforeClose = false
+            let factory: Configuration.TransportFactory = {
+                do {
+                    return try await UnixDomainSocketTransport.connect(
+                        cfg,
+                        maximumInboundBufferedBytes: maximumWireMessageBytes + 4
+                    )
+                } catch let error as UnixDomainSocketTransport.SpawnError {
+                    throw QVACError.transport(reason: error.description, underlying: error)
+                }
+            }
+            reconnectFactory = factory
             do {
-                self.transport = try await UnixDomainSocketTransport.connect(
-                    cfg,
-                    maximumInboundBufferedBytes: maximumWireMessageBytes + 4
-                )
-            } catch let e as UnixDomainSocketTransport.SpawnError {
-                log.log(.error, "QVACClient init: macOS subprocess connect failed — \(e)")
-                throw QVACError.transport(reason: e.description, underlying: e)
+                initialTransport = try await factory()
+            } catch {
+                log.log(.error, "QVACClient init: macOS subprocess connect failed — \(error)")
+                throw error
             }
         #endif
         #if os(iOS)
         case .iOSWorklet(let cfg):
             self.shutdownBeforeClose = true
+            let factory: Configuration.TransportFactory = {
+                do {
+                    return try BareIPCTransport.connect(
+                        cfg,
+                        maximumInboundBufferedBytes: maximumWireMessageBytes + 4
+                    )
+                } catch let error as BareIPCTransport.Error {
+                    throw QVACError.transport(reason: error.description, underlying: error)
+                }
+            }
+            reconnectFactory = factory
             do {
                 log.log(
                     .info,
                     "QVACClient init: spawning BareKit worklet "
                         + "(entry=\(cfg.workletEntryName), argumentCount=\(cfg.arguments.count))"
                 )
-                self.transport = try BareIPCTransport.connect(
-                    cfg,
-                    maximumInboundBufferedBytes: maximumWireMessageBytes + 4
-                )
+                initialTransport = try await factory()
                 log.log(.info, "QVACClient init: BareKit worklet + IPC ready")
-            } catch let e as BareIPCTransport.Error {
-                log.log(.error, "QVACClient init: BareIPCTransport.connect failed — \(e)")
-                throw QVACError.transport(reason: e.description, underlying: e)
+            } catch {
+                log.log(.error, "QVACClient init: BareIPCTransport.connect failed — \(error)")
+                throw error
             }
         #endif
         case .testing(let transport, let shutdownBeforeClose):
             self.shutdownBeforeClose = shutdownBeforeClose
-            self.transport = transport
+            initialTransport = transport
+            reconnectFactory = nil
+        case .testingFactory(let factory, let shutdownBeforeClose):
+            self.shutdownBeforeClose = shutdownBeforeClose
+            let normalizedFactory = Self.normalizingTransportFactory(factory)
+            initialTransport = try await normalizedFactory()
+            reconnectFactory = normalizedFactory
         }
         self.shutdownTimeout = .seconds(10)
+        self.transportFactory = reconnectFactory
+        self.transport = initialTransport
         self.rpc = BareRPCClient(
-            validatedTransport: transport,
+            validatedTransport: initialTransport,
             maximumWireMessageBytes: maximumWireMessageBytes,
             maximumBufferedStreamBytes: bufferLimit,
             logger: logger
@@ -447,19 +515,36 @@ public actor QVACClient {
             return
         }
         closed = true
-        let rpc = self.rpc
+        let currentRPC = self.rpc
+        let pendingReconnect = reconnectAttempt
+        reconnectAttempt = nil
+        pendingReconnect?.task.cancel()
         let shouldShutdown = shutdownBeforeClose
         let shutdownTimeout = self.shutdownTimeout
         let logger = self.logger
         let task = Task {
             if shouldShutdown {
                 do {
-                    try await QVACHandshake.sendShutdown(on: rpc, timeout: shutdownTimeout)
+                    try await QVACHandshake.sendShutdown(
+                        on: currentRPC,
+                        timeout: shutdownTimeout
+                    )
                 } catch {
                     logger?.log(.warn, "QVACClient close: bounded __shutdown__ failed; forcing transport close")
                 }
             }
-            await rpc.close()
+            await currentRPC.close()
+            if let pendingReconnect,
+               let replacement = try? await pendingReconnect.task.value,
+               replacement.rpc !== currentRPC {
+                if shouldShutdown {
+                    try? await QVACHandshake.sendShutdown(
+                        on: replacement.rpc,
+                        timeout: shutdownTimeout
+                    )
+                }
+                await replacement.rpc.close()
+            }
         }
         closeTask = task
         await task.value
@@ -467,14 +552,30 @@ public actor QVACClient {
 
     deinit {
         if !closed {
-            let rpc = self.rpc
+            let currentRPC = self.rpc
+            let pendingReconnect = reconnectAttempt
+            pendingReconnect?.task.cancel()
             let shouldShutdown = shutdownBeforeClose
             let shutdownTimeout = self.shutdownTimeout
             Task {
                 if shouldShutdown {
-                    try? await QVACHandshake.sendShutdown(on: rpc, timeout: shutdownTimeout)
+                    try? await QVACHandshake.sendShutdown(
+                        on: currentRPC,
+                        timeout: shutdownTimeout
+                    )
                 }
-                await rpc.close()
+                await currentRPC.close()
+                if let pendingReconnect,
+                   let replacement = try? await pendingReconnect.task.value,
+                   replacement.rpc !== currentRPC {
+                    if shouldShutdown {
+                        try? await QVACHandshake.sendShutdown(
+                            on: replacement.rpc,
+                            timeout: shutdownTimeout
+                        )
+                    }
+                    await replacement.rpc.close()
+                }
             }
         }
     }
@@ -495,9 +596,12 @@ public actor QVACClient {
         decoding _: Response.Type = Response.self,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> Response {
-        try await assertOpen()
         let timeout = try Self.validatedRPCOptions(rpcOptions)
         let payload = try encode(request, rpcOptions: rpcOptions)
+        // Reject deterministic local input errors before touching connection
+        // lifecycle. An invalid call must never spawn or install a replacement
+        // worker merely because the previous generation ended.
+        let rpc = try await rpcForNewRequest()
         let respData: Data?
         do {
             respData = try await rpc.send(command: nextCommand(), data: payload, timeout: timeout)
@@ -517,9 +621,9 @@ public actor QVACClient {
         decoding _: Response.Type = Response.self,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACResponseStream<Response> {
-        try await assertOpen()
         let timeout = try Self.validatedRPCOptions(rpcOptions)
         let payload = try encode(request, rpcOptions: rpcOptions)
+        let rpc = try await rpcForNewRequest()
         let cmd = nextCommand()
         let operation = request.discriminator
         let rawStream: BareRPCResponseStream
@@ -548,9 +652,9 @@ public actor QVACClient {
         decoding _: Response.Type = Response.self,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> QVACDuplexSession<Response> {
-        try await assertOpen()
         let timeout = try Self.validatedRPCOptions(rpcOptions)
         let payload = try encode(request, rpcOptions: rpcOptions)
+        let rpc = try await rpcForNewRequest()
         let cmd = nextCommand()
         do {
             let raw = try await rpc.duplex(command: cmd, initialPayload: payload, timeout: timeout)
@@ -776,13 +880,367 @@ public actor QVACClient {
         return QVACError.transport(reason: "\(operation) RPC failed", underlying: error)
     }
 
-    private func assertOpen() async throws {
-        if closed {
+    /// Return the RPC generation to use for a brand-new operation.
+    ///
+    /// An operation is bound to the generation returned here for its complete
+    /// lifetime. If that generation fails, the operation fails exactly once and
+    /// is never replayed. Only a later API call is eligible to create a fresh
+    /// worker and repeat the mandatory `__init_config` handshake.
+    private func rpcForNewRequest() async throws -> BareRPCClient {
+        while true {
+            try Task.checkCancellation()
+            guard !closed else {
+                throw QVACError.transport(reason: "client is closed")
+            }
+            guard initialized else {
+                throw QVACError.protocolViolation("client not initialized")
+            }
+
+            if let reconnectAttempt {
+                return try await finishReconnect(reconnectAttempt)
+            }
+
+            let currentRPC = rpc
+            let currentGenerationIsOpen = await currentRPC.isOpen()
+            if let afterOpenCheckTestHook { await afterOpenCheckTestHook() }
+            try Task.checkCancellation()
+            guard !closed else {
+                throw QVACError.transport(reason: "client is closed")
+            }
+
+            // A different caller may have completed and installed a reconnect
+            // while this actor was reentrant at `isOpen()` (or in the test hook).
+            // This call crossed the state-loss boundary before it was assigned
+            // to a generation, so fail it explicitly instead of silently sending
+            // stateful work to the replacement.
+            if rpc !== currentRPC {
+                throw QVACError.connectionReset
+            }
+
+            // A reconnect may also be in progress but not installed yet. Join it
+            // before trusting the cached old-generation result.
+            if let reconnectAttempt {
+                return try await finishReconnect(reconnectAttempt)
+            }
+            if currentGenerationIsOpen {
+                return currentRPC
+            }
+
+            // The one-shot test configuration intentionally has no factory. This
+            // preserves its historical deterministic behavior; production
+            // configurations and factory-backed tests always take the path below.
+            guard let transportFactory else { return currentRPC }
+
+            let attemptID = nextReconnectAttemptID
+            nextReconnectAttemptID &+= 1
+            if nextReconnectAttemptID == 0 { nextReconnectAttemptID = 1 }
+
+            let maximumWireMessageBytes = self.maximumWireMessageBytes
+            let maximumBufferedStreamBytes = self.maximumBufferedStreamBytes
+            let runtimeContext = self.runtimeContext
+            let workerConfig = self.workerConfig
+            let initHandshakeTimeout = self.initHandshakeTimeout
+            let logger = self.logger
+            logger?.log(
+                .info,
+                "QVACClient reconnect: transport generation \(connectionGeneration) ended; "
+                    + "starting a fresh worker"
+            )
+
+            let task = Task<RPCConnection, Error> {
+                // Join teardown of the failed generation before starting another
+                // worker. This prevents overlapping subprocesses/worklets and leaves
+                // each generation with one clear resource owner.
+                await currentRPC.close()
+                try Task.checkCancellation()
+                return try await Self.makeConnection(
+                    transportFactory: transportFactory,
+                    runtimeContext: runtimeContext,
+                    config: workerConfig,
+                    initHandshakeTimeout: initHandshakeTimeout,
+                    maximumWireMessageBytes: maximumWireMessageBytes,
+                    maximumBufferedStreamBytes: maximumBufferedStreamBytes,
+                    logger: logger
+                )
+            }
+            let attempt = ReconnectAttempt(
+                id: attemptID,
+                task: task,
+                resultHub: QVACSharedTaskResultHub.observing(task)
+            )
+            reconnectAttempt = attempt
+            return try await finishReconnect(attempt)
+        }
+    }
+
+    private func finishReconnect(_ attempt: ReconnectAttempt) async throws -> BareRPCClient {
+        let outcome: Result<RPCConnection, Error>
+        do {
+            outcome = try await attempt.resultHub.wait()
+            // A canceled waiter must never be the actor turn that installs a new
+            // empty worker generation. Leave the shared attempt available for a
+            // later non-canceled caller, which will receive connectionReset.
+            try Task.checkCancellation()
+        } catch is CancellationError {
+            if closed {
+                throw QVACError.transport(reason: "client is closed")
+            }
+            throw CancellationError()
+        }
+
+        let replacement: RPCConnection
+        switch outcome {
+        case .success(let connection):
+            replacement = connection
+        case .failure(let error):
+            if reconnectAttempt?.id == attempt.id {
+                reconnectAttempt = nil
+            }
+            if closed {
+                throw QVACError.transport(reason: "client is closed")
+            }
+            logger?.log(.error, "QVACClient reconnect: fresh worker failed — \(error)")
+            // Every caller that joined this single-flight attempt observes the
+            // same failure. A genuinely later call may start another attempt.
+            throw error
+        }
+
+        guard !closed else {
+            await replacement.rpc.close()
             throw QVACError.transport(reason: "client is closed")
         }
-        if !initialized {
-            throw QVACError.protocolViolation("client not initialized")
+
+        if reconnectAttempt?.id == attempt.id {
+            transport = replacement.transport
+            rpc = replacement.rpc
+            connectionGeneration &+= 1
+            if connectionGeneration == 0 { connectionGeneration = 1 }
+            reconnectAttempt = nil
+            logger?.log(
+                .info,
+                "QVACClient reconnect: generation \(connectionGeneration) ready; "
+                    + "prior worker model/session state was not restored"
+            )
+            throw QVACError.connectionReset
         }
+
+        if rpc !== replacement.rpc {
+            // The attempt completed after close or after a newer generation won.
+            // Do not leak its worker. This caller still crossed a reconnect and
+            // must observe state loss rather than use whichever generation won.
+            await replacement.rpc.close()
+        }
+
+        guard !closed else {
+            throw QVACError.transport(reason: "client is closed")
+        }
+        // Every caller that joined this successful single-flight attempt receives
+        // the same explicit state-loss signal. A genuinely later call may use the
+        // ready generation after reloading its models/session state.
+        throw QVACError.connectionReset
+    }
+
+    private static func makeConnection(
+        transportFactory: Configuration.TransportFactory,
+        runtimeContext: QVACRuntimeContext?,
+        config: JSONValue?,
+        initHandshakeTimeout: Duration,
+        maximumWireMessageBytes: Int,
+        maximumBufferedStreamBytes: Int,
+        logger: BareRPCLogger?
+    ) async throws -> RPCConnection {
+        let transport = try await transportFactory()
+        let rpc = BareRPCClient(
+            validatedTransport: transport,
+            maximumWireMessageBytes: maximumWireMessageBytes,
+            maximumBufferedStreamBytes: maximumBufferedStreamBytes,
+            logger: logger
+        )
+        do {
+            try Task.checkCancellation()
+            try await QVACHandshake.sendInitConfig(
+                on: rpc,
+                config: config,
+                runtimeContext: runtimeContext,
+                timeout: initHandshakeTimeout
+            )
+            try Task.checkCancellation()
+            return RPCConnection(transport: transport, rpc: rpc)
+        } catch {
+            await rpc.close()
+            throw handshakeError(error, timeout: initHandshakeTimeout)
+        }
+    }
+
+    private static func normalizingTransportFactory(
+        _ factory: @escaping Configuration.TransportFactory
+    ) -> Configuration.TransportFactory {
+        {
+            do {
+                return try await factory()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as QVACError {
+                throw error
+            } catch {
+                throw QVACError.transport(
+                    reason: "could not create worker transport",
+                    underlying: error
+                )
+            }
+        }
+    }
+
+    private static func handshakeError(_ error: Error, timeout: Duration) -> Error {
+        if error is CancellationError { return CancellationError() }
+        if let error = error as? QVACInitConfigFailed {
+            return QVACError.transport(reason: error.description, underlying: error)
+        }
+        if error is BareRPCRequestTimeout {
+            let message = "worker did not reply to __init_config within \(timeout). "
+                + "Most likely the worker bundle crashed during startup, or `arguments` "
+                + "did not include a valid JSON config in argv[2] (which silently runs the "
+                + "worker in direct mode — see Configuration.defaultWorkletArguments)."
+            return QVACError.transport(reason: message)
+        }
+        return publicRPCError(error, operation: "__init_config")
+    }
+
+    /// Internal observability for deterministic lifecycle tests.
+    func __testConnectionGeneration() -> UInt64 {
+        connectionGeneration
+    }
+
+    func __testReconnectWaiterCount() -> Int {
+        reconnectAttempt?.resultHub.pendingWaiterCount() ?? 0
+    }
+
+    func __testSetAfterOpenCheckHook(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        afterOpenCheckTestHook = hook
+    }
+}
+
+/// One completion observer shared by every caller joining a reconnect attempt.
+///
+/// Awaiting `Task.value` is not caller-cancelable, and spawning one observer per
+/// joiner lets canceled callers accumulate behind a stalled factory. This hub owns
+/// exactly one observer for the shared task, caches its outcome, and removes each
+/// independently canceled waiter immediately.
+private final class QVACSharedTaskResultHub<Value: Sendable>: @unchecked Sendable {
+    typealias SharedResult = Result<Value, Error>
+
+    private let lock = NSLock()
+    private var nextWaiterID: UInt64 = 1
+    private var outcome: SharedResult?
+    private var waiters: [UInt64: QVACCancellableTaskResultWaiter<Value>] = [:]
+
+    private init() {}
+
+    static func observing(_ task: Task<Value, Error>) -> QVACSharedTaskResultHub<Value> {
+        let hub = QVACSharedTaskResultHub<Value>()
+        Task.detached {
+            hub.complete(await task.result)
+        }
+        return hub
+    }
+
+    func wait() async throws -> SharedResult {
+        try Task.checkCancellation()
+        let waiter = QVACCancellableTaskResultWaiter<Value>()
+        let registration: (id: UInt64, outcome: SharedResult?) = lock.withLock {
+            let id = nextWaiterID
+            nextWaiterID &+= 1
+            if nextWaiterID == 0 { nextWaiterID = 1 }
+            if let outcome { return (id, outcome) }
+            waiters[id] = waiter
+            return (id, nil)
+        }
+        if let outcome = registration.outcome {
+            waiter.resolve(outcome)
+        }
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                waiter.register(continuation)
+            }
+        } onCancel: {
+            // Cancel the waiter itself even if completion already removed it from
+            // the hub but has not yet delivered the cached outcome. The waiter gate
+            // linearizes that race and resumes exactly once.
+            waiter.cancel()
+            self.unregister(registration.id)
+        }
+    }
+
+    func pendingWaiterCount() -> Int {
+        lock.withLock { waiters.count }
+    }
+
+    private func unregister(_ id: UInt64) {
+        _ = lock.withLock { waiters.removeValue(forKey: id) }
+    }
+
+    private func complete(_ result: SharedResult) {
+        let pending: [QVACCancellableTaskResultWaiter<Value>] = lock.withLock {
+            guard outcome == nil else { return [] }
+            outcome = result
+            defer { waiters.removeAll(keepingCapacity: false) }
+            return Array(waiters.values)
+        }
+        for waiter in pending { waiter.resolve(result) }
+    }
+}
+
+/// One-shot bridge from a shared task to one independently cancelable waiter.
+/// Resolution and cancellation may race on arbitrary executors; exactly one wins
+/// and resumes the checked continuation outside the lock.
+private final class QVACCancellableTaskResultWaiter<Value: Sendable>: @unchecked Sendable {
+    typealias SharedResult = Result<Value, Error>
+    typealias WaitResult = Result<SharedResult, Error>
+
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<SharedResult, Error>?
+    private var pendingResult: WaitResult?
+    private var registered = false
+    private var settled = false
+
+    func register(_ continuation: CheckedContinuation<SharedResult, Error>) {
+        let pending: WaitResult? = lock.withLock {
+            precondition(!registered, "cancellable shared-task waiter registered twice")
+            registered = true
+            if let pendingResult {
+                return pendingResult
+            }
+            self.continuation = continuation
+            return nil
+        }
+        if let pending {
+            continuation.resume(with: pending)
+        }
+    }
+
+    func resolve(_ result: SharedResult) {
+        settle(.success(result))
+    }
+
+    func cancel() {
+        settle(.failure(CancellationError()))
+    }
+
+    private func settle(_ result: WaitResult) {
+        let continuation: CheckedContinuation<SharedResult, Error>? = lock.withLock {
+            guard !settled else { return nil }
+            settled = true
+            if let continuation = self.continuation {
+                self.continuation = nil
+                return continuation
+            }
+            pendingResult = result
+            return nil
+        }
+        continuation?.resume(with: result)
     }
 }
 

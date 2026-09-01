@@ -20,6 +20,7 @@ import Foundation
 ///   • `.inferenceCancelled(...)` — a completion was cancelled, with correlated
 ///                                  partial aggregate state
 ///   • `.transport(_)`            — connection/transport failure
+///   • `.connectionReset`         — a fresh worker is ready but in-memory state was lost
 ///   • `.requestTimedOut(...)`     — a local per-call RPC deadline elapsed
 ///   • `.invalidArgument(_)`       — the caller supplied an invalid local option
 ///   • `.protocolViolation(_)`    — server returned an unexpected shape
@@ -40,6 +41,10 @@ public enum QVACError: Error, CustomStringConvertible, Sendable {
         partial: QVACClient.InferenceCancelledPartial
     )
     case transport(reason: String, underlying: Error? = nil)
+    /// The failed transport was replaced and `__init_config` succeeded, but the
+    /// operation was deliberately not sent because a fresh worker has no loaded
+    /// models or session state. Reload required state, then retry the operation.
+    case connectionReset
     case requestTimedOut(operation: String, after: Duration)
     case streamBufferOverflow(operation: String, maximumBytes: Int, attemptedBytes: Int)
     case invalidArgument(String)
@@ -61,6 +66,9 @@ public enum QVACError: Error, CustomStringConvertible, Sendable {
                 + "(partial text: \(textCount) characters, tool calls: \(toolCallCount))"
         case .transport(let reason, _):
             return "QVAC transport error: \(reason)"
+        case .connectionReset:
+            return "QVAC worker reconnected; in-memory model and session state was lost. "
+                + "Reload required state, then retry the operation."
         case .requestTimedOut(let operation, let timeout):
             return "QVAC request '\(operation)' timed out after \(timeout)"
         case .streamBufferOverflow(let operation, let maximumBytes, let attemptedBytes):

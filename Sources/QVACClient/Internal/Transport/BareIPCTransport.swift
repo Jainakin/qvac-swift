@@ -17,6 +17,12 @@ private let _bareKitLogger = Logger(subsystem: "io.qvac.client", category: "bare
 
 final class BareIPCTransport: BareTransport, @unchecked Sendable {
 
+    enum ReadableDrainResult: Sendable, Equatable {
+        case wouldBlock
+        case peerEOF
+        case inboundOverflow
+    }
+
     enum Error: Swift.Error, CustomStringConvertible {
         case workletInitFailed
         case ipcInitFailed
@@ -124,14 +130,56 @@ final class BareIPCTransport: BareTransport, @unchecked Sendable {
         // which is thread-safe per AsyncThrowingStream contract.
         ipc.readable = { [weak self] ipcRef in
             guard let self = self else { return }
-            // Drain everything available on this fire — read() returns nil when empty.
-            while let chunk = ipcRef.read(), chunk.count > 0 {
-                if self.inbound.yield(chunk as Data) != nil {
-                    Task { [weak self] in await self?.close() }
-                    return
+            // Drain everything available on this fire. BareIPC's synchronous API
+            // distinguishes would-block (`nil`) from peer EOF (a successful,
+            // non-nil zero-byte read). Treat EOF as terminal immediately so the
+            // bare-rpc generation fails its waiters and a later API call can
+            // reconnect instead of hanging on an apparently open worklet.
+            let result = Self.drainReadable(
+                read: { ipcRef.read() as Data? },
+                onChunk: { self.inbound.yield($0) == nil },
+                onEOF: {
+                    // Stop poll delivery before publishing EOF. The bare-rpc
+                    // feeder drains any chunks already queued above, observes
+                    // the channel finish, and then owns transport/worklet close.
+                    ipcRef.readable = nil
+                    self.inbound.finish(discardingBuffered: false)
                 }
+            )
+            if result == .inboundOverflow {
+                Task { [weak self] in await self?.close() }
             }
         }
+    }
+
+    /// Drain one readable notification while preserving the three distinct native
+    /// outcomes: bytes, would-block, and zero-byte peer EOF. Keeping this logic in a
+    /// dependency-free seam lets the iOS test target prove response-before-EOF order
+    /// without pretending BareKit always reports worklet self-exit as EOF.
+    private static func drainReadable(
+        read: () -> Data?,
+        onChunk: (Data) -> Bool,
+        onEOF: () -> Void
+    ) -> ReadableDrainResult {
+        while let chunk = read() {
+            guard !chunk.isEmpty else {
+                onEOF()
+                return .peerEOF
+            }
+            guard onChunk(chunk) else { return .inboundOverflow }
+        }
+        return .wouldBlock
+    }
+
+    static func __testDrainReadable(
+        read: () -> Data?,
+        into channel: BoundedTransportInboundChannel
+    ) -> ReadableDrainResult {
+        drainReadable(
+            read: read,
+            onChunk: { channel.yield($0) == nil },
+            onEOF: { channel.finish(discardingBuffered: false) }
+        )
     }
 
     /// Single-use — see UnixDomainSocketTransport.inboundStream() for the same

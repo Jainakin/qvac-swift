@@ -1,0 +1,19 @@
+// swift-tools-version:5.10
+
+import PackageDescription
+
+let package = Package(
+    name: "QVACiOSURLConsumer",
+    platforms: [.iOS(.v17)],
+    dependencies: [
+        .package(url: "__QVAC_PACKAGE_URL__", revision: "__QVAC_PACKAGE_REVISION__"),
+    ],
+    targets: [
+        .testTarget(
+            name: "QVACiOSURLSmokeTests",
+            dependencies: [
+                .product(name: "QVACClient", package: "__QVAC_PACKAGE_ID__"),
+            ]
+        ),
+    ]
+)

@@ -88,6 +88,8 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
                 )
             case .transport(let reason, _):
                 XCTFail("\(name): transport failure — \(reason)", file: file, line: line)
+            case .connectionReset:
+                XCTFail("\(name): worker reconnected and lost in-memory state", file: file, line: line)
             case .requestTimedOut:
                 XCTFail("\(name): request unexpectedly timed out", file: file, line: line)
             case .invalidArgument(let message):
