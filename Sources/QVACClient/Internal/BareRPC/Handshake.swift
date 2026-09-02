@@ -2,8 +2,8 @@
 // that bracket a QVAC session.
 //
 // Both ride on top of BareRPCClient as normal `send`/RPC calls with `command=1`.
-// The wire shape was reverse-engineered from `client/init-hooks.ts:29-55` and
-// observed live in Spike-A (see docs/spike-validations.md).
+// The wire shape follows `client/init-hooks.ts:29-55` and is covered by the live
+// protocol tests documented in `docs/protocol-notes.md`.
 
 import Foundation
 

@@ -1,4 +1,4 @@
-// QVAC-214 — heartbeat
+// Worker heartbeat.
 //
 // Single-shot RPC. Worker replies with `{type:"heartbeat", number: <uptime-seconds>}`.
 // Used both as a health check ("is the worker alive?") and by callers who want

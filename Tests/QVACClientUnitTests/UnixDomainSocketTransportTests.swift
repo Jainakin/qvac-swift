@@ -280,12 +280,10 @@ final class UnixDomainSocketTransportTests: XCTestCase {
         )
     }
 
-    // MARK: - Security regression tests (§9, §11, §12 from AUDIT.md)
+    // MARK: - Security regression tests
 
-    /// §12 — `environmentOverlay` must strip dynamic-linker keys so a caller can't pipe
-    /// `DYLD_INSERT_LIBRARIES` etc. into the spawned worker process. Expanded post-second-
-    /// audit to also cover Malloc/ObjC/Foundation debug knobs that aid info disclosure or
-    /// heap exploitation.
+    /// `environmentOverlay` strips dynamic-linker and diagnostic keys before
+    /// spawning the worker.
     func test_environmentOverlay_strips_dynamic_linker_keys() {
         let raw: [String: String] = [
             // dyld code-exec vectors

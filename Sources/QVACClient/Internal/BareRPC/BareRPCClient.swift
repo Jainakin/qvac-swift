@@ -591,9 +591,9 @@ actor BareRPCClient {
         }
         let pending = PendingStream(id: id, channel: channel)
         pending.timeout = timeout
-        // Send REQUEST inline + STREAM(RESPONSE|OPEN) immediately (mirrors what JS
-        // bare-rpc's req.createResponseStream({ eagerOpen: true }) does — see the wire
-        // capture for Spike-B in docs/spike-validations.md).
+        // Send REQUEST inline + STREAM(RESPONSE|OPEN) immediately, matching
+        // bare-rpc's req.createResponseStream({ eagerOpen: true }) behavior. See
+        // docs/protocol-notes.md for the stream handshake.
         let req = try BareRPCCodec.encodeRequestFrame(
             id: id,
             command: command,

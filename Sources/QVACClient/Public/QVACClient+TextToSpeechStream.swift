@@ -1,4 +1,4 @@
-// QVAC-209 — textToSpeechStream (bidirectional)
+// Bidirectional text-to-speech streaming.
 //
 // Opens a long-lived session: client writes text fragments (UTF-8 bytes), server streams
 // back audio chunks as they're synthesized. QVAC 0.17 represents native signed 16-bit PCM

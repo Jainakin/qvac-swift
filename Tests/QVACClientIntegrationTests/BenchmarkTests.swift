@@ -1,4 +1,4 @@
-// Grant KR-2 — real streaming-completion latency, Swift versus JavaScript.
+// Real streaming-completion latency, Swift versus JavaScript.
 //
 // `bench/run.sh` executes this release-built test in ten adjacent process pairs
 // with execution-order allocation balanced against the exact @qvac/sdk 0.17

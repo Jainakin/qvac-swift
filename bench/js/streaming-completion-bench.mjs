@@ -75,7 +75,7 @@ function validateWorkload() {
   requireCondition(workload.schema_version === 3, 'workload schema_version must be 3')
   requireCondition(
     workload.criterion === 'Streaming completion latency overhead (Swift client vs. JS client on same machine) < 5%.',
-    'workload criterion does not match grant KR-2',
+    'workload criterion does not match the fixed benchmark protocol',
   )
   requireCondition(workload.model.model_type === 'llamacpp-completion'
     && workload.model.config.ctx_size === 2048
@@ -274,7 +274,7 @@ try {
 } catch (error) {
   // Preserve every completed preconditioning and measurement request for
   // diagnosis. The orchestrator accepts only status=sample, so partial work
-  // can never enter the grant analysis.
+  // can never enter the benchmark analysis.
   atomicWriteJSON(resultPath, {
     schema_version: 2,
     status: 'error',

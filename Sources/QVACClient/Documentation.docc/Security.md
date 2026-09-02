@@ -6,9 +6,9 @@ The enforced boundaries and caller responsibilities for the client/worker design
 
 The worker connects through an AF_UNIX socket inside an atomically created `0700`
 temporary directory. The socket is restricted to `0600`, accepted descriptors have
-close-on-exec set, and the listener rejects invalid peers. Socket writes suppress
-`SIGPIPE`, so a worker crash or close/write race becomes a Swift transport error
-instead of terminating the host application.
+close-on-exec set, and the directory permissions restrict access to the current
+user. Socket writes suppress `SIGPIPE`, so a worker crash or close/write race
+becomes a Swift transport error instead of terminating the host application.
 
 The caller-provided environment overlay cannot set dynamic-loader or common runtime
 diagnostic injection variables. The worker path and Bare executable are validated
@@ -44,15 +44,15 @@ progress views retain a bounded window of the newest snapshots and coalesce olde
 snapshots under burst load. Buffer budgets apply per stream and per concurrent
 operation.
 
-This limit is intentionally configurable because 0.17 video and upscaling return a
-complete base64 media output in one record. Base64 parsing, JSON decoding, and final
+The limit is configurable because video and upscaling can return a complete base64
+media output in one record. Base64 parsing, JSON decoding, and final
 `Data` ownership can temporarily use several times the payload size. Choose a lower
 limit for memory-constrained deployments that do not support large media outputs,
 and validate the chosen limit on representative physical devices.
 
-The worker itself has no library-imposed model RAM, disk, or inference-time quota.
-Applications decide which models and operations are permitted and should set an
-explicit per-request deadline.
+QVACClient does not add model RAM, disk, or inference-time quotas. Applications
+decide which models and operations are permitted and should set an explicit
+per-request deadline.
 
 ## URL policy
 
@@ -93,10 +93,9 @@ Swift cannot await asynchronous work from `deinit`.
 
 ## Supply-chain boundary
 
-The upstream QVAC source commit, npm tarball SRI/shasum, contract inputs, runtime
-dependency graph, worker, and native archive checksums are independent pinned
-identities. A release is blocked unless they agree semantically and every referenced
-binary is already available at an immutable public URL.
+Release checks bind the upstream commit, npm tarball, generated contract, worker
+bundle, runtime dependency graph, and native archive checksums. Source releases
+also verify that every referenced binary is available at its versioned public URL.
 
 Compromise of the trusted upstream source or native model implementations remains a
 supply-chain risk outside the protocol client's authority.

@@ -5,8 +5,8 @@
 // (no subprocess on iOS — Apple forbids it). All IPC is over the socketpair that
 // BareKit's `BareIPC` wraps under the hood; we never touch the fd directly.
 //
-// Tested end-to-end in Examples/BareKitProbeApp on iPhone 17 simulator
-// (see docs/spike-validations.md Spike-E and QVAC-004f).
+// The iOS package integration suite covers the BareKit worklet and BareIPC path
+// end to end. See docs/protocol-notes.md.
 
 #if canImport(BareKit) && os(iOS)
 import Foundation

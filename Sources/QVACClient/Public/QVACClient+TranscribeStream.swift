@@ -1,4 +1,4 @@
-// QVAC-207 — transcribeStream (bidirectional)
+// Bidirectional transcription streaming.
 //
 // Opens a long-lived session: client writes audio chunks (raw PCM bytes the worker's
 // model expects — usually 16 kHz mono int16), server streams back transcription as VAD

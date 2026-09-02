@@ -1,14 +1,12 @@
-# Swift Package Index submission
+# Swift Package Index
 
-Swift Package Index submission is a post-release operation. It must not be used to
-paper over an unpublished binary closure or an unverified source tag. The first
-exact release pair, `artifacts-sdk-0.17.0-r1` and `v0.1.0`, is public and remains
-valid URL-installation evidence.
+Submit QVACClient to Swift Package Index only after its source release and binary
+artifacts are publicly available. A designated maintainer owns this step; it is
+separate from source review.
 
-## Index build configuration
+## Configuration
 
-The repository-root `.spi.yml` opts `QVACClient` into Swift Package Index-hosted
-DocC:
+The root `.spi.yml` enables hosted DocC for `QVACClient`:
 
 ```yaml
 version: 1
@@ -17,61 +15,39 @@ builder:
     - documentation_targets: [QVACClient]
 ```
 
-Keep this configuration minimal. Platform compatibility comes from
-`Package.swift`, where every binary-target dependency of `QVACClient` is explicitly
-conditioned on iOS; repository CI separately builds the target's DocC archive on
-macOS. Validate any future change with the Index's
-[SPI manifest validator](https://swiftpackageindex.com/validate-spi-manifest)
-before publishing it.
+Platform requirements come from `Package.swift`. CI separately builds the DocC
+archive with warnings treated as errors.
 
-Swift Package Index analyzes `.spi.yml` from each checked-out version. The
-immutable-by-policy `v0.1.0` tag predates this file, so it must never be moved merely
-to add hosted documentation. A subsequent `v0.2.0` release created from a commit
-that contains `.spi.yml` can become the first stable tag with configured versioned
-DocC. The grant-handoff stream API is intentionally the new original API and does
-not carry a migration or compatibility layer for the unpublished review delta.
-Existing release evidence remains additive and unchanged.
+Swift Package Index reads `.spi.yml` from each release tag. `v0.1.0` predates this
+file, so do not move that tag to add hosted documentation. Publish a new SemVer
+release from a reviewed commit instead.
 
-## Preconditions
+## Before submission
 
-Before submitting `qvac-swift`, verify all of the following:
+Verify that:
 
-- the repository is publicly readable at
-  `https://github.com/Jainakin/qvac-swift.git`;
-- the root `Package.swift` contains release-asset HTTPS binary-target URLs and
-  checksums, not development `path:` targets;
-- the Source Release workflow has created the selected stable SemVer tag from the
-  exact commit whose full required CI run passed;
-- the selected tag contains `.spi.yml` when versioned hosted DocC is part of the
-  acceptance evidence;
-- `swift package dump-package` succeeds with the latest supported Swift toolchain;
-- an anonymous external consumer resolves the Git URL at the selected exact
-  SemVer, builds, and imports `QVACClient`; and
-- the macOS 14, iOS 17 device/simulator, DocC, live-worker, pinned-model, and
-  performance gates are green for that source commit.
+- `https://github.com/Jainakin/qvac-swift.git` is publicly readable;
+- the selected release uses public binary-target URLs and valid checksums;
+- `swift package dump-package` succeeds for the release tag;
+- a clean external consumer resolves the Git URL and imports `QVACClient`;
+- macOS, iOS device and simulator, DocC, live-worker, model, and performance jobs
+  passed for the release commit; and
+- the selected tag contains `.spi.yml`.
 
-These checks mirror the current inclusion requirements published by the
-[Swift Package Index](https://swiftpackageindex.com/add-a-package): public access,
-a valid root manifest, Swift 5 or later, a SemVer release, a protocol-qualified
-`.git` URL, valid `dump-package` output, and a compiling package.
+The release workflow performs the package and external-consumer checks. Validate
+`.spi.yml` separately with the
+[SPI manifest validator](https://swiftpackageindex.com/validate-spi-manifest).
 
 ## Submit and verify
 
 1. Open [Add a Package](https://swiftpackageindex.com/add-a-package) and submit
    `https://github.com/Jainakin/qvac-swift.git`.
-2. Wait for the package-list validation and index build to complete. Do not create
-   a replacement tag to work around a failure; fix the source and publish a new
-   SemVer release through the guarded release workflow.
-3. On the indexed package page, verify the latest reviewed stable version, iOS 17,
-   macOS 14, the `QVACClient` library product, successful compatibility builds,
-   and hosted DocC documentation for `QVACClient`.
-4. Use the page's maintainer-claim flow and add its generated compatibility badges
-   to the README only after the package is actually indexed.
-5. Record the indexed package/documentation URLs and successful build evidence in
-   `SUBMISSION.md`; do not infer completion merely from submitting the form.
+2. Wait for package validation and the hosted build to finish.
+3. Confirm the latest reviewed version, supported platforms, `QVACClient` product,
+   compatibility builds, and hosted documentation on the package page.
+4. Complete the maintainer-claim flow.
+5. Add Index badges to the README only after the listing and builds exist.
+6. Record the package and documentation URLs in the release record.
 
-The repository-side Index preparation is complete: this document and `.spi.yml`
-provide the required guidance and hosted-DocC configuration. Actual Index
-submission, build verification, maintainer claiming, and badges remain
-publisher-owned operations; perform them only with explicit publication authority
-and do not describe them as complete without the resulting evidence.
+If validation fails, fix the source and publish a new version through the release
+process. Do not replace or move an existing release tag.

@@ -1,4 +1,4 @@
-// QVAC-212 — ocr
+// Optical character recognition.
 //
 // Optical character recognition on an image. The worker streams discovered text blocks
 // progressively (e.g. as it finishes recognizing each region).

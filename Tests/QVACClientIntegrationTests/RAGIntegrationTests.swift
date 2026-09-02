@@ -1,12 +1,11 @@
-// QVAC-312 + QVAC-313 — RAG + plugin live integration tests.
-//
-// Exercises the full RAG pipeline against a real Bare worker:
+// Exercises the RAG pipeline against a live Bare worker:
 //   loadModel(embedding model) → ragChunk → ragIngest → ragSearch
 //   → ragListWorkspaces → ragDeleteEmbeddings → ragCloseWorkspace
 //   → ragDeleteWorkspace → unloadModel
 //
-// Gated on `QVAC_RUN_RAG_TESTS=1` because they download a 20,999,104-byte
-// public embedding model. The immutable revision and SHA-256 are verified first.
+// Enabled with `QVAC_RUN_RAG_TESTS=1` because the suite downloads a
+// 20,999,104-byte public embedding model. Its revision and SHA-256 are verified
+// before use.
 
 import XCTest
 @testable import QVACClient

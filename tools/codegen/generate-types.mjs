@@ -450,9 +450,9 @@ function emitStruct(discriminator, node, side) {
 
   // Apply two sources of "omit this field" instructions:
   //   1. Per-side per-discriminator entries in overrides.json (manual escape hatch).
-  //   2. Auto-detected `z.function`/`z.custom` callback fields from the Zod schema
-  //      (§27 in AUDIT.md). These travel only inside the JS client process and never
-  //      hit the wire, so they must not appear in the generated Codable struct.
+  //   2. Auto-detected `z.function`/`z.custom` callback fields from the Zod schema.
+  //      These stay inside the JavaScript client and do not belong in a Codable
+  //      wire type.
   const omit = new Set([
     ...(overrides.omitFields?.[`${side}/${discriminator}`] ?? []),
     ...(overrides.omitFields?.['*'] ?? []),

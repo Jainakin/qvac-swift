@@ -1,6 +1,5 @@
-// LiveWorkerIntegrationTests — spawn a real `bare worker.js` and exercise the full
-// init → heartbeat → downloadAsset → cancel cycle. Mirrors what the Phase-0 MacOSProbe
-// does, but assertion-driven inside the test framework.
+// LiveWorkerIntegrationTests — spawn a real `bare worker.js` and exercise the
+// init → heartbeat → downloadAsset → cancel cycle.
 //
 // These tests are SKIPPED unless `bare` and a built `@qvac/sdk` are present at well-known
 // locations (controlled via env). CI runs them on macOS-14-arm64 runners; local dev runs

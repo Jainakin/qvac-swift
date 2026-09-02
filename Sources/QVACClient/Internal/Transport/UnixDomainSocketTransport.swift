@@ -8,9 +8,8 @@
 //
 // On close: kill the worker process, close the listening socket, unlink the path.
 
-// Subprocess spawning is unavailable on iOS — Foundation.Process is macOS/Linux/Windows-only.
-// The grant scope is macOS + iOS, so we only compile this file on macOS. (Linux is not
-// supported: every syscall below uses Darwin-specific symbols.)
+// This implementation is macOS-only because subprocess setup and the socket calls
+// below use Darwin-specific APIs.
 #if os(macOS)
 import Foundation
 import Darwin

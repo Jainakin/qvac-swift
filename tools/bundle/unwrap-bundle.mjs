@@ -18,8 +18,8 @@
 // Usage:
 //   node tools/bundle/unwrap-bundle.mjs <input.js> <output.bundle>
 //
-// Example (release pipeline):
-//   node tools/bundle/unwrap-bundle.mjs spike-js/qvac/worker.bundle.js \
+// Example:
+//   node tools/bundle/unwrap-bundle.mjs /path/to/worker.mobile.bundle.js \
 //     Sources/QVACClient/Resources/worker.mobile.bundle
 
 import { readFileSync, writeFileSync } from 'node:fs'

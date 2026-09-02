@@ -1,4 +1,4 @@
-// QVAC-204 — completion
+// Completion operations.
 
 import Foundation
 
@@ -374,8 +374,8 @@ public extension QVACClient {
     ///
     /// The request id is available as soon as this method returns, so callers can
     /// issue targeted cancellation without waiting for a decoded token. Supply an
-    /// explicit `rpcOptions.timeout` to override the production-safe 60-second
-    /// default inactivity deadline, or pass `nil` for an intentionally unbounded run.
+    /// explicit `rpcOptions.timeout` to override the 60-second default inactivity
+    /// deadline, or pass `nil` when another watchdog bounds the operation.
     func completion(
         modelId: String,
         history: [ChatMessage],

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Grant KR-2: compare real public streaming completions through the Swift and
+# Compare real public streaming completions through the Swift and
 # JavaScript clients using one immutable workload, model, and runtime graph.
 
 set -euo pipefail
@@ -443,7 +443,7 @@ else
     ANALYSIS_STATUS=$?
 fi
 # The analyzer itself is a benchmark input. Close the pre-analysis check/use
-# race before accepting its report or publishing it as grant evidence.
+# race before accepting its report or publishing benchmark evidence.
 verify_source_tree
 POST_ANALYSIS_SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 [[ "$POST_ANALYSIS_SOURCE_COMMIT" == "$SOURCE_COMMIT" ]] \

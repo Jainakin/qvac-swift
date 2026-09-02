@@ -1,8 +1,8 @@
-// QVAC-301..309 — RAG (Retrieval-Augmented Generation) operations.
+// Retrieval-augmented generation operations.
 //
 // Maps the JS client's 9 RAG functions to typed Swift methods. All share the same
-// wire envelope (`type: "rag"`, `operation: <op>`) — we route per-op on the Swift side
-// to keep parameter sets ergonomic.
+// wire envelope (`type: "rag"`, `operation: <op>`). Swift provides one method per
+// operation so each parameter set remains explicit.
 //
 // Workspace model: each RAG instance lives in a named workspace (default = "default").
 // Workspaces are created implicitly on first `ragIngest`. Use `ragListWorkspaces` to

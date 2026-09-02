@@ -1,70 +1,69 @@
 # Getting started
 
-Connect to the exact QVAC SDK 0.17.0 worker, load a model, stream a completion,
-and close every resource deterministically.
+Add QVACClient to an iOS or macOS application, load a model, and stream a
+completion.
 
 ## Add the package
 
-After grant reviewers acting as the authorized publisher have published artifact
-revision `artifacts-sdk-0.17.0-r2` and source release `v0.2.0`:
+The 0.2 release line contains the current SDK 0.17.0 API. Add the package through
+Xcode or Swift Package Manager:
 
 ```swift
 dependencies: [
     .package(
         url: "https://github.com/Jainakin/qvac-swift.git",
-        exact: "0.2.0"
-    ),
+        .upToNextMinor(from: "0.2.0")
+    )
 ],
 targets: [
     .target(
         name: "MyApp",
         dependencies: [
-            .product(name: "QVACClient", package: "qvac-swift"),
+            .product(name: "QVACClient", package: "qvac-swift")
         ]
-    ),
+    )
 ]
 ```
 
-`v0.2.0` is the intended grant-handoff source release and is not published by this
-handoff. Grant reviewers—not the implementation team—publish the checksum-pinned
-`artifacts-sdk-0.17.0-r2` binary closure first, then create `v0.2.0` only after the
-guarded public-URL preflight passes. The historical `v0.1.0` and
-`artifacts-sdk-0.17.0-r1` pair remains valid baseline URL-installation evidence but
-does not expose the final stream API documented here. The repository's canonical
-`Package.swift` stays URL-backed between releases; `Package.swift.dev` is activated
-only in disposable development/CI checkouts.
+The minimum platforms are iOS 17 and macOS 14. The macOS runtime requires Apple
+silicon.
 
-The minimum platforms are iOS 17 and macOS 14 on arm64.
+> Important: If `0.2.0` is not yet available during review, evaluators can
+> temporarily replace the version requirement with `branch: "main"`. Do not ship
+> a branch-based dependency. The existing `v0.1.0` tag predates the current stream
+> types and buffering behavior.
 
 ## Create a client
 
-On iOS, use the worker bundled in an artifact-backed release:
+On iOS, start the worker bundled with the package:
 
 ```swift
 let client = try await QVACClient(
-    configuration: try .iOSWithBundledResource(),
-    maximumWireMessageBytes: 256 * 1024 * 1024
+    configuration: try .iOSWithBundledResource()
 )
 ```
 
-On macOS, install exact `bare-runtime@1.31.0` and `@qvac/sdk@0.17.0` dependencies,
-retain the npm lockfile, and provide its `node_modules` directory. The configuration
-prefers that directory's package-owned `bare-runtime/bin/bare`, so the worker and
-executable come from the same locked graph without depending on npm's `.bin`
-symlink materialization:
+On macOS, install `bare-runtime@1.31.0` and `@qvac/sdk@0.17.0` in a locked npm
+environment, then provide its `node_modules` directory:
 
 ```swift
 let client = try await QVACClient(
     configuration: try .macOS(
-        nodeModulesDir: URL(fileURLWithPath: "/absolute/qvac-runtime/node_modules")
+        nodeModulesDir: URL(
+            fileURLWithPath: "/absolute/path/to/qvac-runtime/node_modules"
+        )
     )
 )
 ```
 
+The macOS configuration prefers that directory's
+`bare-runtime/bin/bare` executable, keeping the worker and runtime in the same
+dependency graph.
+
 ## Load and infer
 
-`modelConfig` is optional. The client sends an empty object when it is omitted,
-which is required by the 0.17 worker and fixes the npm-installed macOS path.
+`modelConfig` is optional. When omitted, the client sends the empty object required
+by the QVAC 0.17.0 worker.
 
 ```swift
 let load = try await client.loadModelStreaming(
@@ -92,8 +91,7 @@ let final = try await run.final.value
 print(final.stats as Any)
 ```
 
-Each run exposes a request ID before its terminal result resolves. Use it for
-targeted cancellation:
+Each run exposes its request ID immediately. Use it for targeted cancellation:
 
 ```swift
 try await client.cancel(
@@ -104,30 +102,22 @@ try await client.cancel(
 
 ## Deadlines
 
-Every public operation accepts `QVACRPCOptions`. Request/reply calls use a total
-response deadline, server streams use a next-frame inactivity deadline, and duplex
-operations apply the deadline while opening the session. Values below 100 ms are
-rejected.
+Every operation accepts `QVACRPCOptions`. Unary calls use a total response
+deadline, server streams use an inactivity deadline between frames, and duplex
+operations apply the deadline while opening the session. Values below 100
+milliseconds are rejected.
 
-Ordinary calls use a production-safe 60-second deadline. Set an explicit value
-based on the expected model and output size; pass `timeout: nil` only for an
-intentionally unbounded operation protected by an external watchdog.
+Calls default to a 60-second deadline. Override it for operations that legitimately
+take longer; use `timeout: nil` only when another watchdog bounds the operation.
 
-## Errors
+## Streams and errors
 
-High-level RPC and worker failures are surfaced as `QVACError`. Cooperative Swift
-task cancellation remains `CancellationError`. The intentionally low-level
-`wireProgressStream`, `wireServerStream`, and `wireDuplex` escape hatches instead
-preserve `QVACResponse.error` as a union value; callers of those APIs must continue
-the same response iterator to EOF so a following profiling trailer is consumed.
-Batch-aware public run views use the single-consumer `QVACBufferedStream`. They
-queue at most 64 whole worker batches and apply the client's
-`maximumBufferedStreamBytes` budget across queued plus partially consumed data.
-Lossless views preserve each accepted worker frame atomically and report
-`QVACStreamBufferOverflow` if they fall behind;
-observational progress views coalesce older snapshots under the same count and byte
-ceilings. An indivisible batch larger than the byte budget fails only its view, while
-the authoritative result continues independently:
+High-level worker and transport failures are reported as `QVACError`. Swift task
+cancellation remains `CancellationError`.
+
+Progress streams coalesce older snapshots when a consumer falls behind. Lossless
+result streams report ``QVACStreamBufferOverflow`` rather than drop accepted data.
+See <doc:Architecture> for buffer and lifecycle details.
 
 ```swift
 do {
@@ -148,23 +138,19 @@ do {
 }
 ```
 
-Profiling-only trailer records are removed before response decoding. Malformed
-non-trailers, unknown discriminators, and truncated NDJSON still fail explicitly.
+Profiling trailers are removed before typed response decoding. Malformed ordinary
+records, unknown discriminators, and truncated NDJSON remain errors.
 
-On iOS, a transport-observable BareIPC EOF or write failure participates in the
-generation-safe reconnect flow. Current BareKit may not report a worklet's own exit
-as EOF; if a bounded request times out and the worklet is suspected to have ended,
-close and recreate the client. Do not retry stateful work automatically unless you
-know whether the worker processed it.
+``QVACResponseStream`` is single-consumer. Use one `for try await` loop or one
+iterator. Leaving the loop tears down the remote stream; call `cancel()` if the
+operation must be stopped before iteration begins.
 
-Live RPC responses are exposed as `QVACResponseStream`. They are single-consumer
-sequences: use one `for try await` loop or iterator. Breaking the loop tears down
-the remote operation even if your code retains the stream; call `cancel()` to stop
-it before iteration begins.
+If an iOS request times out after a suspected worklet exit, close and recreate the
+client. Do not automatically replay stateful work unless it is safe to do so.
 
 ## Shut down
 
-Unload models that are no longer needed and always await `close()`:
+Unload models that are no longer needed and await `close()`:
 
 ```swift
 try await client.unloadModel(
@@ -174,11 +160,11 @@ try await client.unloadModel(
 await client.close()
 ```
 
-`close()` is idempotent and joinable. On iOS it performs the SDK's bounded
-`__shutdown__` handshake before ending the BareKit worklet.
+`close()` is idempotent. On iOS it completes the SDK shutdown handshake before
+terminating the BareKit worklet.
 
 ## Next steps
 
 - <doc:Architecture>
 - <doc:Security>
-- See the `Examples/QVACChat` target for a complete SwiftUI flow.
+- See `Examples/QVACChat` for a complete SwiftUI flow.

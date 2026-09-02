@@ -1,8 +1,8 @@
-// QVAC-310 / QVAC-311 — invokePlugin + invokePluginStream
+// Plugin invocation operations.
 //
 // Generic plugin RPC. Each plugin registers handlers on the worker side with arbitrary
-// request/response Zod schemas; we don't know them at compile time, so the public
-// Swift API exposes them via `Encodable` (params) + `Decodable` (response) generics.
+// request and response Zod schemas. Because those schemas are known only at
+// runtime, the Swift API uses `Encodable` parameters and `Decodable` responses.
 // Callers define their own typed structs for the plugin they're calling.
 //
 // Example:

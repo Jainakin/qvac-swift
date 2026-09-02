@@ -1,86 +1,66 @@
 # QVAC Swift code generation
 
-Code generation is locked to the exact published QVAC SDK 0.17.0 release. Swift
-consumers use only the checked-in generated files; Node and the upstream checkout
-are development/CI inputs.
+The generator produces the Swift API from the published QVAC SDK 0.17.0
+contract. Generated Swift files are committed so package consumers do not need
+Node.js or an upstream QVAC checkout.
 
-## Immutable inputs
+## Pinned inputs
 
-`tools/provenance/qvac-sdk.lock.json` independently identifies:
+[`tools/provenance/qvac-sdk.lock.json`](../provenance/qvac-sdk.lock.json) records:
 
-- authoritative source commit `e8b440665a053a9efe852f04c3601da44f0d55d8`;
-- the `@qvac/sdk@0.17.0` npm tarball SRI and shasum; and
-- SHA-256 values for every `packages/sdk/contract/*.json` input.
+- source commit `e8b440665a053a9efe852f04c3601da44f0d55d8`;
+- the `@qvac/sdk@0.17.0` npm tarball integrity and shasum; and
+- SHA-256 values for every contract input.
 
-The current `sdk-v0.17.0` tag resolves to the later `3176cca…` commit, whose
-contract contains post-publication schema changes. It is recorded as a
-non-authoritative tag and rejected by provenance checks; there is no assertion
-that the tag was moved.
+The `sdk-v0.17.0` tag points to a later commit with schema changes, so generation
+uses the npm release's `gitHead` rather than the tag.
 
-`bootstrap.sh` installs `package-lock.json` with `npm ci`, materializes the exact
-source commit in the tool-owned `.build/qvac-sdk`, verifies every locked input,
-and independently reconstructs the representable request/response schemas from
-the published `dist/schemas/common.js` with exact Zod 4.4.3. It also compares the
-published method-shape and error-code maps. Progress conditions, constants, model
-type maps, and model metadata are source-only and explicitly protected by their
-input hashes rather than falsely claimed as npm exports. A caller-set
-`QVAC_UPSTREAM_DIR` is read-only: its origin, HEAD and hashes must already match,
-and bootstrap never fetches, checks out or changes it. Tool-owned checkout paths
-reject symlink components before any Git mutation.
+`bootstrap.sh` installs the locked Node dependencies, checks out the pinned
+source commit in `.build/qvac-sdk`, verifies each input, and reconstructs the
+representable request and response schemas from the published npm package. It
+also compares method shapes and error-code maps. Source-only inputs are verified
+against lockfile hashes because npm does not export them.
+
+When `QVAC_UPSTREAM_DIR` is supplied, bootstrap treats it as read-only and
+requires its origin, commit, and hashes to match the lock.
 
 ## Outputs
 
-| Generated Swift file | Pinned source input |
+| Generated file | Contract input |
 |---|---|
-| `QVACErrorCodes.generated.swift` | `contract/error-codes.json` (all 136 codes) |
-| `QVACTypes.generated.swift` | `contract/schema.json` |
-| `QVACModelTypeContract.generated.swift` | `contract/model-type-maps.json` |
-| `QVACSDKContract.generated.swift` | `contract/manifest.json` + `contract/schema.json` |
-| `QVACGeneratedRoundTripTests.generated.swift` | all concrete request/response leaves in `contract/schema.json` |
-| `QVACModelTypeContractTests.generated.swift` | all three maps in `contract/model-type-maps.json` |
+| `QVACErrorCodes.generated.swift` | `error-codes.json` |
+| `QVACTypes.generated.swift` | `schema.json` |
+| `QVACModelTypeContract.generated.swift` | `model-type-maps.json` |
+| `QVACSDKContract.generated.swift` | `manifest.json` and `schema.json` |
+| `QVACGeneratedRoundTripTests.generated.swift` | Concrete request and response variants |
+| `QVACModelTypeContractTests.generated.swift` | Model-type maps |
 
-The API generator emits the full immutable method inventory, guarded generic
-routing by call shape, exact conditional-progress routing, and one collision-safe
-typed wire signature per method. Adding a method to a future pinned manifest
-mechanically adds a callable Swift signature without hand-editing Swift routing.
-Mapped public streams use a pull-driven adapter with no eager task or second
-element queue, preserving the byte-bounded transport's backpressure and consumer
-cancellation.
+The generated contract contains 39 methods, 43 response variants, 136 error
+codes, and the model-type aliases published by SDK 0.17.0. Requests and responses
+validate their type discriminators, and generated tests encode and decode every
+concrete variant.
 
-Concrete request/response types own immutable literal discriminators. Their
-initializers do not accept `type`, direct decoding validates the literal, and the
-pinned unions reject unknown discriminators rather than hiding contract drift.
-The generated XCTest constructs, encodes, and decodes all 39 request and 43
-response leaves, both directly and through their strict unions; the generator
-verifier also proves every initializer assigns every stored property.
-
-The model-type generator emits the exact 0.17 alias-to-canonical table used by
-`loadModel`, plus the source contract's engine/addon and legacy maps for complete
-drift evidence. The normalizer canonicalizes only built-in aliases and preserves
-canonical or custom plugin identifiers, matching the published SDK behavior.
-
-`overrides.json` is a narrow wire-only escape hatch. The 0.17 source exporter
-retains `rag.onProgress`, a JavaScript callback that cannot cross JSON; that field
-is explicitly omitted. Production generators never import today's npm Zod build.
-The npm parity gate imports only the published schemas/maps and does not trust or
-invoke npm's contract exporter or `dist/contract` files.
+`overrides.json` handles wire-only exceptions. The source schema retains
+`rag.onProgress`, a JavaScript callback that cannot cross JSON, so the generator
+omits that field. Generation reads the pinned source contract; published npm
+schemas and maps are used only for parity validation.
 
 ## Run and verify
 
-Use Node `22.22.0` (also recorded in `.node-version`):
+Use Node 22.22.0, also recorded in `.node-version`:
 
 ```bash
-./tools/codegen/run.sh
+./tools/codegen/bootstrap.sh
+./tools/codegen/run.sh --generate-only
+
 git diff --exit-code -- Sources/QVACClient/Generated
 git diff --exit-code -- 'Tests/QVACClientUnitTests/*.generated.swift'
 ```
 
-`QVAC_ALLOW_NODE_VERSION_MISMATCH=1` is available only for local diagnostics; CI
-and release workflows require the exact Node version. `test-bootstrap-safety.sh`
-is the regression check for caller-owned checkout safety.
+`QVAC_ALLOW_NODE_VERSION_MISMATCH=1` is available for local diagnostics. CI and
+release workflows require the pinned Node version.
 
-Updating to another SDK is an explicit provenance change: select the published
-release commit and npm tarball independently, update every locked contract hash,
-regenerate the npm locks, pass semantic parity, review generated API changes, and
-run the complete Swift and live-worker suites. Never substitute `latest` or a tag
-name for these inputs.
+To update the SDK, select the published source commit and npm tarball, update the
+contract hashes and npm locks, regenerate the Swift API, review the diff, and run
+the Swift and live-worker suites. Do not use `latest` or a floating tag as a
+code-generation input.

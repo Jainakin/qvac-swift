@@ -53,7 +53,7 @@ public struct QVACProfilingMetadata: Sendable, Equatable {
 /// long-lived operation. Values below 100 milliseconds are rejected by the
 /// public client, matching the upstream SDK schema.
 public struct QVACRPCOptions: Sendable, Equatable {
-    /// Production-safe deadline used when an operation does not provide one.
+    /// Default deadline used when an operation does not provide one.
     /// Streaming operations interpret this as an inactivity timeout, not as a
     /// limit on their total duration.
     public static let defaultTimeout: Duration = .seconds(60)

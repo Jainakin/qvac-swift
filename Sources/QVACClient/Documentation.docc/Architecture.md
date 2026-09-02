@@ -23,32 +23,20 @@ factory; operation implementations share one path.
 
 ## Startup and shutdown
 
-Construction starts the transport and sends `__init_config` with the optional
-client config plus runtime context. The handshake has its own finite deadline and
-cancellation-safe pending state. A worker that crashes, starts in direct mode, or
-never replies cannot leave initialization waiting forever.
+Construction starts the transport and performs the `__init_config` handshake.
+Both startup and the handshake have finite deadlines.
 
-Unexpected EOF, an inbound channel error, or an outbound write failure makes that
-transport generation terminal. Every operation already assigned to it fails once
-and is never replayed. The next new API call starts one shared reconnect attempt,
-waits for the old transport to finish closing, creates a fresh worker, and repeats
-`__init_config`; concurrent callers join the same attempt. A failed reconnect is
-fully closed and a later call may retry. A successful reconnect deliberately does
-not send any waiting application request: every caller that crossed the boundary
-receives ``QVACError/connectionReset``. Because the replacement is a new worker,
-loaded models and other in-memory session state are intentionally **not** restored.
-Each caller waits cancellation-safely without canceling the shared reconnect. A
-canceled sole waiter cannot install the replacement; the next non-canceled caller
-finishes the attempt and receives the reset signal. Reload the required state,
-then retry on the ready generation. Explicit `close()` remains terminal and
-disables reconnect.
+EOF, a read error, or a write failure ends the current connection. In-flight
+operations fail once and are never replayed. A later call starts one shared
+reconnect attempt and repeats the handshake; callers that crossed the connection
+boundary receive ``QVACError/connectionReset``. The replacement worker has no
+loaded models or in-memory session state, so applications must restore that state
+before retrying. Calling `close()` disables reconnection.
 
-macOS process exit and `SIGKILL` are observed through socket EOF. iOS generation
-replacement is available when BareIPC exposes zero-byte EOF or a write failure,
-but it is not a general worklet-crash detector: the pinned BareKit runtime can
-leave host IPC descriptors open after a worklet exits itself (upstream BareKit
-issue 83). In that case per-request deadlines bound the caller's wait, and the
-application should close and recreate the client if it suspects the worklet ended.
+macOS observes worker exit through socket EOF. iOS can reconnect after BareIPC
+reports EOF or a write failure, but BareKit may not expose every worklet exit. A
+request deadline still bounds the wait; close and recreate the client if a worklet
+is suspected to have exited without a transport error.
 
 `close()` is serialized through one shared task. Concurrent callers join the same
 cleanup. macOS shuts down the socket, drains transport work, and waits for the child
@@ -133,14 +121,10 @@ protocol violations; malformed JSON/NDJSON becomes an encoding error; operating
 system failures remain transport errors. Internal bare-rpc error types are not
 exposed through public async sequences.
 
-The `wireProgressStream`, `wireServerStream`, and `wireDuplex` escape hatches are
-deliberately lower level: their `QVACResponse` union preserves an `.error` record as
-a domain element. A caller using those APIs must continue the same response iterator
-to EOF after observing `.error` so a following profiling trailer is consumed.
-Concrete-response generated adapters and high-level run APIs perform that bounded
-drain themselves and then throw the corresponding `QVACError`; generated conditional
-progress accessors remain wire-union streams because one operation can emit several
-response variants.
+Low-level `wireProgressStream`, `wireServerStream`, and `wireDuplex` methods return
+the `QVACResponse` union directly. After an `.error` element, continue the same
+iterator to EOF so any profiling trailer is consumed. High-level APIs perform this
+bounded drain and then throw the corresponding `QVACError`.
 
 ## See also
 

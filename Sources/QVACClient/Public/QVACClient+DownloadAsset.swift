@@ -1,4 +1,4 @@
-// QVAC-213 — downloadAsset
+// Asset downloads.
 //
 // Download a model asset (or any HTTPS URL the worker will fetch) to the worker's
 // cache without loading it into memory. Returns the asset id (the resolved cache key).

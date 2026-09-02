@@ -26,7 +26,7 @@ env:
 
 jobs:
   codegen:
-    name: Pinned contract, codegen freshness, and <30s generation
+    name: Code generation
     runs-on: macos-15
     timeout-minutes: 20
     steps:
@@ -36,19 +36,19 @@ jobs:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm
           cache-dependency-path: tools/codegen/package-lock.json
-      - name: Bootstrap exact source and npm inputs
+      - name: Bootstrap pinned SDK inputs
         run: tools/codegen/bootstrap.sh
-      - name: Generate from immutable contract and enforce KR-3
+      - name: Generate Swift sources
         run: |
           SECONDS=0
           tools/codegen/run.sh --generate-only
           ELAPSED=$SECONDS
           echo "Pinned generation time: ${ELAPSED}s"
           if [ "$ELAPSED" -ge 30 ]; then
-            echo "::error::Code generation took ${ELAPSED}s; grant limit is <30s after bootstrap"
+            echo "::error::Code generation took ${ELAPSED}s; the limit is <30s after bootstrap"
             exit 1
           fi
-      - name: Verify generated sources and tests are fresh
+      - name: Verify generated files
         run: |
           CHANGES="$(git status --porcelain -- \
             Sources/QVACClient/Generated \
@@ -64,7 +64,7 @@ jobs:
         run: tools/codegen/test-bootstrap-safety.sh
 
   runtime-artifact:
-    name: Exact 0.17 portable worker reproducibility
+    name: Reproducible worker bundle
     runs-on: macos-15
     timeout-minutes: 20
     steps:
@@ -76,14 +76,14 @@ jobs:
           cache-dependency-path: tools/runtime/package-lock.json
       - name: Build twice from distinct roots
         run: tools/runtime/test-bundle-reproducibility.sh
-      - name: Require committed worker to be the reproduced artifact
+      - name: Verify committed worker bundle
         run: |
           cmp tools/runtime/.build/worker.repro-a.bundle \
             Sources/QVACClient/Resources/worker.mobile.bundle
           node tools/release/verify-bundle-provenance.mjs \
             Sources/QVACClient/Resources/worker.mobile.bundle
           node tools/release/generate-third-party-notices.mjs --check
-      - name: Destructive path and archive determinism regressions
+      - name: Verify release tooling
         run: |
           tools/runtime/test-path-safety.sh
           node tools/release/test-archive-reproducibility.mjs
@@ -108,9 +108,9 @@ jobs:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm
           cache-dependency-path: tools/runtime/package-lock.json
-      - name: Materialize exact local development binary graph
+      - name: Prepare local binary dependencies
         run: tools/runtime/link-ios-artifacts.sh
-      - name: Verify exact development manifest freshness
+      - name: Verify development manifest
         run: |
           node tools/release/compute-manifest.mjs development \
             tools/runtime/.build/artifacts \
@@ -122,7 +122,7 @@ jobs:
             "$RUNNER_TEMP/artifacts.development.json" "$RUNNER_TEMP/Package.swift"
           cmp "$RUNNER_TEMP/Package.swift" Package.swift.dev
           node tools/ci/package-manifest-mode.mjs --activate-development
-      - name: Build and run fail-closed unit-test inventory
+      - name: Build and run unit tests
         run: |
           test "$(uname -m)" = arm64
           swift package dump-package >/dev/null
@@ -130,7 +130,7 @@ jobs:
           tools/ci/run-unit-tests.sh
 
   documentation:
-    name: DocC · warnings are errors
+    name: Documentation
     runs-on: macos-15
     needs: [unit]
     timeout-minutes: 20
@@ -141,7 +141,7 @@ jobs:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm
           cache-dependency-path: tools/runtime/package-lock.json
-      - name: Materialize exact local development binary graph
+      - name: Prepare local binary dependencies
         run: |
           tools/runtime/link-ios-artifacts.sh
           node tools/ci/package-manifest-mode.mjs --activate-development
@@ -172,7 +172,7 @@ jobs:
             OTHER_DOCC_FLAGS='--warnings-as-errors'
 
   integration-live:
-    name: Live worker · all no-model RPC suites
+    name: Live integration tests
     runs-on: macos-15
     needs: [unit, runtime-artifact]
     timeout-minutes: 20
@@ -183,11 +183,11 @@ jobs:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm
           cache-dependency-path: tools/runtime/package-lock.json
-      - name: Install exact runtime and local binary graph
+      - name: Prepare runtime and binary dependencies
         run: |
           tools/runtime/link-ios-artifacts.sh
           node tools/ci/package-manifest-mode.mjs --activate-development
-      - name: Run required live suites with zero skips
+      - name: Run live test suites
         env:
           QVAC_BARE_BIN: ${{ github.workspace }}/tools/runtime/node_modules/bare-runtime/bin/bare
           QVAC_NODE_MODULES: ${{ github.workspace }}/tools/runtime/node_modules
@@ -198,7 +198,7 @@ jobs:
           tools/ci/run-required-suite.sh AllRPCTypesRoundTripTests 1
 
   integration-models:
-    name: First inference <10m; pinned models; KR-2 streaming benchmark
+    name: Model integration and performance
     runs-on: macos-15
     needs: [unit, runtime-artifact]
     timeout-minutes: 120
@@ -211,11 +211,11 @@ jobs:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm
           cache-dependency-path: tools/runtime/package-lock.json
-      - name: Install exact runtime and local binary graph
+      - name: Prepare runtime and binary dependencies
         run: |
           tools/runtime/link-ios-artifacts.sh
           node tools/ci/package-manifest-mode.mjs --activate-development
-      - name: Prove clean checkout through first real inference in under 10 minutes
+      - name: Verify first inference under 10 minutes
         env:
           QVAC_BARE_BIN: ${{ github.workspace }}/tools/runtime/node_modules/bare-runtime/bin/bare
           QVAC_NODE_MODULES: ${{ github.workspace }}/tools/runtime/node_modules
@@ -245,7 +245,7 @@ jobs:
           TOTAL="$(( $(date +%s) - START ))"
           echo "Clean checkout/setup through pinned real-model inference: ${TOTAL}s"
           if [ "$TOTAL" -ge 600 ]; then
-            echo "::error::First inference took ${TOTAL}s; grant limit is <600s"
+            echo "::error::First inference took ${TOTAL}s; the limit is <600s"
             exit 1
           fi
       - name: Run remaining checksum-pinned model suites
@@ -258,14 +258,14 @@ jobs:
         run: |
           tools/ci/run-required-suite.sh RAGIntegrationTests 2
           tools/ci/run-required-suite.sh UpscaleIntegrationTests 1
-      - name: Verify the KR-2 statistical analyzer
+      - name: Verify benchmark analyzer
         run: node bench/test-analyzer.mjs
-      - name: Compare real streaming completion through the public Swift and JS APIs
+      - name: Compare Swift and JavaScript streaming performance
         timeout-minutes: 35
         env:
           QVAC_BENCH_MODEL_PATH: ${{ runner.temp }}/qvac-model-fixtures/2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d-SmolLM2-135M-Instruct-Q4_K_M.gguf
         run: bench/run.sh
-      - name: Upload KR-2 benchmark evidence
+      - name: Upload benchmark evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -288,11 +288,11 @@ jobs:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm
           cache-dependency-path: tools/runtime/package-lock.json
-      - name: Materialize exact 0.17 iOS graph
+      - name: Prepare iOS binary dependencies
         run: |
           tools/runtime/link-ios-artifacts.sh
           node tools/ci/package-manifest-mode.mjs --activate-development
-      - name: Build clean-checkout package for iOS device and Simulator
+      - name: Build package for iOS device and Simulator
         run: |
           swift package dump-package >/dev/null
           git diff --exit-code -- Sources Tests
@@ -303,7 +303,7 @@ jobs:
           xcodebuild -scheme QVACClient \
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath "$RUNNER_TEMP/qvac-package-dd" build
-      - name: Run local-graph worker smoke test on a hosted iOS Simulator
+      - name: Run iOS Simulator worker test
         working-directory: Tests/QVACiOSSmokeHarness
         run: |
           swift package dump-package >/dev/null
@@ -361,7 +361,7 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/qvac-chat-macos-dd" build
 
   ios17-url-runtime:
-    name: iOS 17.0 · candidate/public package runtime gate
+    name: iOS 17 package integration
     if: github.event_name == 'push'
     runs-on: macos-15
     needs: [runtime-artifact]
@@ -379,7 +379,7 @@ jobs:
           node-version: ${{ env.QVAC_NODE_VERSION }}
           cache: npm
           cache-dependency-path: tools/runtime/package-lock.json
-      - name: Resolve the canonical artifact publication phase
+      - name: Determine artifact availability
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -437,7 +437,7 @@ jobs:
             '{phase: $phase, artifactTag: $tag, sourceRevision: $revision}' \
             > "$RUNNER_TEMP/qvac-ios17-runtime-mode.json"
           echo "Canonical artifact phase: $ARTIFACT_PHASE ($ARTIFACT_TAG)"
-      - name: Pin Xcode and install the exact minimum iOS runtime
+      - name: Install the minimum iOS runtime
         timeout-minutes: 40
         run: |
           test "$(xcodebuild -version | sed -n '1p')" = 'Xcode 16.4'
@@ -456,7 +456,7 @@ jobs:
           fi
           xcrun simctl list -j runtimes | jq -e --arg id "$QVAC_IOS_RUNTIME_ID" \
             'any(.runtimes[]; .identifier == $id and .isAvailable == true)' >/dev/null
-      - name: Create and boot a fresh pinned simulator
+      - name: Create and boot the test simulator
         run: |
           xcrun simctl list -j devicetypes | jq -e --arg id "$QVAC_IOS_DEVICE_TYPE_ID" \
             'any(.devicetypes[]; .identifier == $id)' >/dev/null
@@ -467,7 +467,7 @@ jobs:
           echo "QVAC_SIMULATOR_UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
-      - name: Run the phase-appropriate iOS 17 worker smoke
+      - name: Run iOS 17 package integration
         run: |
           if [ "$QVAC_ARTIFACT_PHASE" = published ]; then
             tools/ci/test-ios-url-consumer.sh \
@@ -497,7 +497,7 @@ jobs:
               QVACiOSSmokeTests
             echo "[ios17-runtime] candidate graph handshake passed; public-URL proof remains a mandatory source-release preflight"
           fi
-      - name: Tear down pinned simulator
+      - name: Tear down test simulator
         if: always()
         run: |
           if [ -n "${QVAC_SIMULATOR_UDID:-}" ]; then

@@ -1,8 +1,8 @@
-// QVAC-205 — embed
+// Text embedding operations.
 //
 // Returns a vector embedding for the given text. Supports single (string) and batch
-// (array of strings) inputs. The JS API overloads on input type; in Swift we use
-// two methods to keep the return types tight.
+// (array of strings) inputs. The JavaScript API overloads on input type; Swift
+// exposes separate methods with concrete return types.
 
 import Foundation
 

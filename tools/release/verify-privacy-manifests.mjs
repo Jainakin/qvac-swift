@@ -1148,7 +1148,7 @@ function selfTest(audit, development) {
   const sourceWorkflow = readFileSync(sourceReleaseWorkflowPath, 'utf8')
   assert.match(
     sourceWorkflow,
-    /Require complete native-license and privacy closure before publication[\s\S]{0,500}generate-third-party-notices\.mjs --check-publication[\s\S]{0,500}verify-privacy-manifests\.mjs --check-publication/,
+    /generate-third-party-notices\.mjs --check-publication[\s\S]{0,500}verify-privacy-manifests\.mjs --check-publication/,
   )
   console.log('[privacy-manifest-audit-test] target drift, Apple schema/value allowlists, collection/tracking consistency, byte-bound declarations, closure, and both publication gates enforced')
 }

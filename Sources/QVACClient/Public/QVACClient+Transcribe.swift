@@ -1,4 +1,4 @@
-// QVAC-206 — transcribe (upfront audio)
+// Transcription from complete audio input.
 //
 // Streams transcription back as the worker processes the supplied audio. Two output
 // styles match the JS API:

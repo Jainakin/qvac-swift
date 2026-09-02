@@ -1,19 +1,9 @@
-// AllRPCTypesRoundTripTests — AC-4 evidence.
+// Exercises every public operation against a live Bare worker. Both successful
+// responses and typed application errors demonstrate a complete request/response
+// round trip. Encoding errors and protocol violations fail the suite.
 //
-// The grant requires: "All RPC message types round-trip correctly (encode → send →
-// receive → decode) against the Bare worker." The other live-worker tests only cover
-// init, heartbeat, downloadAsset stream, cancel error, and close. This file fires every
-// public QVACClient method at a real worker and asserts the wire format is intact:
-//
-//   - Success path: the worker decoded our request and we decoded its response — done.
-//   - Application error path: the worker decoded our request and returned a typed error
-//     envelope (e.g. "model not loaded", "asset URL invalid"). Wire format is good.
-//   - Wire/protocol error path: encoding/decoding failed on either side. THIS is what
-//     the test guards against — we count any thrown `QVACError.encoding` or `.protocolViolation`
-//     as a hard failure.
-//
-// Requires `QVAC_BARE_BIN` + `QVAC_NODE_MODULES` set (CI sets these in the
-// `integration-macos` job). Skipped otherwise.
+// Requires `QVAC_BARE_BIN` and `QVAC_NODE_MODULES`. Required CI wrappers reject
+// missing configuration or skipped tests.
 
 import XCTest
 @testable import QVACClient

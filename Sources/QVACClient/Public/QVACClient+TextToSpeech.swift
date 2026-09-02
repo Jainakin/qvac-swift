@@ -1,4 +1,4 @@
-// QVAC-208 — textToSpeech (single-shot synthesis)
+// Text-to-speech synthesis.
 //
 // Synthesizes speech audio from text. QVAC 0.17 emits native signed 16-bit PCM sample
 // values as JSON numbers, which the generated wire contract decodes to Swift `Double`.

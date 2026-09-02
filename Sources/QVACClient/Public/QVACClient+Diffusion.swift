@@ -1,4 +1,4 @@
-// QVAC-211 — diffusion
+// Image generation.
 //
 // Image generation via Stable Diffusion / FLUX. The worker streams two kinds of frames:
 //   • `step` events with progress (current step / total steps)

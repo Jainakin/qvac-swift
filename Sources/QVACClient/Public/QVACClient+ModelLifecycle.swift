@@ -1,4 +1,4 @@
-// QVAC-202 / QVAC-203 — loadModel + unloadModel
+// Model loading and unloading.
 
 import Foundation
 

@@ -1,14 +1,14 @@
-name: Build Immutable SDK 0.17 Artifacts
+name: Build SDK 0.17 Artifacts
 
 on:
   workflow_dispatch:
     inputs:
       revision:
-        description: Monotonic artifact revision N >= 2 (creates hardened artifacts-sdk-0.17.0-rN)
+        description: Artifact revision number (2 or higher); creates artifacts-sdk-0.17.0-rN
         required: true
         type: number
       publish:
-        description: Publish a new immutable GitHub artifact release
+        description: Publish the artifact release after all checks pass
         required: true
         default: false
         type: boolean
@@ -127,16 +127,16 @@ jobs:
           tools/runtime/test-bundle-reproducibility.sh
           cmp tools/runtime/.build/worker.repro-a.bundle \
             Sources/QVACClient/Resources/worker.mobile.bundle
-      - name: Link exact native graph and compute closure
+      - name: Build the native dependency closure
         run: |
           tools/runtime/link-ios-artifacts.sh
           node tools/release/compute-manifest.mjs link-set \
             tools/runtime/.build/artifacts \
             tools/runtime/.build/worker.repro-a.bundle \
             tools/runtime/.build/link-set.json
-      - name: Verify exact third-party attribution
+      - name: Verify third-party notices
         run: node tools/release/generate-third-party-notices.mjs --check
-      - name: Package deterministic assets and byte-bound evidence manifest
+      - name: Package artifacts and evidence
         run: |
           tools/runtime/test-path-safety.sh
           node tools/release/test-archive-reproducibility.mjs
@@ -158,7 +158,7 @@ jobs:
             --require-schema 3 \
             --privacy-audit tools/release/privacy-manifest-audit.json \
             --assets-dir tools/runtime/.build/release-assets
-      - name: Require reviewed attribution and privacy closure before publication
+      - name: Verify publication prerequisites
         if: inputs.publish
         run: |
           node tools/release/generate-third-party-notices.mjs --check-publication
@@ -172,7 +172,7 @@ jobs:
             echo "::error::Binary publication requires maintainer/legal review of THIRD_PARTY_NOTICES.md, including pinned supplements, and license_reviewed=true"
             exit 1
           fi
-      - name: Require successful full CI for the exact publication commit
+      - name: Verify CI for the publication commit
         if: inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -194,7 +194,7 @@ jobs:
           fi
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID" \
             --jq '"Artifact publication authorized by CI run \(.html_url): sha=\(.head_sha) conclusion=\(.conclusion)"'
-      - name: Require the final URL manifest before artifact publication
+      - name: Verify the URL package manifest
         if: inputs.publish
         run: |
           node tools/release/verify-release.mjs \
@@ -206,7 +206,7 @@ jobs:
             --bundle Sources/QVACClient/Resources/worker.mobile.bundle \
             --privacy-audit tools/release/privacy-manifest-audit.json
           echo "Final publication gate: canonical Package.swift is URL-based and bound to $GITHUB_SHA"
-      - name: Upload immutable candidate evidence
+      - name: Upload candidate evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.ARTIFACT_TAG }}
@@ -243,8 +243,8 @@ jobs:
             gh release create "$ARTIFACT_TAG" tools/runtime/.build/release-assets/* \
               --target "$GITHUB_SHA" \
               --latest=false \
-              --title "$ARTIFACT_TAG" \
-              --notes "Immutable iOS artifacts for exact @qvac/sdk 0.17.0. The worker, native archives, THIRD_PARTY_NOTICES.md, privacy audit, runtime resolution inventory, and SDK provenance are byte-bound by artifact-manifest.json."
+              --title "QVAC SDK 0.17.0 binary artifacts (${ARTIFACT_TAG##*-})" \
+              --notes "Binary dependencies for QVACClient. This release contains the iOS XCFrameworks and worker bundle referenced by Package.swift, together with checksums, third-party notices, privacy-audit results, and provenance records. Most users should install the source package rather than download these files directly."
           fi
 
           # With repository release immutability enabled, current gh creates a

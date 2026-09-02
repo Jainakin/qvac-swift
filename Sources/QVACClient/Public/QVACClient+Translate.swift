@@ -1,4 +1,4 @@
-// QVAC-210 — translate
+// Translation operations.
 //
 // Streams the translated text token-by-token. The worker supports both LLM-based
 // (`modelType: "llamacpp-completion"`) and NMT-based (`modelType: "nmtcpp-translation"`)

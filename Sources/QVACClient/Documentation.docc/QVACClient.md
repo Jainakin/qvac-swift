@@ -1,6 +1,6 @@
 # ``QVACClient``
 
-A native Swift concurrency client for the exact QVAC SDK 0.17.0 wire contract.
+A native Swift concurrency client for QVAC SDK 0.17.0.
 
 ## Overview
 
@@ -9,9 +9,9 @@ A native Swift concurrency client for the exact QVAC SDK 0.17.0 wire contract.
 worker deterministically. macOS uses a spawned Bare process over a private
 Unix-domain socket; iOS runs the verified mobile worker in a BareKit worklet.
 
-The generated contract contains 39 methods across request/reply, server-stream,
-and duplex call shapes. Every generated request and response validates its literal
-discriminator, and unknown response types are rejected instead of being hidden.
+The generated API contains 39 request/reply, server-stream, and duplex methods.
+Generated requests and responses validate their type discriminators, and unknown
+response types are reported as compatibility errors.
 
 Rich operation APIs provide:
 
@@ -23,8 +23,8 @@ Rich operation APIs provide:
 - typed `QVACError` values for worker, transport, timeout, encoding, and protocol
   failures.
 
-Exact generated `wire…` methods remain available for applications that need all
-optional 0.17 contract fields directly.
+Generated `wire…` methods remain available for applications that need every
+optional contract field.
 
 ## Operation groups
 
@@ -39,14 +39,12 @@ optional 0.17 contract fields directly.
 
 ## Contract identity
 
-`QVACSDKContract` publishes the generated SDK version, upstream commit, exact
-method inventory, call shapes, and conditional-progress metadata. The same pinned
-contract produces the concrete Swift types, the 136 error codes, and exhaustive
-round-trip tests.
+`QVACSDKContract` publishes the SDK version, upstream commit, method inventory,
+call shapes, and conditional-progress metadata used by the generated API. The
+same pinned contract produces the concrete Swift types and 136 error codes.
 
-The committed worker is independently reproduced from a lockfile-pinned runtime
-graph and verified to embed SDK 0.17.0. Source generation never evaluates a
-floating npm SDK package.
+The worker bundle and generated API are pinned to QVAC SDK 0.17.0. CI reproduces
+the worker from its locked runtime dependency graph.
 
 ## Resource limits
 

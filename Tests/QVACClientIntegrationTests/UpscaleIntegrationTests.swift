@@ -1,4 +1,4 @@
-// End-to-end proof for the reviewer-requested 0.17 standalone upscale operation.
+// End-to-end coverage for the QVAC 0.17 standalone upscale operation.
 // Opt-in is the only allowed skip. Once enabled, every missing prerequisite,
 // download mismatch, load/upscale error, or cleanup error fails the test.
 

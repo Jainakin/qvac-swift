@@ -163,9 +163,8 @@ final class BareRPCCodecTests: XCTestCase {
         XCTAssertNotNil(reader.next())
     }
 
-    // §10 from AUDIT.md — the reader must reject a frame whose declared length exceeds
-    // its `maxFrameSize`. A malformed/hostile peer that ships `0xFFFFFFFF` as the length
-    // prefix would otherwise grow the buffer to 4 GiB and OOM the process.
+    // Reject a frame whose declared length exceeds `maxFrameSize`. A hostile peer
+    // could otherwise force the process to reserve an unbounded input buffer.
     func test_reader_rejects_frame_larger_than_max_frame_size() throws {
         let reader = try BareRPCFrameReader(maxFrameSize: 1024)
         // 4-byte little-endian length prefix = 0x00000800 = 2048 (> 1024 max).
