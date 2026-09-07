@@ -21,7 +21,9 @@ on:
 permissions:
   actions: read
   attestations: read
-  contents: write
+  # Candidate runs are intentionally non-publishing. Grant write access only in
+  # the separately reviewed commit that removes the publication kill switch.
+  contents: read
 
 defaults:
   run:
@@ -265,7 +267,10 @@ jobs:
             xcrun simctl delete "$QVAC_SIMULATOR_UDID" || true
           fi
       - name: Upload patched-candidate validation evidence
-        if: always()
+        # A rejected publication request must not create even a partial
+        # candidate artifact. Candidate evidence is produced only by the
+        # explicitly non-publishing path.
+        if: always() && !inputs.publish
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bare-kit-candidate-validation-${{ github.sha }}
