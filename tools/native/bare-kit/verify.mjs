@@ -418,6 +418,27 @@ function workingTreeDigest(source) {
   return hash.digest('hex')
 }
 
+// Git's optional hunk-heading text is produced by version- and
+// installation-specific userdiff attributes. It is not consumed by `git apply`,
+// and Git installations can describe the same Objective-C hunk with different
+// method/function labels. The comparison preserves every path, blob ID, mode,
+// range, and payload byte while excluding only that non-semantic suffix.
+function canonicalPatchForComparison(patchText) {
+  return patchText.replace(
+    /^(@@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? @@)(?: .*)?$/gm,
+    '$1',
+  )
+}
+
+function reviewedPatchDiff(source, paths = expectedPatchPaths) {
+  return run('git', [
+    '-C', source, '-c', 'diff.suppressBlankEmpty=false', 'diff', '--full-index',
+    '--no-ext-diff', '--no-textconv', '--no-renames', '--no-color', '--unified=3',
+    '--diff-algorithm=myers', '--indent-heuristic', '--src-prefix=a/', '--dst-prefix=b/',
+    '--', ...paths,
+  ])
+}
+
 function verifySource(sourcePath, state, lock) {
   const source = requireDirectory(resolve(sourcePath), 'BareKit source checkout')
   if (!['upstream', 'patched'].includes(state)) fail(`invalid source state: ${state}`)
@@ -442,11 +463,11 @@ function verifySource(sourcePath, state, lock) {
       fail(`patched checkout changed unexpected paths: ${changed.join(', ')}`)
     }
     run('git', ['-C', source, 'diff', '--check'])
-    const actualPatch = run('git', [
-      '-C', source, 'diff', '--full-index', '--no-ext-diff', '--', ...expectedPatchPaths,
-    ])
+    const actualPatch = reviewedPatchDiff(source)
     const expectedPatch = readFileSync(join(toolDirectory, lock.patch.file), 'utf8')
-    if (actualPatch !== expectedPatch) fail('patched checkout diff differs byte-for-byte from the reviewed patch')
+    if (canonicalPatchForComparison(actualPatch) !== canonicalPatchForComparison(expectedPatch)) {
+      fail('patched checkout canonical diff differs from the reviewed patch')
+    }
     if (workingTreeDigest(source) !== lock.patch.patchedTreeSHA256) fail('complete patched source SHA-256 changed')
   }
   console.log(`[bare-kit] verified ${state} source ${lock.upstream.commit}`)
@@ -984,6 +1005,59 @@ function selfTest() {
     writeFileSync(join(hashFixture, 'input'), 'changed bytes\n')
     expectFailure(() => verifyHashes(hashFixture, { input: '0'.repeat(64) }, 'fixture'), /SHA-256 mismatch/)
 
+    const appleGitPatch = [
+      'diff --git a/apple/BareKit/BareKit.m b/apple/BareKit/BareKit.m',
+      'index 1111111..2222222 100644',
+      '--- a/apple/BareKit/BareKit.m',
+      '+++ b/apple/BareKit/BareKit.m',
+      '@@ -10,2 +10,3 @@ - (void)poll:(int)events;',
+      ' unchanged',
+      '+reviewed',
+      ' unchanged',
+      '',
+    ].join('\n')
+    const upstreamGitPatch = appleGitPatch.replace(
+      '@@ -10,2 +10,3 @@ - (void)poll:(int)events;',
+      '@@ -10,2 +10,3 @@ bare_worklet__on_push(bare_worklet_t *worklet)',
+    )
+    assert.equal(
+      canonicalPatchForComparison(appleGitPatch),
+      canonicalPatchForComparison(upstreamGitPatch),
+    )
+    assert.notEqual(
+      canonicalPatchForComparison(appleGitPatch),
+      canonicalPatchForComparison(upstreamGitPatch.replace('-10,2', '-11,2')),
+    )
+    assert.notEqual(
+      canonicalPatchForComparison(appleGitPatch),
+      canonicalPatchForComparison(upstreamGitPatch.replace('+reviewed', '+different')),
+    )
+    for (const alteredMetadataPatch of [
+      upstreamGitPatch.replace('2222222', '3333333'),
+      upstreamGitPatch.replace('100644', '100755'),
+      upstreamGitPatch.replace('b/apple/BareKit/BareKit.m', 'b/apple/BareKit/Other.m'),
+    ]) {
+      assert.notEqual(
+        canonicalPatchForComparison(appleGitPatch),
+        canonicalPatchForComparison(alteredMetadataPatch),
+      )
+    }
+
+    const gitDiffFixture = join(fixture, 'git-diff')
+    mkdirSync(gitDiffFixture)
+    run('git', ['-C', gitDiffFixture, 'init', '--quiet'])
+    writeFileSync(join(gitDiffFixture, 'blank.txt'), 'alpha\n\nomega\n')
+    run('git', ['-C', gitDiffFixture, 'add', 'blank.txt'])
+    run('git', [
+      '-C', gitDiffFixture,
+      '-c', 'user.name=QVAC verifier',
+      '-c', 'user.email=verifier@invalid.example',
+      'commit', '--quiet', '-m', 'fixture',
+    ])
+    writeFileSync(join(gitDiffFixture, 'blank.txt'), 'alpha\n\nreviewed\nomega\n')
+    run('git', ['-C', gitDiffFixture, 'config', 'diff.suppressBlankEmpty', 'true'])
+    assert.match(reviewedPatchDiff(gitDiffFixture, ['blank.txt']), /\n \n/)
+
     const badLock = structuredClone(lock)
     badLock.candidate.activationStatus = 'ready'
     expectFailure(() => validateLock(badLock), /must remain blocked/)
@@ -1119,7 +1193,7 @@ function selfTest() {
   } finally {
     rmSync(fixture, { recursive: true, force: true })
   }
-  console.log('[bare-kit] verifier self-test passed (tamper, schema, closure, hash, activation, artifact shape, sanitizer isolation, native TSan compile invocations, symbols, and load-command rejection)')
+  console.log('[bare-kit] verifier self-test passed (tamper, schema, closure, hash, portable hunk headings, activation, artifact shape, sanitizer isolation, native TSan compile invocations, symbols, and load-command rejection)')
 }
 
 function option(name) {

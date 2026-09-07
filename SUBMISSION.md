@@ -53,11 +53,12 @@ replace clean hosted validation of the delivered commit.
 | macOS Address Sanitizer | The same 620-test inventory passed |
 | macOS Undefined Behavior Sanitizer | The same 620-test inventory passed |
 | Required integration tests | 19 of 19 passed with no failures or skips, including live-worker, real-model completion and profiling, RAG, and upscaling coverage |
-| Handwritten macOS production coverage | 15,813/16,230 lines (97.43%), 1,403/1,482 functions (94.67%), and 4,846/5,213 regions (92.96%) |
+| Handwritten macOS production coverage | 15,814/16,230 lines (97.44%), 1,403/1,482 functions (94.67%), and 4,847/5,213 regions (92.98%) |
 | Generated-source coverage | 3,533/3,936 lines (89.76%), 325/325 functions (100%), and 1,966/2,235 regions (87.96%) |
-| Combined macOS production coverage | 19,346/20,166 lines (95.93%), 1,728/1,807 functions (95.63%), and 6,812/7,448 regions (91.46%) |
+| Combined macOS production coverage | 19,347/20,166 lines (95.94%), 1,728/1,807 functions (95.63%), and 6,813/7,448 regions (91.47%) |
 | iOS platform coverage | 37 of 37 reviewed tests passed. `BareIPCTransport.swift` measured 782/806 lines (97.02%), 108/115 functions (93.91%), and 258/281 regions (91.81%); supplemental `QVACClient.swift` and handshake measurements bring the gated iOS sources to 1,323/2,567 lines (51.54%), 160/288 functions (55.56%), and 421/893 regions (47.14%). |
 | iOS Simulator Thread Sanitizer | The 37-test inventory passed locally with Swift-side instrumentation against the public r1 BareKit binary. The final hosted gate separately instruments every native unit built from the pinned patched BareKit source, while correctly excluding its three prebuilt archives from that claim. |
+| Physical iPhone validation | 1 of 1 selected arm64 tests passed on an iPhone 15 Pro running iOS 26.6.1. `QVACChatPhysicalDeviceTests/testLoadStreamAndUnloadOnPhysicalDevice()` launched the signed app and completed worker startup, model load, streaming inference, and model unload. |
 | Package manifest | SwiftPM resolves one library product backed by 38 checksum-pinned binary targets |
 | Publication guard | Fails closed on any of the six license/privacy blockers and on the separate BareKit r2 activation gate |
 
@@ -105,9 +106,11 @@ must have a clean hosted validation run that confirms:
 3. deterministic code generation and runtime-artifact reproduction;
 4. strict macOS, generic iOS device, and iOS Simulator builds;
 5. DocC, external SwiftPM URL-consumer, example-application, and iOS runtime
-   checks; and
-6. the selected physical-device test, if physical-device evidence is included
-   in the final review package.
+   checks.
+
+If physical-device evidence is included in the final review package, its
+signed test result must identify the same delivered source revision separately
+from the hosted run.
 
 The delivery record outside this source tree must identify the delivered commit
 and its matching hosted run. Calibration output from a dirty worktree must not

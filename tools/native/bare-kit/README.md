@@ -75,6 +75,12 @@ creates the XCFramework, installs the SwiftPM module map, and verifies the
 finished binary. It emits both
 `tools/native/bare-kit/.build/BareKit.xcframework` and the deterministic
 `tools/native/bare-kit/.build/bare-kit-native-closure.json` evidence document.
+Patch revalidation compares every path, blob ID, mode, hunk range, and payload
+byte. It ignores only Git's optional hunk-heading description, which is not part
+of the applied patch and varies with Git's installation-specific Objective-C
+userdiff attributes. The verifier pins the Myers algorithm, indentation
+heuristic, and blank-context rendering so ambient Git configuration cannot
+change the reviewed payload.
 
 The lock records the exact dependency closure observed after generation rather
 than relying on the abbreviated tags present in upstream CMake files. The

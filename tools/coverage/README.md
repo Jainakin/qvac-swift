@@ -172,12 +172,12 @@ node tools/ci/verify-ios-test-log.mjs --self-test
 
 ## Reviewed calibration
 
-The 620-test local calibration on Xcode 26.6 measured 15,813/16,230 handwritten
-lines (97.43%), 1,403/1,482 functions (94.67%), and 4,846/5,213 regions
-(92.96%) across 38 files. The four generated files measured 3,533/3,936 lines
+The 620-test local calibration on Xcode 26.6 measured 15,814/16,230 handwritten
+lines (97.44%), 1,403/1,482 functions (94.67%), and 4,847/5,213 regions
+(92.98%) across 38 files. The four generated files measured 3,533/3,936 lines
 (89.76%), 325/325 functions (100%), and 1,966/2,235 regions (87.96%). Combined
-macOS production coverage was 19,346/20,166 lines (95.93%), 1,728/1,807
-functions (95.63%), and 6,812/7,448 regions (91.46%).
+macOS production coverage was 19,347/20,166 lines (95.94%), 1,728/1,807
+functions (95.63%), and 6,813/7,448 regions (91.47%).
 
 The separate iOS platform gate binds its exact test inventory and SHA-256 in
 `ios-transport-policy.json` and `../ci/ios-smoke-test-inventory.txt`. Its

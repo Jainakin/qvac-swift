@@ -12,6 +12,17 @@ final class BareRPCClientTests: XCTestCase {
 
     // MARK: - In-memory transport
 
+    /// Cross-toolchain weak storage for lifetime assertions. Swift 5.10
+    /// requires local weak bindings to be mutable, while newer compilers warn
+    /// when that local `var` is otherwise never assigned.
+    private final class WeakReference<Object: AnyObject> {
+        weak var value: Object?
+
+        init(_ value: Object?) {
+            self.value = value
+        }
+    }
+
     private final class InboundPipe: @unchecked Sendable {
         let stream: AsyncThrowingStream<Data, Error>
         let continuation: AsyncThrowingStream<Data, Error>.Continuation
@@ -368,6 +379,19 @@ final class BareRPCClientTests: XCTestCase {
         }
         XCTFail("timed out waiting for \(count) outbound frames")
         return frames(in: await transport.outbound())
+    }
+
+    private static func waitForCount(
+        _ expected: Int,
+        in counter: OSAllocatedAtomic,
+        timeout: Duration = .seconds(1)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while counter.get() < expected, clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(counter.get(), expected, "timed out waiting for counter value \(expected)")
     }
 
     /// Open both duplex directions explicitly. A nil timeout removes only the
@@ -4139,7 +4163,7 @@ final class BareRPCClientTests: XCTestCase {
         try await Self.replyToInit(on: first)
         var client: QVACClient? = try await initialization?.value
         initialization = nil
-        weak let weakClient = client
+        let weakClient = WeakReference(client)
         let initialRPC = await client?.rpc
         XCTAssertNotNil(initialRPC)
 
@@ -4180,10 +4204,10 @@ final class BareRPCClientTests: XCTestCase {
         client = nil
 
         let deinitDeadline = ContinuousClock.now.advanced(by: .seconds(1))
-        while weakClient != nil, ContinuousClock.now < deinitDeadline {
+        while weakClient.value != nil, ContinuousClock.now < deinitDeadline {
             try await Task.sleep(for: .milliseconds(5))
         }
-        XCTAssertNil(weakClient, "the suspended reconnect must not retain QVACClient")
+        XCTAssertNil(weakClient.value, "the suspended reconnect must not retain QVACClient")
 
         // The cancelled factory returns a resource late. `makeConnection` must
         // close it before any handshake or application request reaches the wire.
@@ -5167,8 +5191,9 @@ final class BareRPCClientTests: XCTestCase {
         let elapsed = started.duration(to: clock.now)
         XCTAssertGreaterThanOrEqual(elapsed, .seconds(4.5))
         XCTAssertLessThan(elapsed, .seconds(7))
+        let teardownFrames = try await Self.waitForFrames(3, on: transport)
         try await Self.waitForNoInFlight(await client.rpc)
-        let teardownCount = Self.frames(in: await transport.outbound()).filter { frame in
+        let teardownCount = teardownFrames.filter { frame in
             guard case .stream(let frameID, let flags, _) = frame else { return false }
             return frameID == id
                 && flags.contains(.response)
@@ -5180,11 +5205,15 @@ final class BareRPCClientTests: XCTestCase {
 
     func test_concrete_stream_terminal_drain_cancellation_destroys_remote_once() async throws {
         let transport = MockTransport()
-        let client = QVACClient(testing: transport)
+        let profilingCount = OSAllocatedAtomic(initial: 0)
+        let client = QVACClient(
+            testing: transport,
+            profilingMetadataHandler: { _ in _ = profilingCount.increment() }
+        )
         let source: QVACResponseStream<CompletionStreamResponse> = try await client.streamTyped(
             .completionStream(.init(history: [], modelId: "missing", stream: true)),
             decoding: CompletionStreamResponse.self,
-            rpcOptions: .init(timeout: nil)
+            rpcOptions: .init(timeout: nil, profiling: .init(enabled: true))
         )
         let frames = try await Self.waitForFrames(2, on: transport)
         guard case .request(let id, _, _, _) = frames[0] else {
@@ -5196,6 +5225,10 @@ final class BareRPCClientTests: XCTestCase {
         var terminalErrorRecord = Data(
             #"{"type":"error","code":52002,"message":"missing"}"#.utf8
         )
+        terminalErrorRecord.append(0x0A)
+        terminalErrorRecord.append(contentsOf: Data(
+            #"{"__profilingTrailer":true,"__profiling":{"id":"terminal-drain"}}"#.utf8
+        ))
         terminalErrorRecord.append(0x0A)
         var inbound = BareRPCCodec.__testEncodeResponseFrame(
             id: id,
@@ -5213,7 +5246,7 @@ final class BareRPCClientTests: XCTestCase {
             var iterator = source.makeAsyncIterator()
             return try await iterator.next()
         }
-        try await Task.sleep(for: .milliseconds(25))
+        try await Self.waitForCount(1, in: profilingCount)
         read.cancel()
         do {
             _ = try await read.value
@@ -5224,8 +5257,9 @@ final class BareRPCClientTests: XCTestCase {
             XCTFail("expected cancellation, got \(error)")
         }
 
+        let teardownFrames = try await Self.waitForFrames(3, on: transport)
         try await Self.waitForNoInFlight(await client.rpc)
-        let teardownCount = Self.frames(in: await transport.outbound()).filter { frame in
+        let teardownCount = teardownFrames.filter { frame in
             guard case .stream(let frameID, let flags, _) = frame else { return false }
             return frameID == id
                 && flags.contains(.response)
