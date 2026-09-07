@@ -152,6 +152,14 @@ self-tests with:
 tools/coverage/run-ios-transport.sh --self-test
 ```
 
+Evidence runs must also declare the native read adapter explicitly with
+`--native-read-adapter checked` for a patched r2-or-later BareKit candidate or
+`--native-read-adapter legacy` for the immutable r1 baseline. There is no
+default. The policy requires a mutually exclusive LLVM coverage anchor for the
+selected adapter, requires the other adapter's anchor to exist with a zero
+execution count, and records both sets in the evidence. A candidate therefore
+cannot pass by silently exercising the wrong Objective-C ABI path or both paths.
+
 Thread Sanitizer uses a separate build and result bundle because sanitizer and
 coverage instrumentation are independent gates. The non-publishing BareKit r2
 candidate job first builds an arm64 Simulator-only native framework with
@@ -198,6 +206,14 @@ functions (25.93%), and 134/563 regions (23.80%); `Handshake.swift` measured
 57/71 lines (80.28%), 10/11 functions (90.91%), and 29/49 regions (59.18%).
 Across the three gated iOS sources, that is 1,323/2,567 lines (51.54%), 160/288
 functions (55.56%), and 421/893 regions (47.14%).
+
+That calibration uses the immutable r1 adapter. Under the same 37-test
+inventory on hosted Xcode 16.4, the patched r2 adapter measures 775/806 lines
+(96.15%), 107/115 functions (93.04%), and 257/281 regions (91.46%). The
+seven-line difference is the intentionally unexecuted r1 fallback closure.
+The shared uncovered-line ceiling is calibrated to the stricter r2 result,
+while mode-specific required lines independently prove that r1 executed the
+legacy reader and r2 selected `readWithError:`.
 
 The hosted workflow pins its toolchain independently of this local Xcode 26.6
 calibration. Aggregate, per-file, and critical-file limits retain deliberate

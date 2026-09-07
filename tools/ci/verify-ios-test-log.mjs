@@ -88,7 +88,7 @@ function loadReviewMetadata() {
   const policyBytes = regularBytes(policyPath, 'iOS coverage policy', maximumMetadataBytes)
   const policy = parseJSON(policyBytes, 'iOS coverage policy')
   const testPolicy = policy?.test
-  if (policy?.schemaVersion !== 2 ||
+  if (policy?.schemaVersion !== 3 ||
       testPolicy?.module !== 'QVACiOSSmokeTests' ||
       !Number.isSafeInteger(testPolicy.expectedCount) ||
       testPolicy.expectedCount <= 0 ||

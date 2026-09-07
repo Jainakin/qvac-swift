@@ -39,6 +39,9 @@ jobs:
     timeout-minutes: 180
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      QVAC_IOS_RUNTIME_VERSION: "17.0"
+      QVAC_IOS_RUNTIME_ID: com.apple.CoreSimulator.SimRuntime.iOS-17-0
+      QVAC_IOS_DEVICE_TYPE_ID: com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -167,6 +170,36 @@ jobs:
           test -x "$QVAC_XCODEGEN"
           test "$("$QVAC_XCODEGEN" --version)" = "Version: $XCODEGEN_VERSION"
           echo "QVAC_XCODEGEN=$QVAC_XCODEGEN" >> "$GITHUB_ENV"
+      - name: Install the pinned iOS test runtime
+        timeout-minutes: 40
+        run: |
+          test "$(xcodebuild -version | sed -n '1p')" = 'Xcode 16.4'
+          test "$(xcodebuild -version | sed -n '2p')" = 'Build version 16F6'
+          if ! xcrun simctl list -j runtimes | jq -e --arg id "$QVAC_IOS_RUNTIME_ID" \
+            'any(.runtimes[]; .identifier == $id and .isAvailable == true)' >/dev/null; then
+            for ATTEMPT in 1 2; do
+              if xcodebuild -downloadPlatform iOS -buildVersion "$QVAC_IOS_RUNTIME_VERSION"; then
+                break
+              fi
+              if [ "$ATTEMPT" = 2 ]; then
+                echo "::error::Could not install iOS $QVAC_IOS_RUNTIME_VERSION Simulator runtime"
+                exit 1
+              fi
+            done
+          fi
+          xcrun simctl list -j runtimes | jq -e --arg id "$QVAC_IOS_RUNTIME_ID" \
+            'any(.runtimes[]; .identifier == $id and .isAvailable == true)' >/dev/null
+      - name: Create and boot the artifact-candidate simulator
+        run: |
+          xcrun simctl list -j devicetypes | jq -e --arg id "$QVAC_IOS_DEVICE_TYPE_ID" \
+            'any(.devicetypes[]; .identifier == $id)' >/dev/null
+          UDID="$(xcrun simctl create \
+            "qvac-artifact-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            "$QVAC_IOS_DEVICE_TYPE_ID" \
+            "$QVAC_IOS_RUNTIME_ID")"
+          echo "QVAC_SIMULATOR_UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
       - name: Validate the patched candidate through the consuming package
         run: |
           cp Package.swift "$RUNNER_TEMP/Package.swift.canonical"
@@ -190,7 +223,8 @@ jobs:
           (
             cd Tests/QVACiOSSmokeHarness
             xcodebuild -scheme QVACiOSSmokeHarness-Package \
-              -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
+              -destination "platform=iOS Simulator,id=$QVAC_SIMULATOR_UDID" \
+              -destination-timeout 180 \
               -derivedDataPath "$RUNNER_TEMP/qvac-candidate-ios-dd" \
               CODE_SIGNING_ALLOWED=NO \
               -parallel-testing-enabled NO \
@@ -203,6 +237,7 @@ jobs:
               test
           ) 2>&1 | tee "$RUNNER_TEMP/qvac-candidate-ios.log"
           tools/coverage/run-ios-transport.sh \
+            --native-read-adapter checked \
             "$RUNNER_TEMP/qvac-candidate-ios-dd" \
             "$RUNNER_TEMP/qvac-candidate-ios.log" \
             "$RUNNER_TEMP/qvac-candidate-ios-coverage"
@@ -222,6 +257,13 @@ jobs:
           restore_package_manifest
           trap - EXIT
           git diff --exit-code -- Package.swift
+      - name: Tear down the artifact-candidate simulator
+        if: always()
+        run: |
+          if [ -n "${QVAC_SIMULATOR_UDID:-}" ]; then
+            xcrun simctl shutdown "$QVAC_SIMULATOR_UDID" || true
+            xcrun simctl delete "$QVAC_SIMULATOR_UDID" || true
+          fi
       - name: Upload patched-candidate validation evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

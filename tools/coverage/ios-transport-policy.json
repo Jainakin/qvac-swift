@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "test": {
     "module": "QVACiOSSmokeTests",
     "expectedCount": 37,
@@ -9,13 +9,17 @@
   "sources": [
     {
       "path": "Sources/QVACClient/Internal/Transport/BareIPCTransport.swift",
-      "requiredCoveredLines": [90, 180, 209, 247, 254, 262, 264, 273, 278, 303, 304, 308, 310, 377, 381, 390, 401, 406, 419, 423, 453, 464, 471, 492, 494, 500, 512, 522, 531, 538, 559, 566, 573, 589, 603, 612, 624, 634, 645, 655, 665, 675, 686],
+      "requiredCoveredLines": [89, 180, 209, 247, 254, 262, 264, 273, 278, 303, 304, 308, 310, 377, 381, 390, 401, 406, 419, 423, 453, 464, 471, 492, 494, 500, 512, 522, 531, 538, 559, 566, 573, 589, 603, 612, 624, 634, 645, 655, 665, 675, 686],
+      "requiredCoveredLinesByNativeReadAdapter": {
+        "checked": [95],
+        "legacy": [91]
+      },
       "gate": {
         "lines": {
           "minimumPercentBasisPoints": 9000,
           "minimumCovered": 670,
           "minimumTotal": 680,
-          "maximumUncovered": 30
+          "maximumUncovered": 31
         },
         "functions": {
           "minimumPercentBasisPoints": 8000,

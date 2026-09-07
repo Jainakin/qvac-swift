@@ -209,6 +209,7 @@ jobs:
               test
           ) 2>&1 | tee "$RUNNER_TEMP/qvac-barekit-r2-ios.log"
           tools/coverage/run-ios-transport.sh \
+            --native-read-adapter checked \
             "$RUNNER_TEMP/qvac-barekit-r2-ios-dd" \
             "$RUNNER_TEMP/qvac-barekit-r2-ios.log" \
             "$RUNNER_TEMP/qvac-barekit-r2-ios-coverage"
@@ -681,7 +682,11 @@ jobs:
     name: iOS package and example builds
     runs-on: macos-15
     needs: [unit, runtime-artifact]
-    timeout-minutes: 35
+    timeout-minutes: 90
+    env:
+      QVAC_IOS_RUNTIME_VERSION: "17.0"
+      QVAC_IOS_RUNTIME_ID: com.apple.CoreSimulator.SimRuntime.iOS-17-0
+      QVAC_IOS_DEVICE_TYPE_ID: com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -715,13 +720,44 @@ jobs:
             SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
             OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
             build
+      - name: Install the pinned iOS test runtime
+        timeout-minutes: 40
+        run: |
+          test "$(xcodebuild -version | sed -n '1p')" = 'Xcode 16.4'
+          test "$(xcodebuild -version | sed -n '2p')" = 'Build version 16F6'
+          if ! xcrun simctl list -j runtimes | jq -e --arg id "$QVAC_IOS_RUNTIME_ID" \
+            'any(.runtimes[]; .identifier == $id and .isAvailable == true)' >/dev/null; then
+            for ATTEMPT in 1 2; do
+              if xcodebuild -downloadPlatform iOS -buildVersion "$QVAC_IOS_RUNTIME_VERSION"; then
+                break
+              fi
+              if [ "$ATTEMPT" = 2 ]; then
+                echo "::error::Could not install iOS $QVAC_IOS_RUNTIME_VERSION Simulator runtime"
+                exit 1
+              fi
+            done
+          fi
+          xcrun simctl list -j runtimes | jq -e --arg id "$QVAC_IOS_RUNTIME_ID" \
+            'any(.runtimes[]; .identifier == $id and .isAvailable == true)' >/dev/null
+      - name: Create and boot the iOS coverage simulator
+        run: |
+          xcrun simctl list -j devicetypes | jq -e --arg id "$QVAC_IOS_DEVICE_TYPE_ID" \
+            'any(.devicetypes[]; .identifier == $id)' >/dev/null
+          UDID="$(xcrun simctl create \
+            "qvac-ios-coverage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            "$QVAC_IOS_DEVICE_TYPE_ID" \
+            "$QVAC_IOS_RUNTIME_ID")"
+          echo "QVAC_SIMULATOR_UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
       - name: Run complete iOS transport suite with source coverage
         working-directory: Tests/QVACiOSSmokeHarness
         run: |
           swift package dump-package >/dev/null
           ../../tools/coverage/run-ios-transport.sh --self-test
           xcodebuild -scheme QVACiOSSmokeHarness-Package \
-            -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
+            -destination "platform=iOS Simulator,id=$QVAC_SIMULATOR_UDID" \
+            -destination-timeout 180 \
             -derivedDataPath "$RUNNER_TEMP/qvac-ios-smoke-dd" \
             CODE_SIGNING_ALLOWED=NO \
             -parallel-testing-enabled NO \
@@ -733,11 +769,19 @@ jobs:
             -only-testing:QVACiOSSmokeTests \
             test 2>&1 | tee "$RUNNER_TEMP/qvac-ios-smoke.log"
           ../../tools/coverage/run-ios-transport.sh \
+            --native-read-adapter legacy \
             "$RUNNER_TEMP/qvac-ios-smoke-dd" \
             "$RUNNER_TEMP/qvac-ios-smoke.log" \
             "$RUNNER_TEMP/qvac-ios-transport-coverage"
           cat "$RUNNER_TEMP/qvac-ios-transport-coverage/ios-transport-coverage-summary.md" \
             >> "$GITHUB_STEP_SUMMARY"
+      - name: Tear down the iOS coverage simulator
+        if: always()
+        run: |
+          if [ -n "${QVAC_SIMULATOR_UDID:-}" ]; then
+            xcrun simctl shutdown "$QVAC_SIMULATOR_UDID" || true
+            xcrun simctl delete "$QVAC_SIMULATOR_UDID" || true
+          fi
       - name: Upload iOS transport coverage evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

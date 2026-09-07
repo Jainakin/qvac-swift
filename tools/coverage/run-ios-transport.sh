@@ -16,14 +16,19 @@ if [[ "${1:-}" == "--self-test" ]]; then
     exit 0
 fi
 
-if [[ "$#" -ne 3 ]]; then
-    echo "usage: $0 <DerivedData> <xcodebuild.log> <evidence-directory>" >&2
+if [[ "$#" -ne 5 || "$1" != "--native-read-adapter" ]]; then
+    echo "usage: $0 --native-read-adapter <checked|legacy> <DerivedData> <xcodebuild.log> <evidence-directory>" >&2
     exit 2
 fi
 
-DERIVED_DATA="$1"
-TEST_LOG="$2"
-EVIDENCE="$3"
+NATIVE_READ_ADAPTER="$2"
+if [[ "$NATIVE_READ_ADAPTER" != "checked" && "$NATIVE_READ_ADAPTER" != "legacy" ]]; then
+    echo "[ios-transport-coverage] native read adapter must be checked or legacy" >&2
+    exit 2
+fi
+DERIVED_DATA="$3"
+TEST_LOG="$4"
+EVIDENCE="$5"
 BINARY="$DERIVED_DATA/Build/Products/Debug-iphonesimulator/QVACiOSSmokeTests.xctest/QVACiOSSmokeTests"
 
 for INPUT in "$DERIVED_DATA" "$TEST_LOG" "$POLICY" "$BINARY"; do
@@ -85,4 +90,6 @@ xcrun llvm-cov export "$BINARY" \
     -instr-profile="$PROFILE" \
     "${SOURCES[@]}" > "$RAW_TEMP"
 mv "$RAW_TEMP" "$RAW_REPORT"
-node "$ANALYZER" "$RAW_REPORT" "$TEST_LOG" "$SUMMARY" "$MARKDOWN"
+node "$ANALYZER" \
+    --native-read-adapter "$NATIVE_READ_ADAPTER" \
+    "$RAW_REPORT" "$TEST_LOG" "$SUMMARY" "$MARKDOWN"
