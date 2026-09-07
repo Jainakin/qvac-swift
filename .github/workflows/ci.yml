@@ -102,6 +102,10 @@ jobs:
     name: BareKit r2 candidate · non-publishing
     runs-on: macos-15
     timeout-minutes: 180
+    env:
+      QVAC_IOS_RUNTIME_VERSION: "17.0"
+      QVAC_IOS_RUNTIME_ID: com.apple.CoreSimulator.SimRuntime.iOS-17-0
+      QVAC_IOS_DEVICE_TYPE_ID: com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -135,6 +139,36 @@ jobs:
           echo "QVAC_XCODEGEN=$QVAC_XCODEGEN" >> "$GITHUB_ENV"
       - name: Verify the exact-inventory iOS test-log gate
         run: node tools/ci/verify-ios-test-log.mjs --self-test
+      - name: Install the pinned iOS test runtime
+        timeout-minutes: 40
+        run: |
+          test "$(xcodebuild -version | sed -n '1p')" = 'Xcode 16.4'
+          test "$(xcodebuild -version | sed -n '2p')" = 'Build version 16F6'
+          if ! xcrun simctl list -j runtimes | jq -e --arg id "$QVAC_IOS_RUNTIME_ID" \
+            'any(.runtimes[]; .identifier == $id and .isAvailable == true)' >/dev/null; then
+            for ATTEMPT in 1 2; do
+              if xcodebuild -downloadPlatform iOS -buildVersion "$QVAC_IOS_RUNTIME_VERSION"; then
+                break
+              fi
+              if [ "$ATTEMPT" = 2 ]; then
+                echo "::error::Could not install iOS $QVAC_IOS_RUNTIME_VERSION Simulator runtime"
+                exit 1
+              fi
+            done
+          fi
+          xcrun simctl list -j runtimes | jq -e --arg id "$QVAC_IOS_RUNTIME_ID" \
+            'any(.runtimes[]; .identifier == $id and .isAvailable == true)' >/dev/null
+      - name: Create and boot the candidate test simulator
+        run: |
+          xcrun simctl list -j devicetypes | jq -e --arg id "$QVAC_IOS_DEVICE_TYPE_ID" \
+            'any(.devicetypes[]; .identifier == $id)' >/dev/null
+          UDID="$(xcrun simctl create \
+            "qvac-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            "$QVAC_IOS_DEVICE_TYPE_ID" \
+            "$QVAC_IOS_RUNTIME_ID")"
+          echo "QVAC_SIMULATOR_UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
       - name: Validate the candidate through the complete iOS transport suite
         run: |
           cp Package.swift "$RUNNER_TEMP/Package.swift.canonical"
@@ -161,7 +195,8 @@ jobs:
           (
             cd Tests/QVACiOSSmokeHarness
             xcodebuild -scheme QVACiOSSmokeHarness-Package \
-              -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
+              -destination "platform=iOS Simulator,id=$QVAC_SIMULATOR_UDID" \
+              -destination-timeout 180 \
               -derivedDataPath "$RUNNER_TEMP/qvac-barekit-r2-ios-dd" \
               CODE_SIGNING_ALLOWED=NO \
               -parallel-testing-enabled NO \
@@ -195,6 +230,13 @@ jobs:
           restore_package_manifest
           trap - EXIT
           git diff --exit-code -- Package.swift
+      - name: Tear down the candidate test simulator
+        if: always()
+        run: |
+          if [ -n "${QVAC_SIMULATOR_UDID:-}" ]; then
+            xcrun simctl shutdown "$QVAC_SIMULATOR_UDID" || true
+            xcrun simctl delete "$QVAC_SIMULATOR_UDID" || true
+          fi
       - name: Upload candidate and validation evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -217,6 +259,10 @@ jobs:
     name: BareKit r2 native-source + Swift TSan · non-publishing
     runs-on: macos-15
     timeout-minutes: 180
+    env:
+      QVAC_IOS_RUNTIME_VERSION: "17.0"
+      QVAC_IOS_RUNTIME_ID: com.apple.CoreSimulator.SimRuntime.iOS-17-0
+      QVAC_IOS_DEVICE_TYPE_ID: com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -236,6 +282,36 @@ jobs:
         run: |
           tools/native/bare-kit/build-candidate.sh --thread-sanitizer-simulator \
             2>&1 | tee "$RUNNER_TEMP/qvac-barekit-r2-native-tsan-build.log"
+      - name: Install the pinned iOS test runtime
+        timeout-minutes: 40
+        run: |
+          test "$(xcodebuild -version | sed -n '1p')" = 'Xcode 16.4'
+          test "$(xcodebuild -version | sed -n '2p')" = 'Build version 16F6'
+          if ! xcrun simctl list -j runtimes | jq -e --arg id "$QVAC_IOS_RUNTIME_ID" \
+            'any(.runtimes[]; .identifier == $id and .isAvailable == true)' >/dev/null; then
+            for ATTEMPT in 1 2; do
+              if xcodebuild -downloadPlatform iOS -buildVersion "$QVAC_IOS_RUNTIME_VERSION"; then
+                break
+              fi
+              if [ "$ATTEMPT" = 2 ]; then
+                echo "::error::Could not install iOS $QVAC_IOS_RUNTIME_VERSION Simulator runtime"
+                exit 1
+              fi
+            done
+          fi
+          xcrun simctl list -j runtimes | jq -e --arg id "$QVAC_IOS_RUNTIME_ID" \
+            'any(.runtimes[]; .identifier == $id and .isAvailable == true)' >/dev/null
+      - name: Create and boot the native TSan test simulator
+        run: |
+          xcrun simctl list -j devicetypes | jq -e --arg id "$QVAC_IOS_DEVICE_TYPE_ID" \
+            'any(.devicetypes[]; .identifier == $id)' >/dev/null
+          UDID="$(xcrun simctl create \
+            "qvac-native-tsan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            "$QVAC_IOS_DEVICE_TYPE_ID" \
+            "$QVAC_IOS_RUNTIME_ID")"
+          echo "QVAC_SIMULATOR_UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
       - name: Run the exact iOS inventory with BareKit-source and Swift instrumentation
         run: |
           cp Package.swift "$RUNNER_TEMP/Package.swift.canonical"
@@ -264,7 +340,8 @@ jobs:
             cd Tests/QVACiOSSmokeHarness
             TSAN_OPTIONS='halt_on_error=1:exitcode=66' \
               xcodebuild -scheme QVACiOSSmokeHarness-Package \
-                -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
+                -destination "platform=iOS Simulator,id=$QVAC_SIMULATOR_UDID" \
+                -destination-timeout 180 \
                 -derivedDataPath "$RUNNER_TEMP/qvac-barekit-r2-ios-tsan-dd" \
                 CODE_SIGNING_ALLOWED=NO \
                 -parallel-testing-enabled NO \
@@ -283,6 +360,13 @@ jobs:
           restore_package_manifest
           trap - EXIT
           git diff --exit-code -- Package.swift
+      - name: Tear down the native TSan test simulator
+        if: always()
+        run: |
+          if [ -n "${QVAC_SIMULATOR_UDID:-}" ]; then
+            xcrun simctl shutdown "$QVAC_SIMULATOR_UDID" || true
+            xcrun simctl delete "$QVAC_SIMULATOR_UDID" || true
+          fi
       - name: Upload native Thread Sanitizer evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
