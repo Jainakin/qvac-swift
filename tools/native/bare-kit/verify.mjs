@@ -33,6 +33,11 @@ const expectedHistoricalR1Hashes = new Set([
   '072006007278fa3bdf0ca4d1cec1d2c6972b8e1f0655c7a11f44551423f91b29',
 ])
 const expectedModuleMapSHA256 = '05864530e635c81092e55151c5fe3bf5348cea5912aecb11420f078c9a97b619'
+// BareKit statically links V8, so legitimate `nm` and `strings` output exceeds
+// Node's 1 MiB execFileSync default. Keep inspection bounded while leaving
+// ample headroom over the exact pinned 2.3.0 binary.
+const subprocessOutputLimitBytes = 64 * 1024 * 1024
+const subprocessErrorDetailLimit = 4 * 1024
 const expectedPatchMarker = 'qvac-bare-kit-2.3.0-ipc-hardening-1'
 const expectedPatchSHA256 = 'd8513ef4b411767719a6f10997408c6075a85bd7d171efd25d8076ea0e4683d2'
 const expectedPatchedTreeSHA256 = 'b4eb3c53ddfb09545bfdd0dbc126f259581bdfd1a36268bc1b2fa29ff7e46d5a'
@@ -149,10 +154,29 @@ function readJSON(path, label) {
 
 function run(command, arguments_, options = {}) {
   try {
-    return execFileSync(command, arguments_, { encoding: 'utf8', ...options })
+    return execFileSync(command, arguments_, {
+      encoding: 'utf8',
+      maxBuffer: subprocessOutputLimitBytes,
+      stdio: 'pipe',
+      ...options,
+    })
   } catch (error) {
-    const detail = String(error.stderr || error.stdout || error.message).trim()
-    fail(`${command} ${arguments_.join(' ')} failed${detail ? `: ${detail}` : ''}`)
+    const metadata = [
+      typeof error?.code === 'string' ? `code=${error.code}` : undefined,
+      Number.isInteger(error?.status) ? `status=${error.status}` : undefined,
+      typeof error?.signal === 'string' ? `signal=${error.signal}` : undefined,
+    ].filter(Boolean).join(' ')
+    const stderr = Buffer.isBuffer(error?.stderr)
+      ? error.stderr.toString('utf8')
+      : String(error?.stderr ?? '')
+    const message = String(error?.message ?? '')
+    const rawDetail = (stderr.trim() || message.trim())
+    const detail = rawDetail.length > subprocessErrorDetailLimit
+      ? `${rawDetail.slice(0, subprocessErrorDetailLimit)}…`
+      : rawDetail
+    // Never echo captured stdout here: binary inspection tools can produce
+    // tens of MiB, and ENOBUFS diagnostics must remain useful and bounded.
+    fail(`${command} ${arguments_.join(' ')} failed${metadata ? ` (${metadata})` : ''}${detail ? `: ${detail}` : ''}`)
   }
 }
 
@@ -1013,6 +1037,46 @@ function selfTest() {
   const lock = verifyRepository()
   const fixture = mkdtempSync(join(tmpdir(), 'qvac-bare-kit-verifier-'))
   try {
+    let boundedFailure
+    try {
+      run(process.execPath, ['-e', 'process.stdout.write("x".repeat(4096))'], { maxBuffer: 256 })
+    } catch (error) {
+      boundedFailure = error
+    }
+    assert.ok(boundedFailure instanceof Error, 'subprocess overflow self-test unexpectedly succeeded')
+    assert.match(boundedFailure.message, /code=ENOBUFS/)
+    assert.ok(
+      !boundedFailure.message.includes('x'.repeat(128)),
+      'subprocess overflow diagnostics leaked captured stdout',
+    )
+
+    let forwardedStderr = ''
+    let stderrFailure
+    const originalStderrWrite = process.stderr.write
+    process.stderr.write = (chunk) => {
+      forwardedStderr += String(chunk)
+      return true
+    }
+    try {
+      run(process.execPath, [
+        '-e',
+        'process.stderr.write("ERR_SENTINEL\\n" + "y".repeat(8192)); process.exit(7)',
+      ])
+    } catch (error) {
+      stderrFailure = error
+    } finally {
+      process.stderr.write = originalStderrWrite
+    }
+    assert.equal(forwardedStderr, '', 'failed subprocess stderr bypassed bounded diagnostics')
+    assert.ok(stderrFailure instanceof Error, 'subprocess stderr self-test unexpectedly succeeded')
+    assert.match(stderrFailure.message, /status=7/)
+    assert.match(stderrFailure.message, /ERR_SENTINEL/)
+    assert.ok(
+      stderrFailure.message.length < subprocessErrorDetailLimit + 1024,
+      'subprocess stderr diagnostics exceeded the reviewed bound',
+    )
+    assert.ok(stderrFailure.message.endsWith('…'), 'subprocess stderr diagnostics were not truncated')
+
     for (const name of [lockName, lock.patch.file, 'package.json', 'package-lock.json']) {
       copyFileSync(join(toolDirectory, name), join(fixture, name))
     }
