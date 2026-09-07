@@ -695,6 +695,34 @@ function validateDistributableSanitizerAbsence(loadCommands, undefinedSymbols, k
   }
 }
 
+function validateBareKitFrameworkLayout(libraryPath, binaryPath, label) {
+  if (libraryPath !== 'BareKit.framework' || binaryPath !== 'BareKit.framework/BareKit') {
+    fail(`${label} framework bundle/executable layout differs from BareKit`)
+  }
+}
+
+function resolveBareKitBinaryPath(libraryPath, declaredBinaryPath, label) {
+  // BinaryPath is optional XCFramework metadata. Derive only an omitted value;
+  // malformed explicit values (including null) must still fail closed.
+  const value = declaredBinaryPath === undefined
+    ? `${libraryPath}/BareKit`
+    : declaredBinaryPath
+  const binaryPath = safeRelativePath(value, `${label} BinaryPath`)
+  validateBareKitFrameworkLayout(libraryPath, binaryPath, label)
+  return binaryPath
+}
+
+function validateBareKitFrameworkInfo(info, label, version) {
+  if (info.CFBundleExecutable !== 'BareKit'
+      || info.CFBundleName !== 'BareKit'
+      || info.CFBundlePackageType !== 'FMWK'
+      || info.CFBundleIdentifier !== 'to.holepunch.bare.kit'
+      || info.CFBundleShortVersionString !== version
+      || info.CFBundleVersion !== version) {
+    fail(`${label} framework identity differs from BareKit ${version}`)
+  }
+}
+
 function verifyArtifact(artifactPath, lock) {
   const artifact = requireDirectory(resolve(artifactPath), 'BareKit XCFramework')
   if (basename(artifact) !== 'BareKit.xcframework') fail('candidate must be named BareKit.xcframework')
@@ -725,6 +753,7 @@ function verifyArtifact(artifactPath, lock) {
     }
     const identifier = safeRelativePath(library.LibraryIdentifier, `${kind} LibraryIdentifier`)
     const libraryPath = safeRelativePath(library.LibraryPath, `${kind} LibraryPath`)
+    const binaryRelative = resolveBareKitBinaryPath(libraryPath, library.BinaryPath, kind)
     const framework = pathInside(artifact, `${identifier}/${libraryPath}`, `${kind} framework`)
     requireDirectory(framework, `${kind} framework`)
     const header = join(framework, 'Headers', 'BareKit.h')
@@ -734,12 +763,7 @@ function verifyArtifact(artifactPath, lock) {
     }
     if (sha256(moduleMap) !== expectedModuleMapSHA256) fail(`${kind} framework module map changed`)
     const frameworkInfo = parsePlist(join(framework, 'Info.plist'), `${kind} framework Info.plist`)
-    if (frameworkInfo.CFBundleIdentifier !== 'to.holepunch.bare.kit'
-        || frameworkInfo.CFBundleShortVersionString !== lock.upstreamVersion
-        || frameworkInfo.CFBundleVersion !== lock.upstreamVersion) {
-      fail(`${kind} framework identity differs from BareKit ${lock.upstreamVersion}`)
-    }
-    const binaryRelative = safeRelativePath(library.BinaryPath ?? `${libraryPath}/BareKit`, `${kind} BinaryPath`)
+    validateBareKitFrameworkInfo(frameworkInfo, kind, lock.upstreamVersion)
     const binary = pathInside(artifact, `${identifier}/${binaryRelative}`, `${kind} binary`)
     requireRegularFile(binary, `${kind} binary`)
     const actualArchitectures = run('lipo', ['-archs', binary]).trim().split(/\s+/).sort()
@@ -900,6 +924,11 @@ function verifyThreadSanitizerArtifact(
 
   const identifier = safeRelativePath(library.LibraryIdentifier, 'Thread Sanitizer LibraryIdentifier')
   const libraryPath = safeRelativePath(library.LibraryPath, 'Thread Sanitizer LibraryPath')
+  const binaryRelative = resolveBareKitBinaryPath(
+    libraryPath,
+    library.BinaryPath,
+    'Thread Sanitizer',
+  )
   const framework = pathInside(artifact, `${identifier}/${libraryPath}`, 'Thread Sanitizer framework')
   requireDirectory(framework, 'Thread Sanitizer framework')
   const header = join(framework, 'Headers', 'BareKit.h')
@@ -911,16 +940,7 @@ function verifyThreadSanitizerArtifact(
     fail('Thread Sanitizer framework module map changed')
   }
   const frameworkInfo = parsePlist(join(framework, 'Info.plist'), 'Thread Sanitizer framework Info.plist')
-  if (frameworkInfo.CFBundleIdentifier !== 'to.holepunch.bare.kit'
-      || frameworkInfo.CFBundleShortVersionString !== lock.upstreamVersion
-      || frameworkInfo.CFBundleVersion !== lock.upstreamVersion) {
-    fail(`Thread Sanitizer framework identity differs from BareKit ${lock.upstreamVersion}`)
-  }
-
-  const binaryRelative = safeRelativePath(
-    library.BinaryPath ?? `${libraryPath}/BareKit`,
-    'Thread Sanitizer BinaryPath',
-  )
+  validateBareKitFrameworkInfo(frameworkInfo, 'Thread Sanitizer', lock.upstreamVersion)
   const binary = pathInside(artifact, `${identifier}/${binaryRelative}`, 'Thread Sanitizer binary')
   requireRegularFile(binary, 'Thread Sanitizer binary')
   const binaryEvidence = validateThreadSanitizerBinaryEvidence({
@@ -1097,6 +1117,56 @@ function selfTest() {
     expectFailure(() => validateLock(extraKey), /keys differ/)
     writeFileSync(join(fixture, 'not-an-xcframework'), 'x')
     expectFailure(() => verifyArtifact(join(fixture, 'not-an-xcframework'), lock), /directory/)
+
+    const reviewedFrameworkInfo = {
+      CFBundleExecutable: 'BareKit',
+      CFBundleName: 'BareKit',
+      CFBundlePackageType: 'FMWK',
+      CFBundleIdentifier: 'to.holepunch.bare.kit',
+      CFBundleShortVersionString: lock.upstreamVersion,
+      CFBundleVersion: lock.upstreamVersion,
+    }
+    assert.equal(
+      resolveBareKitBinaryPath('BareKit.framework', undefined, 'fixture'),
+      'BareKit.framework/BareKit',
+    )
+    assert.equal(
+      resolveBareKitBinaryPath('BareKit.framework', 'BareKit.framework/BareKit', 'fixture'),
+      'BareKit.framework/BareKit',
+    )
+    assert.doesNotThrow(() => validateBareKitFrameworkInfo(
+      reviewedFrameworkInfo,
+      'fixture',
+      lock.upstreamVersion,
+    ))
+    expectFailure(
+      () => resolveBareKitBinaryPath(
+        'Renamed.framework',
+        'Renamed.framework/BareKit',
+        'fixture',
+      ),
+      /bundle\/executable layout differs/,
+    )
+    expectFailure(
+      () => resolveBareKitBinaryPath(
+        'BareKit.framework',
+        'BareKit.framework/Renamed',
+        'fixture',
+      ),
+      /bundle\/executable layout differs/,
+    )
+    expectFailure(
+      () => resolveBareKitBinaryPath('BareKit.framework', null, 'fixture'),
+      /unsafe fixture BinaryPath/,
+    )
+    expectFailure(
+      () => validateBareKitFrameworkInfo(
+        { ...reviewedFrameworkInfo, CFBundleExecutable: 'Renamed' },
+        'fixture',
+        lock.upstreamVersion,
+      ),
+      /framework identity differs/,
+    )
 
     assert.doesNotThrow(() => validateDistributableSanitizerAbsence(
       '/usr/lib/libSystem.B.dylib\n',
