@@ -333,6 +333,41 @@ final class BareRPCDataChannelRetentionTests: XCTestCase {
         channel.finish(discardingBuffered: true)
     }
 
+    func test_cancellationObservedImmediatelyAfterRegistrationCannotLoseWakeup() async throws {
+        let cancellations = LockedCounter()
+        let channel = BoundedRPCDataChannel(
+            maximumBufferedBytes: 8,
+            isCurrentTaskCancelled: { true }
+        ) {
+            cancellations.increment()
+        }
+
+        do {
+            _ = try await channel.next()
+            XCTFail("expected cancellation observed immediately after waiter registration")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("unexpected cancellation error: \(error)")
+        }
+
+        XCTAssertEqual(cancellations.get(), 1)
+        var state = channel.__testState()
+        XCTAssertFalse(state.hasPendingWaiter)
+        XCTAssertEqual(state.queuedValues, 0)
+        XCTAssertEqual(state.inFlightBytes, 0)
+        XCTAssertEqual(state.bufferedBytes, 0)
+
+        let terminalValue = try await channel.next()
+        XCTAssertNil(terminalValue)
+        state = channel.__testState()
+        XCTAssertFalse(state.hasPendingWaiter)
+        XCTAssertEqual(state.queuedValues, 0)
+        XCTAssertEqual(state.inFlightBytes, 0)
+        XCTAssertEqual(state.bufferedBytes, 0)
+        channel.finish(discardingBuffered: true)
+    }
+
     func test_preCancelledReadStillNotifiesExactlyOnce() async throws {
         let cancellations = LockedCounter()
         let channel = BoundedRPCDataChannel(maximumBufferedBytes: 8) {

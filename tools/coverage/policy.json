@@ -3,9 +3,9 @@
   "test": {
     "module": "QVACClientUnitTests",
     "product": "QVACClientPackageTests",
-    "expectedCount": 620,
+    "expectedCount": 621,
     "inventoryPath": "tools/ci/unit-test-inventory.txt",
-    "inventorySHA256": "a251633a8f990fb260dcd283a3dbed2fae389047049129f55832680030cede64"
+    "inventorySHA256": "5441645de16ac6a4950a5f44b28e38db1e47827aca177ca7d704a645f534d109"
   },
   "scope": {
     "sourceRoot": "Sources/QVACClient",

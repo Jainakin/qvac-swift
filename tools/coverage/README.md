@@ -1,8 +1,8 @@
 # Coverage gate
 
-The coverage job runs the complete reviewed 620-test `QVACClientUnitTests`
+The coverage job runs the complete reviewed 621-test `QVACClientUnitTests`
 inventory on macOS with LLVM instrumentation. The inventory is bound by SHA-256
-`a251633a8f990fb260dcd283a3dbed2fae389047049129f55832680030cede64`.
+`5441645de16ac6a4950a5f44b28e38db1e47827aca177ca7d704a645f534d109`.
 The job fails if discovery changes, a required test is skipped, the executed
 identities differ from the inventory, or any macOS-compiled handwritten or
 generated-source threshold regresses.
@@ -172,12 +172,14 @@ node tools/ci/verify-ios-test-log.mjs --self-test
 
 ## Reviewed calibration
 
-The 620-test local calibration on Xcode 26.6 measured 15,814/16,230 handwritten
-lines (97.44%), 1,403/1,482 functions (94.67%), and 4,847/5,213 regions
-(92.98%) across 38 files. The four generated files measured 3,533/3,936 lines
+The 621-test local calibration on Xcode 26.6 measured 15,812/16,232 handwritten
+lines (97.41%), 1,404/1,483 functions (94.67%), and 4,846/5,214 regions
+(92.94%) across 38 files. The four generated files measured 3,533/3,936 lines
 (89.76%), 325/325 functions (100%), and 1,966/2,235 regions (87.96%). Combined
-macOS production coverage was 19,347/20,166 lines (95.94%), 1,728/1,807
-functions (95.63%), and 6,813/7,448 regions (91.47%).
+macOS production coverage was 19,345/20,168 lines (95.92%), 1,729/1,808
+functions (95.63%), and 6,812/7,449 regions (91.45%). The channel's
+post-registration cancellation fallback is exercised through a deterministic
+internal seam, so that safety branch no longer depends on scheduler timing.
 
 The separate iOS platform gate binds its exact test inventory and SHA-256 in
 `ios-transport-policy.json` and `../ci/ios-smoke-test-inventory.txt`. Its

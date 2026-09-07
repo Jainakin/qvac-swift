@@ -37,7 +37,7 @@ const expectedPatchMarker = 'qvac-bare-kit-2.3.0-ipc-hardening-1'
 const expectedPatchSHA256 = 'd8513ef4b411767719a6f10997408c6075a85bd7d171efd25d8076ea0e4683d2'
 const expectedPatchedTreeSHA256 = 'b4eb3c53ddfb09545bfdd0dbc126f259581bdfd1a36268bc1b2fa29ff7e46d5a'
 const expectedBuilderLockSHA256 = '1cde446d0351b7547f6dce7adf70e69470b253b12e155db8bce221400b7bd09c'
-const expectedNativeClosureSHA256 = 'a456eeaf612132a3b6af1433640fdcf64ab715ef95dc18e99f740270700065b8'
+const expectedNativeClosureSHA256 = '9d04d324f1a76ca35962ec3be8505a71828f216b46831546187ec75705b2f473'
 const expectedThreadSanitizerRuntime = '@rpath/libclang_rt.tsan_iossim_dynamic.dylib'
 const requiredThreadSanitizerSources = [
   'apple/BareKit/BareKit.m',
@@ -209,10 +209,12 @@ function validateLock(lock) {
 
   exactKeys(lock.nativeClosure, ['sources', 'prebuiltArchiveMirror'], 'native closure')
   const sourceDirectories = [
+    'github+c-ares+c-ares-src',
     'github+google+boringssl-src',
     'github+holepunchto+bare-src',
     'github+holepunchto+libbase64-src',
     'github+holepunchto+libhex-src',
+    'github+holepunchto+libintrusive-src',
     'github+holepunchto+libjs-src',
     'github+holepunchto+liblog-src',
     'github+holepunchto+libnapi-src',
@@ -1069,6 +1071,13 @@ function selfTest() {
       substitutedNativeSource.nativeClosure.sources['github+libuv+libuv-src']
     delete substitutedNativeSource.nativeClosure.sources['github+libuv+libuv-src']
     expectFailure(() => validateLock(substitutedNativeSource), /native closure sources keys differ/)
+    const missingTransitiveNativeSource = structuredClone(lock)
+    delete missingTransitiveNativeSource.nativeClosure.sources['github+c-ares+c-ares-src']
+    expectFailure(() => validateLock(missingTransitiveNativeSource), /native closure sources keys differ/)
+    const changedTransitiveNativeIdentity = structuredClone(lock)
+    changedTransitiveNativeIdentity.nativeClosure.sources['github+holepunchto+libintrusive-src'].commit =
+      '0'.repeat(40)
+    expectFailure(() => validateLock(changedTransitiveNativeIdentity), /native dependency closure differs/)
     const changedPrebuiltArchive = structuredClone(lock)
     changedPrebuiltArchive.nativeClosure.prebuiltArchiveMirror.targets['ios-arm64']['libv8.a'] = '0'.repeat(64)
     expectFailure(() => validateLock(changedPrebuiltArchive), /native dependency closure differs/)

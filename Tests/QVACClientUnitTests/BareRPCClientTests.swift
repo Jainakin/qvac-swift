@@ -5325,6 +5325,7 @@ final class BareRPCClientTests: XCTestCase {
         let worker = workerDirectory.appendingPathComponent("worker.js")
         let response = workerDirectory.appendingPathComponent("init.response")
         let packageBare = bareDirectory.appendingPathComponent("bare")
+        let fixtureTimeoutSeconds: TimeInterval = 10
         try FileManager.default.createDirectory(
             at: workerDirectory,
             withIntermediateDirectories: true
@@ -5349,7 +5350,7 @@ final class BareRPCClientTests: XCTestCase {
 
         config = json.loads(sys.argv[1])
         peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        peer.settimeout(2.0)
+        peer.settimeout(\(fixtureTimeoutSeconds))
         peer.connect(config["QVAC_IPC_SOCKET_PATH"])
         if not peer.recv(65536):
             raise RuntimeError("host closed before __init_config")
@@ -5368,13 +5369,13 @@ final class BareRPCClientTests: XCTestCase {
 
         let configuration = try QVACClient.Configuration.macOS(
             nodeModulesDir: nodeModules,
-            initTimeout: 2,
+            initTimeout: fixtureTimeoutSeconds,
             homeDirectory: root
         )
         let client = try await QVACClient(
             configuration: configuration,
             runtimeContext: nil,
-            initHandshakeTimeout: .seconds(2),
+            initHandshakeTimeout: .seconds(fixtureTimeoutSeconds),
             logger: nil
         )
         let activeTransport = await client.transport

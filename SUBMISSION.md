@@ -48,14 +48,14 @@ replace clean hosted validation of the delivered commit.
 
 | Gate | Result |
 |---|---|
-| Unit tests | 620 of 620 passed with no failures or skips |
-| macOS Thread Sanitizer | The same 620-test inventory passed |
-| macOS Address Sanitizer | The same 620-test inventory passed |
-| macOS Undefined Behavior Sanitizer | The same 620-test inventory passed |
+| Unit tests | 621 of 621 passed with no failures or skips |
+| macOS Thread Sanitizer | The same 621-test inventory passed |
+| macOS Address Sanitizer | The same 621-test inventory passed |
+| macOS Undefined Behavior Sanitizer | The same 621-test inventory passed |
 | Required integration tests | 19 of 19 passed with no failures or skips, including live-worker, real-model completion and profiling, RAG, and upscaling coverage |
-| Handwritten macOS production coverage | 15,814/16,230 lines (97.44%), 1,403/1,482 functions (94.67%), and 4,847/5,213 regions (92.98%) |
+| Handwritten macOS production coverage | 15,812/16,232 lines (97.41%), 1,404/1,483 functions (94.67%), and 4,846/5,214 regions (92.94%) |
 | Generated-source coverage | 3,533/3,936 lines (89.76%), 325/325 functions (100%), and 1,966/2,235 regions (87.96%) |
-| Combined macOS production coverage | 19,347/20,166 lines (95.94%), 1,728/1,807 functions (95.63%), and 6,813/7,448 regions (91.47%) |
+| Combined macOS production coverage | 19,345/20,168 lines (95.92%), 1,729/1,808 functions (95.63%), and 6,812/7,449 regions (91.45%) |
 | iOS platform coverage | 37 of 37 reviewed tests passed. `BareIPCTransport.swift` measured 782/806 lines (97.02%), 108/115 functions (93.91%), and 258/281 regions (91.81%); supplemental `QVACClient.swift` and handshake measurements bring the gated iOS sources to 1,323/2,567 lines (51.54%), 160/288 functions (55.56%), and 421/893 regions (47.14%). |
 | iOS Simulator Thread Sanitizer | The 37-test inventory passed locally with Swift-side instrumentation against the public r1 BareKit binary. The final hosted gate separately instruments every native unit built from the pinned patched BareKit source, while correctly excluding its three prebuilt archives from that claim. |
 | Physical iPhone validation | 1 of 1 selected arm64 tests passed on an iPhone 15 Pro running iOS 26.6.1. `QVACChatPhysicalDeviceTests/testLoadStreamAndUnloadOnPhysicalDevice()` launched the signed app and completed worker startup, model load, streaming inference, and model unload. |
@@ -63,7 +63,7 @@ replace clean hosted validation of the delivered commit.
 | Publication guard | Fails closed on any of the six license/privacy blockers and on the separate BareKit r2 activation gate |
 
 The unit inventory is bound to SHA-256
-`a251633a8f990fb260dcd283a3dbed2fae389047049129f55832680030cede64`.
+`5441645de16ac6a4950a5f44b28e38db1e47827aca177ca7d704a645f534d109`.
 The iOS platform inventory contains 37 exact XCTest identities and is bound to
 SHA-256
 `406d901b69476eafa308f691cfa2284abb0a1acbbeda90aa3d4f0eee00f55108`.

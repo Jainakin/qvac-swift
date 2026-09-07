@@ -26,6 +26,11 @@
   },
   "nativeClosure": {
     "sources": {
+      "github+c-ares+c-ares-src": {
+        "repository": "https://github.com/c-ares/c-ares.git",
+        "commit": "b82840329a4081a1f1b125e6e6b760d4e1237b52",
+        "tree": "6c5179b2024f4d051685a0b4216019c81a4dbcc7"
+      },
       "github+google+boringssl-src": {
         "repository": "https://github.com/google/boringssl.git",
         "commit": "617634bc015344093f5ea0b0a5b653c924cfa20d",
@@ -45,6 +50,11 @@
         "repository": "https://github.com/holepunchto/libhex.git",
         "commit": "a4a2c8437788bf1fb384257a016d252a954b5bed",
         "tree": "2c7eb488e8998953a93c2103a72441f5fbff498d"
+      },
+      "github+holepunchto+libintrusive-src": {
+        "repository": "https://github.com/holepunchto/libintrusive.git",
+        "commit": "3903632b7a6d1b7b8b627d0b4f80158322e1f7e5",
+        "tree": "a8d3d3dcc2ea14c2ff040e2ec3247fa734d1848a"
       },
       "github+holepunchto+libjs-src": {
         "repository": "https://github.com/holepunchto/libjs.git",

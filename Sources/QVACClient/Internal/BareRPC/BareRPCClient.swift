@@ -119,6 +119,7 @@ final class BoundedRPCDataChannel: @unchecked Sendable {
     }
 
     private let maximumBufferedBytes: Int
+    private let isCurrentTaskCancelled: @Sendable () -> Bool
     private let onCancel: @Sendable () -> Void
     private let lock = NSLock()
     /// Consumed slots are cleared immediately so their `Data` storage is not
@@ -133,8 +134,13 @@ final class BoundedRPCDataChannel: @unchecked Sendable {
     private var terminal: Terminal?
     private var cancellationReported = false
 
-    init(maximumBufferedBytes: Int, onCancel: @escaping @Sendable () -> Void) {
+    init(
+        maximumBufferedBytes: Int,
+        isCurrentTaskCancelled: @escaping @Sendable () -> Bool = { Task.isCancelled },
+        onCancel: @escaping @Sendable () -> Void
+    ) {
         self.maximumBufferedBytes = maximumBufferedBytes
+        self.isCurrentTaskCancelled = isCurrentTaskCancelled
         self.onCancel = onCancel
     }
 
@@ -239,7 +245,7 @@ final class BoundedRPCDataChannel: @unchecked Sendable {
                     waiter = continuation
                     registered = true
                 }
-                let cancelledAfterRegistration = registered && Task.isCancelled
+                let cancelledAfterRegistration = registered && isCurrentTaskCancelled()
                 lock.unlock()
 
                 if cancelledAfterRegistration {
