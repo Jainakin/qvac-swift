@@ -38,6 +38,86 @@ const expectedModuleMapSHA256 = '05864530e635c81092e55151c5fe3bf5348cea5912aecb1
 // ample headroom over the exact pinned 2.3.0 binary.
 const subprocessOutputLimitBytes = 64 * 1024 * 1024
 const subprocessErrorDetailLimit = 4 * 1024
+const approvedAppleCompilerDrivers = new Set([
+  '/usr/bin/c++',
+  '/usr/bin/cc',
+  '/usr/bin/clang',
+  '/usr/bin/clang++',
+])
+// This is the reviewed option grammar emitted by the locked bare-make, CMake,
+// and Xcode 16.4 toolchain. A closed grammar prevents a value-taking option from
+// consuming a later attestation flag while still allowing path-valued options
+// whose argument boundaries are validated explicitly below.
+const approvedStandaloneCompilerOptions = new Set([
+  '-O2',
+  '-Qunused-arguments',
+  '-Wa,--noexecstack',
+  '-fPIC',
+  '-fPIE',
+  '-fcolor-diagnostics',
+  '-fdiagnostics-color=always',
+  '-fno-aligned-new',
+  '-fno-common',
+  '-fno-delete-null-pointer-checks',
+  '-fno-exceptions',
+  '-fno-omit-frame-pointer',
+  '-fno-rtti',
+  '-fno-strict-aliasing',
+  '-fno-strict-overflow',
+  '-fsanitize=thread',
+  '-fstrict-flex-arrays=3',
+  '-ftrivial-auto-var-init=zero',
+  '-fvisibility=hidden',
+  '-g',
+  '-ggdb',
+  '-mios-simulator-version-min=14.0',
+  '-std=gnu++17',
+  '-std=gnu11',
+  '-std=gnu17',
+  '-std=gnu90',
+  '-std=gnu99',
+])
+const approvedSeparateValueCompilerOptions = new Set([
+  '-isystem',
+  '-isysroot',
+  '-o',
+  '-target',
+  '-x',
+])
+const supportedCompileLanguages = new Set([
+  'assembler',
+  'assembler-with-cpp',
+  'c',
+  'c++',
+  'objective-c',
+  'objective-c++',
+])
+const forbiddenCompilerActions = new Set([
+  '--analyze',
+  '--help',
+  '--help-hidden',
+  '--version',
+  '-###',
+  '-E',
+  '-M',
+  '-MM',
+  '-S',
+  '-analyze',
+  '-cc1',
+  '-cc1as',
+  '-emit-ast',
+  '-emit-llvm',
+  '-extract-api',
+  '-fdriver-only',
+  '-fsyntax-only',
+  '-help',
+  '-help-hidden',
+  '-module-file-info',
+  '-rewrite-legacy-objc',
+  '-rewrite-objc',
+  '-verify-pch',
+  '-version',
+])
 const expectedPatchMarker = 'qvac-bare-kit-2.3.0-ipc-hardening-1'
 const expectedPatchSHA256 = 'd8513ef4b411767719a6f10997408c6075a85bd7d171efd25d8076ea0e4683d2'
 const expectedPatchedTreeSHA256 = 'b4eb3c53ddfb09545bfdd0dbc126f259581bdfd1a36268bc1b2fa29ff7e46d5a'
@@ -669,10 +749,16 @@ function validateAggregateEvidence(document, lock) {
   return document
 }
 
+function nativeClosureEvidenceNames(targets) {
+  // Sort the complete filenames, not the target stems. A target that prefixes
+  // another target changes lexical order when `.json` adds `.` after the stem.
+  return targets.map(target => `${target}.json`).sort()
+}
+
 function aggregateNativeClosureEvidence(directoryPath, outputPath, lock) {
   const directory = requireDirectory(resolve(directoryPath), 'native closure slice evidence')
   const targets = Object.keys(lock.nativeClosure.prebuiltArchiveMirror.targets).sort()
-  const expectedNames = targets.map(target => `${target}.json`)
+  const expectedNames = nativeClosureEvidenceNames(targets)
   const actualNames = readdirSync(directory, { withFileTypes: true }).map(entry => entry.name).sort()
   if (JSON.stringify(actualNames) !== JSON.stringify(expectedNames)) {
     fail(`native closure evidence inventory differs: expected ${expectedNames.join(', ')}, got ${actualNames.join(', ')}`)
@@ -811,55 +897,357 @@ function verifyArtifact(artifactPath, lock) {
   return sliceEvidence
 }
 
-function commandText(entry) {
+function parsePOSIXCompileCommand(command) {
+  const arguments_ = []
+  let argument = ''
+  let argumentStarted = false
+  let state = 'unquoted'
+
+  const pushArgument = () => {
+    if (!argumentStarted) return
+    arguments_.push(argument)
+    argument = ''
+    argumentStarted = false
+  }
+
+  for (let index = 0; index < command.length; index++) {
+    const character = command[index]
+    if (character === '\n' || character === '\r' || character === '\0') {
+      fail('compile command contains a forbidden control character')
+    }
+
+    if (state === 'single-quoted') {
+      if (character === "'") {
+        state = 'unquoted'
+      } else {
+        argument += character
+      }
+      continue
+    }
+
+    if (state === 'double-quoted') {
+      if (character === '"') {
+        state = 'unquoted'
+        continue
+      }
+      if (character === '\\') {
+        if (index + 1 === command.length) fail('compile command ends with an incomplete escape')
+        const escaped = command[++index]
+        if (escaped === '\n' || escaped === '\r' || escaped === '\0') {
+          fail('compile command contains a forbidden escaped control character')
+        }
+        if ('$`"\\'.includes(escaped)) {
+          argument += escaped
+        } else {
+          // POSIX preserves a backslash before non-special characters inside
+          // double quotes.
+          argument += `\\${escaped}`
+        }
+        continue
+      }
+      if (character === '$' || character === '`') {
+        fail('compile command contains a forbidden shell expansion')
+      }
+      argument += character
+      continue
+    }
+
+    if (character === ' ' || character === '\t') {
+      pushArgument()
+      continue
+    }
+    if (character === "'") {
+      argumentStarted = true
+      state = 'single-quoted'
+      continue
+    }
+    if (character === '"') {
+      argumentStarted = true
+      state = 'double-quoted'
+      continue
+    }
+    if (character === '\\') {
+      if (index + 1 === command.length) fail('compile command ends with an incomplete escape')
+      const escaped = command[++index]
+      if (escaped === '\n' || escaped === '\r' || escaped === '\0') {
+        fail('compile command contains a forbidden escaped control character')
+      }
+      argumentStarted = true
+      argument += escaped
+      continue
+    }
+    if ('|&;<>()#$`*?[]{}!~'.includes(character)) {
+      fail(`compile command contains forbidden shell syntax: ${character}`)
+    }
+    argumentStarted = true
+    argument += character
+  }
+
+  if (state !== 'unquoted') fail('compile command contains an unterminated quote')
+  pushArgument()
+  if (arguments_.length === 0) fail('compile command has no arguments')
+  return arguments_
+}
+
+function compileArguments(entry) {
   if (typeof entry?.command === 'string' && entry.command.length > 0
       && entry.arguments === undefined) {
-    return entry.command.replaceAll('\\=', '=')
+    return parsePOSIXCompileCommand(entry.command)
   }
   if (Array.isArray(entry?.arguments) && entry.arguments.length > 0
-      && entry.arguments.every(argument => typeof argument === 'string')
+      && entry.arguments.every(argument_ =>
+        typeof argument_ === 'string' && !argument_.includes('\0'))
       && entry.command === undefined) {
-    return entry.arguments.join(' ')
+    return [...entry.arguments]
   }
   fail('compile command must contain exactly one non-empty command or arguments representation')
 }
 
-function containsCommandToken(command, token) {
-  return command.split(/\s+/).includes(token)
+function compilerDriver(arguments_) {
+  const driver = arguments_[0]
+  if (!approvedAppleCompilerDrivers.has(driver)) {
+    fail(`native compile evidence uses an unapproved compiler driver: ${String(driver)}`)
+  }
+  return driver
+}
+
+function sanitizerList(arguments_, option) {
+  return arguments_
+    .filter(argument_ => argument_.startsWith(`${option}=`))
+    .flatMap(argument_ => argument_.slice(option.length + 1).split(','))
+}
+
+function isApprovedJoinedCompilerOption(argument_) {
+  return (argument_.startsWith('-D') && argument_.length > 2)
+    || (argument_.startsWith('-F') && argument_.length > 2)
+    || (argument_.startsWith('-I') && argument_.length > 2)
+    || (!['-Wa', '-Wl', '-Wp'].includes(argument_)
+      && /^-W[A-Za-z0-9][A-Za-z0-9+._=-]*$/.test(argument_))
+}
+
+function bindCompiledSource(arguments_, directory, source, relativeSource) {
+  if (arguments_.some(argument_ => argument_.startsWith('@'))) {
+    fail(`native compilation uses a response file for ${relativeSource}`)
+  }
+  if (arguments_.some(argument_ =>
+    argument_ === '--config'
+      || argument_.startsWith('--config=')
+      || argument_ === '--config-system-dir'
+      || argument_.startsWith('--config-system-dir=')
+      || argument_ === '--config-user-dir'
+      || argument_.startsWith('--config-user-dir='))) {
+    fail(`native compilation uses an external compiler configuration for ${relativeSource}`)
+  }
+
+  const compilationSwitches = arguments_
+    .map((argument_, index) => argument_ === '-c' ? index : -1)
+    .filter(index => index !== -1)
+  if (compilationSwitches.length !== 1
+      || compilationSwitches[0] !== arguments_.length - 2) {
+    fail(`native compile evidence does not have one final source operand: ${relativeSource}`)
+  }
+
+  const operand = arguments_.at(-1)
+  if (operand.length === 0 || operand.startsWith('-') || operand.startsWith('@')) {
+    fail(`native compilation has an invalid source operand for ${relativeSource}`)
+  }
+  const operandPath = resolve(directory, operand)
+  requireRegularFile(operandPath, `compiled source operand for ${relativeSource}`)
+  if (realpathSync(operandPath) !== source) {
+    fail(`native compilation source operand differs from compile_commands file: ${relativeSource}`)
+  }
+  return compilationSwitches[0]
+}
+
+function sourceLanguageForPath(relativeSource) {
+  if (relativeSource.endsWith('.C')) return 'c++'
+  if (relativeSource.endsWith('.M')) return 'objective-c++'
+  if (relativeSource.endsWith('.S')) return 'assembler-with-cpp'
+  const extension = relativeSource.split('.').at(-1).toLowerCase()
+  return {
+    asm: 'assembler',
+    c: 'c',
+    cc: 'c++',
+    cpp: 'c++',
+    cxx: 'c++',
+    i: 'c',
+    ii: 'c++',
+    m: 'objective-c',
+    mi: 'objective-c',
+    mm: 'objective-c++',
+    mii: 'objective-c++',
+    s: 'assembler',
+  }[extension]
+}
+
+function effectiveCompileLanguage(arguments_, compilationIndex, relativeSource) {
+  const sourceLanguage = sourceLanguageForPath(relativeSource)
+  const overrides = []
+  for (let index = 1; index < compilationIndex; index++) {
+    const argument_ = arguments_[index]
+    if (argument_ === '-x') {
+      overrides.push(arguments_[index + 1])
+      index++
+    } else if (argument_.startsWith('-x')) {
+      fail(`native compilation uses an unsupported combined language override for ${relativeSource}`)
+    }
+  }
+  if (overrides.length > 1) {
+    fail(`native compilation uses multiple language overrides for ${relativeSource}`)
+  }
+  const override = overrides[0]
+  if (override !== undefined && !supportedCompileLanguages.has(override)) {
+    fail(`native compilation uses an unsupported language override for ${relativeSource}: ${override}`)
+  }
+  if (sourceLanguage !== undefined && override !== undefined && sourceLanguage !== override) {
+    fail(`native compilation language override differs from its source extension for ${relativeSource}`)
+  }
+  const effectiveLanguage = override ?? sourceLanguage
+  if (effectiveLanguage === undefined) {
+    fail(`native compilation source language is unknown for ${relativeSource}`)
+  }
+  return effectiveLanguage
+}
+
+function validateCompilerControlArguments(arguments_, relativeSource) {
+  if (arguments_.some(argument_ =>
+    forbiddenCompilerActions.has(argument_)
+      || argument_.startsWith('--autocomplete=')
+      || argument_.startsWith('--print-')
+      || argument_.startsWith('-ccc-print-')
+      || argument_.startsWith('-dump')
+      || argument_.startsWith('-print-'))) {
+    fail(`native compilation uses a non-compiling driver action for ${relativeSource}`)
+  }
+  if (arguments_.some(argument_ =>
+    argument_ === '-ObjC'
+      || argument_ === '-ObjC++'
+      || argument_ === '--driver-mode'
+      || argument_.startsWith('--driver-mode='))) {
+    fail(`native compilation uses an unsupported driver language mode for ${relativeSource}`)
+  }
+  if (arguments_.some(argument_ =>
+    argument_ === '-Xclang'
+      || argument_.startsWith('-Xclang=')
+      || argument_.startsWith('-Xarch_')
+      || argument_ === '-mllvm'
+      || argument_.startsWith('-mllvm='))) {
+    fail(`native compilation uses opaque compiler pass-through options for ${relativeSource}`)
+  }
+}
+
+function validateReviewedCompilerArguments(arguments_, compilationIndex, relativeSource) {
+  const targets = []
+  for (let index = 1; index < compilationIndex; index++) {
+    const argument_ = arguments_[index]
+    if (approvedSeparateValueCompilerOptions.has(argument_)) {
+      const value = arguments_[++index]
+      if (value === undefined || value.length === 0 || value.startsWith('-') || value.startsWith('@')) {
+        fail(`native compilation has an invalid ${argument_} value for ${relativeSource}`)
+      }
+      if (argument_ === '-target') targets.push(value)
+      continue
+    }
+    if (argument_.startsWith('--target=')) {
+      targets.push(argument_.slice('--target='.length))
+      continue
+    }
+    if (!approvedStandaloneCompilerOptions.has(argument_)
+        && !isApprovedJoinedCompilerOption(argument_)) {
+      fail(`native compilation uses an unreviewed compiler option or positional input for ${relativeSource}: ${argument_}`)
+    }
+  }
+  if (targets.length !== 1
+      || !/^arm64-apple-ios\d+(?:\.\d+)*-simulator$/.test(targets[0])) {
+    fail(`native compilation is not for the arm64 iOS Simulator: ${relativeSource}`)
+  }
+}
+
+function validateThreadSanitizerArguments(arguments_, relativeSource) {
+  if (arguments_.some(argument_ =>
+    /^-fsanitize-(?:(?:system-)?ignorelist|blacklist)(?:=|$)/.test(argument_))) {
+    fail(`native compilation uses a sanitizer exclusion list for ${relativeSource}`)
+  }
+  if (arguments_.some(argument_ =>
+    argument_.startsWith('-fno-sanitize-thread-'))) {
+    fail(`native compilation partially disabled Thread Sanitizer for ${relativeSource}`)
+  }
+  const disabledSanitizers = sanitizerList(arguments_, '-fno-sanitize')
+  if (disabledSanitizers.includes('thread') || disabledSanitizers.includes('all')) {
+    fail(`native compilation explicitly disabled Thread Sanitizer for ${relativeSource}`)
+  }
+  const enabledSanitizers = sanitizerList(arguments_, '-fsanitize')
+  if (JSON.stringify(enabledSanitizers) !== JSON.stringify(['thread'])) {
+    fail(`native compilation is not exactly once Thread Sanitizer-instrumented: ${relativeSource}`)
+  }
+}
+
+function attestAppleCompilerDrivers(
+  drivers,
+  developerDirectory,
+  versionProvider = driver => run(driver, ['--version']),
+  environment = process.env,
+) {
+  for (const variable of ['CCC_OVERRIDE_OPTIONS', 'CLANG_CONFIG_PATH']) {
+    if ((environment[variable] ?? '').length > 0) {
+      fail(`compiler environment override ${variable} must be unset`)
+    }
+  }
+  const expectedInstalledDirectory =
+    `${developerDirectory}/Toolchains/XcodeDefault.xctoolchain/usr/bin`
+  for (const driver of [...new Set(drivers)].sort()) {
+    if (!approvedAppleCompilerDrivers.has(driver)) {
+      fail(`cannot attest unapproved compiler driver: ${String(driver)}`)
+    }
+    const version = versionProvider(driver)
+    if (typeof version !== 'string') {
+      fail(`compiler driver ${driver} returned a non-text version response`)
+    }
+    const lines = version.trimEnd().split(/\r?\n/)
+    if (!lines[0]?.startsWith('Apple clang version ')) {
+      fail(`compiler driver ${driver} is not Apple clang`)
+    }
+    if (!lines.includes(`InstalledDir: ${expectedInstalledDirectory}`)) {
+      fail(`compiler driver ${driver} is not from the pinned Xcode developer directory`)
+    }
+  }
 }
 
 function validateThreadSanitizerCompileCommands(document, sourceRoot) {
   if (!Array.isArray(document) || document.length === 0) {
     fail('Thread Sanitizer compile_commands.json must be a non-empty array')
   }
-  const root = resolve(sourceRoot)
+  const root = requireDirectory(resolve(sourceRoot), 'Thread Sanitizer source root')
   const compiledSources = []
+  const compilerDrivers = new Set()
   for (const [index, entry] of document.entries()) {
     if (typeof entry?.directory !== 'string' || entry.directory.length === 0
         || typeof entry?.file !== 'string' || entry.file.length === 0) {
       fail(`compile command ${index} has no directory or source file`)
     }
-    const source = resolve(entry.directory, entry.file)
+    const directory = requireDirectory(resolve(entry.directory), `compile command ${index} directory`)
+    const directoryRelative = relative(root, directory)
+    if (directoryRelative === '..' || directoryRelative.startsWith(`..${sep}`)) {
+      fail(`compile command ${index} directory escaped the pinned checkout: ${entry.directory}`)
+    }
+    const sourcePath = resolve(directory, entry.file)
+    requireRegularFile(sourcePath, `compile command ${index} source`)
+    const source = realpathSync(sourcePath)
     const relativeSource = relative(root, source).split(sep).join('/')
     if (relativeSource === '' || relativeSource === '..' || relativeSource.startsWith('../')) {
       fail(`compile command ${index} source escaped the pinned checkout: ${entry.file}`)
     }
-    if (!/\.(?:c|cc|cpp|cxx|m|mm)$/i.test(relativeSource)) continue
-
-    const command = commandText(entry)
-    if (!/(?:^|\s)(?:\S*\/)?clang(?:\+\+)?(?:\s|$)/.test(command)
-        || !containsCommandToken(command, '-c')) {
-      fail(`native compile evidence is not an actual Clang compilation: ${relativeSource}`)
+    const arguments_ = compileArguments(entry)
+    const driver = compilerDriver(arguments_)
+    const compilationIndex = bindCompiledSource(arguments_, directory, source, relativeSource)
+    validateCompilerControlArguments(arguments_, relativeSource)
+    const language = effectiveCompileLanguage(arguments_, compilationIndex, relativeSource)
+    if (language !== 'assembler' && language !== 'assembler-with-cpp') {
+      validateThreadSanitizerArguments(arguments_, relativeSource)
     }
-    if (containsCommandToken(command, '-fno-sanitize=thread')) {
-      fail(`native compilation explicitly disabled Thread Sanitizer for ${relativeSource}`)
-    }
-    if (!containsCommandToken(command, '-fsanitize=thread')) {
-      fail(`native compilation is not Thread Sanitizer-instrumented: ${relativeSource}`)
-    }
-    if (!/(?:^|[\s=])arm64-apple-ios\d+(?:\.\d+)*-simulator(?:\s|$)/.test(command)) {
-      fail(`native compilation is not for the arm64 iOS Simulator: ${relativeSource}`)
-    }
+    validateReviewedCompilerArguments(arguments_, compilationIndex, relativeSource)
+    compilerDrivers.add(driver)
+    if (language === 'assembler' || language === 'assembler-with-cpp') continue
     compiledSources.push(relativeSource)
   }
 
@@ -873,6 +1261,7 @@ function validateThreadSanitizerCompileCommands(document, sourceRoot) {
     Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8')))
   return {
     count: compiledSources.length,
+    compilerDrivers: [...compilerDrivers].sort(),
     inventorySHA256: sha256Bytes(Buffer.from(`${sortedSources.join('\n')}\n`)),
     requiredSources: Object.fromEntries(requiredThreadSanitizerSources.map(source => [source, true])),
   }
@@ -977,6 +1366,10 @@ function verifyThreadSanitizerArtifact(
   const compileCommandsFile = resolve(compileCommandsPath)
   const compileCommands = readJSON(compileCommandsFile, 'Thread Sanitizer compile commands')
   const compilationEvidence = validateThreadSanitizerCompileCommands(compileCommands, sourceRoot)
+  attestAppleCompilerDrivers(
+    compilationEvidence.compilerDrivers,
+    lock.buildToolchain.developerDirectory,
+  )
   const evidence = {
     schemaVersion: 1,
     component: 'BareKit native Thread Sanitizer simulator candidate',
@@ -1167,6 +1560,18 @@ function selfTest() {
     expectFailure(() => validateLock(changedPrebuiltArchive), /native dependency closure differs/)
     const aggregateEvidence = expectedAggregateEvidence(lock)
     assert.doesNotThrow(() => validateAggregateEvidence(aggregateEvidence, lock))
+    assert.deepEqual(
+      nativeClosureEvidenceNames([
+        'ios-arm64',
+        'ios-arm64-simulator',
+        'ios-x64-simulator',
+      ]),
+      [
+        'ios-arm64-simulator.json',
+        'ios-arm64.json',
+        'ios-x64-simulator.json',
+      ],
+    )
     const alteredAggregateEvidence = structuredClone(aggregateEvidence)
     alteredAggregateEvidence.targets['ios-arm64'].files['libv8.a'] = '0'.repeat(64)
     expectFailure(
@@ -1256,33 +1661,112 @@ function selfTest() {
 
     const sourceRoot = join(fixture, 'source')
     const buildRoot = join(sourceRoot, 'build')
+    const cSource = join(sourceRoot, 'shared/posix/ipc.c')
+    const objectiveCSource = join(sourceRoot, 'apple/BareKit/BareKit.m')
+    const cxxSource = join(sourceRoot, 'vendor/boringssl/crypto/fipsmodule/bcm.cc')
+    const relabeledAssemblySource = join(sourceRoot, 'shared/posix/relabeled.S')
+    const relabeledLowercaseAssemblySource = join(sourceRoot, 'shared/posix/relabeled.s')
+    mkdirSync(buildRoot, { recursive: true })
+    for (const source of [
+      cSource,
+      objectiveCSource,
+      cxxSource,
+      relabeledAssemblySource,
+      relabeledLowercaseAssemblySource,
+    ]) {
+      mkdirSync(dirname(source), { recursive: true })
+      writeFileSync(source, '/* compile evidence fixture */\n')
+    }
     const compileCommands = [
       {
         directory: buildRoot,
-        file: join(sourceRoot, 'shared/posix/ipc.c'),
-        command: `clang -target arm64-apple-ios14.0-simulator -fno-omit-frame-pointer -fsanitize=thread -c ${join(sourceRoot, 'shared/posix/ipc.c')}`,
+        file: cSource,
+        command: `/usr/bin/clang -target arm64-apple-ios14.0-simulator -fno-omit-frame-pointer -fsanitize=thread -c ${cSource}`,
       },
       {
         directory: buildRoot,
-        file: join(sourceRoot, 'apple/BareKit/BareKit.m'),
+        file: objectiveCSource,
         arguments: [
-          'clang',
+          '/usr/bin/clang',
           '-target',
           'arm64-apple-ios14.0-simulator',
+          '-x',
+          'objective-c',
           '-fno-omit-frame-pointer',
           '-fsanitize=thread',
           '-c',
-          join(sourceRoot, 'apple/BareKit/BareKit.m'),
+          objectiveCSource,
         ],
       },
+      {
+        directory: buildRoot,
+        file: cxxSource,
+        command: `/usr/bin/c++ --target=arm64-apple-ios14.0-simulator -fno-omit-frame-pointer -fsanitize=thread -c ${cxxSource}`,
+      },
+      {
+        directory: buildRoot,
+        file: relabeledAssemblySource,
+        command: `/usr/bin/clang -target arm64-apple-ios14.0-simulator -DBORINGSSL_IMPLEMENTATION -I${sourceRoot} -O2 -Wa,--noexecstack -fPIC -g -isysroot /Applications/Xcode_16.4.app/SDK -mios-simulator-version-min=14.0 -o relabeled.S.o -c ${relabeledAssemblySource}`,
+      },
     ]
-    assert.doesNotThrow(() => validateThreadSanitizerCompileCommands(compileCommands, sourceRoot))
+    const compileEvidence = validateThreadSanitizerCompileCommands(compileCommands, sourceRoot)
+    assert.deepEqual(compileEvidence.compilerDrivers, ['/usr/bin/c++', '/usr/bin/clang'])
+    const pinnedDeveloperDirectory = lock.buildToolchain.developerDirectory
+    const reviewedAppleClangVersion = [
+      'Apple clang version 16.0.0 (clang-1600.0.26.6)',
+      'Target: arm64-apple-darwin23.0.0',
+      'Thread model: posix',
+      `InstalledDir: ${pinnedDeveloperDirectory}/Toolchains/XcodeDefault.xctoolchain/usr/bin`,
+      '',
+    ].join('\n')
+    assert.doesNotThrow(() => attestAppleCompilerDrivers(
+      compileEvidence.compilerDrivers,
+      pinnedDeveloperDirectory,
+      () => reviewedAppleClangVersion,
+    ))
+    expectFailure(
+      () => attestAppleCompilerDrivers(
+        compileEvidence.compilerDrivers,
+        pinnedDeveloperDirectory,
+        () => reviewedAppleClangVersion.replace('Apple clang version', 'upstream clang version'),
+      ),
+      /is not Apple clang/,
+    )
+    expectFailure(
+      () => attestAppleCompilerDrivers(
+        compileEvidence.compilerDrivers,
+        pinnedDeveloperDirectory,
+        () => reviewedAppleClangVersion.replace(
+          pinnedDeveloperDirectory,
+          '/Applications/Unpinned.app/Contents/Developer',
+        ),
+      ),
+      /is not from the pinned Xcode developer directory/,
+    )
+    expectFailure(
+      () => attestAppleCompilerDrivers(
+        compileEvidence.compilerDrivers,
+        pinnedDeveloperDirectory,
+        () => reviewedAppleClangVersion,
+        { CCC_OVERRIDE_OPTIONS: '#-fno-sanitize=thread' },
+      ),
+      /compiler environment override CCC_OVERRIDE_OPTIONS must be unset/,
+    )
+    expectFailure(
+      () => attestAppleCompilerDrivers(
+        compileEvidence.compilerDrivers,
+        pinnedDeveloperDirectory,
+        () => reviewedAppleClangVersion,
+        { CLANG_CONFIG_PATH: '/tmp/unreviewed.cfg' },
+      ),
+      /compiler environment override CLANG_CONFIG_PATH must be unset/,
+    )
     const unsanitizedObjectiveC = structuredClone(compileCommands)
     unsanitizedObjectiveC[1].arguments = unsanitizedObjectiveC[1].arguments
       .filter(argument => argument !== '-fsanitize=thread')
     expectFailure(
       () => validateThreadSanitizerCompileCommands(unsanitizedObjectiveC, sourceRoot),
-      /not Thread Sanitizer-instrumented: apple\/BareKit\/BareKit\.m/,
+      /not exactly once Thread Sanitizer-instrumented: apple\/BareKit\/BareKit\.m/,
     )
     const deviceTarget = structuredClone(compileCommands)
     deviceTarget[0].command = deviceTarget[0].command.replace('-simulator', '')
@@ -1291,7 +1775,8 @@ function selfTest() {
       /not for the arm64 iOS Simulator/,
     )
     const disabledSanitizer = structuredClone(compileCommands)
-    disabledSanitizer[0].command += ' -fno-sanitize=thread'
+    disabledSanitizer[0].command = disabledSanitizer[0].command
+      .replace(' -c ', ' -fno-sanitize=thread -c ')
     expectFailure(
       () => validateThreadSanitizerCompileCommands(disabledSanitizer, sourceRoot),
       /explicitly disabled Thread Sanitizer/,
@@ -1302,11 +1787,209 @@ function selfTest() {
       /missing shared\/posix\/ipc\.c/,
     )
     const nonCompilerEvidence = structuredClone(compileCommands)
-    nonCompilerEvidence[0].command = nonCompilerEvidence[0].command.replace('clang ', 'echo ')
+    nonCompilerEvidence[0].command = nonCompilerEvidence[0].command
+      .replace('/usr/bin/clang ', '/usr/bin/echo ')
     expectFailure(
       () => validateThreadSanitizerCompileCommands(nonCompilerEvidence, sourceRoot),
-      /not an actual Clang compilation/,
+      /uses an unapproved compiler driver: \/usr\/bin\/echo/,
     )
+    const compilerImpostor = structuredClone(compileCommands)
+    compilerImpostor[2].command = compilerImpostor[2].command.replace('/usr/bin/c++ ', '/tmp/c++ ')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(compilerImpostor, sourceRoot),
+      /uses an unapproved compiler driver: \/tmp\/c\+\+/,
+    )
+    const shellCommentInjection = structuredClone(compileCommands)
+    shellCommentInjection[0].command += ' # -fsanitize=thread'
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(shellCommentInjection, sourceRoot),
+      /contains forbidden shell syntax: #/,
+    )
+    const shellOperatorInjection = structuredClone(compileCommands)
+    shellOperatorInjection[0].command += ' ; /usr/bin/true'
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(shellOperatorInjection, sourceRoot),
+      /contains forbidden shell syntax: ;/,
+    )
+    const compoundArgument = structuredClone(compileCommands)
+    const sanitizerIndex = compoundArgument[1].arguments.indexOf('-fsanitize=thread')
+    compoundArgument[1].arguments[sanitizerIndex] = '-fsanitize=thread -c'
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(compoundArgument, sourceRoot),
+      /not exactly once Thread Sanitizer-instrumented/,
+    )
+    const mismatchedSourceOperand = structuredClone(compileCommands)
+    mismatchedSourceOperand[1].arguments[mismatchedSourceOperand[1].arguments.length - 1] = cSource
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(mismatchedSourceOperand, sourceRoot),
+      /source operand differs from compile_commands file/,
+    )
+    const responseFile = structuredClone(compileCommands)
+    responseFile[1].arguments.splice(-2, 0, '@unreviewed.rsp')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(responseFile, sourceRoot),
+      /uses a response file/,
+    )
+    const disabledAllSanitizers = structuredClone(compileCommands)
+    disabledAllSanitizers[0].command = disabledAllSanitizers[0].command
+      .replace(' -c ', ' -fno-sanitize=all -c ')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(disabledAllSanitizers, sourceRoot),
+      /explicitly disabled Thread Sanitizer/,
+    )
+    for (const option of [
+      '-fno-sanitize-thread-atomics',
+      '-fno-sanitize-thread-func-entry-exit',
+      '-fno-sanitize-thread-memory-access',
+    ]) {
+      const partiallyDisabledSanitizer = structuredClone(compileCommands)
+      partiallyDisabledSanitizer[0].command = partiallyDisabledSanitizer[0].command
+        .replace(' -c ', ` ${option} -c `)
+      expectFailure(
+        () => validateThreadSanitizerCompileCommands(partiallyDisabledSanitizer, sourceRoot),
+        /partially disabled Thread Sanitizer/,
+      )
+    }
+    const sanitizerIgnoreList = structuredClone(compileCommands)
+    sanitizerIgnoreList[0].command = sanitizerIgnoreList[0].command
+      .replace(' -c ', ' -fsanitize-system-ignorelist=/tmp/unreviewed.txt -c ')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(sanitizerIgnoreList, sourceRoot),
+      /uses a sanitizer exclusion list/,
+    )
+    const opaqueCompilerOptions = structuredClone(compileCommands)
+    opaqueCompilerOptions[0].command = opaqueCompilerOptions[0].command
+      .replace(' -c ', ' -Xclang -unreviewed-option -c ')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(opaqueCompilerOptions, sourceRoot),
+      /uses opaque compiler pass-through options/,
+    )
+    const opaqueLLVMOptions = structuredClone(compileCommands)
+    opaqueLLVMOptions[0].command = opaqueLLVMOptions[0].command
+      .replace(' -c ', ' -mllvm -unreviewed-option -c ')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(opaqueLLVMOptions, sourceRoot),
+      /uses opaque compiler pass-through options/,
+    )
+    const externalCompilerConfig = structuredClone(compileCommands)
+    externalCompilerConfig[0].command = externalCompilerConfig[0].command
+      .replace(' -c ', ' --config=/tmp/unreviewed.cfg -c ')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(externalCompilerConfig, sourceRoot),
+      /uses an external compiler configuration/,
+    )
+    const extraPositionalInput = structuredClone(compileCommands)
+    extraPositionalInput[0].command = extraPositionalInput[0].command
+      .replace(' -c ', ` ${objectiveCSource} -c `)
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(extraPositionalInput, sourceRoot),
+      /uses an unreviewed compiler option or positional input/,
+    )
+    const relabeledSource = structuredClone(compileCommands)
+    relabeledSource[0].file = relabeledAssemblySource
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(relabeledSource, sourceRoot),
+      /source operand differs from compile_commands file: shared\/posix\/relabeled\.S/,
+    )
+    const assemblyDisguisedAsC = structuredClone(compileCommands)
+    assemblyDisguisedAsC[0].file = relabeledAssemblySource
+    assemblyDisguisedAsC[0].command = assemblyDisguisedAsC[0].command
+      .replace(cSource, relabeledAssemblySource)
+      .replace(' -c ', ' -x c -c ')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(assemblyDisguisedAsC, sourceRoot),
+      /language override differs from its source extension/,
+    )
+    const cDisguisedAsAssembly = structuredClone(compileCommands)
+    cDisguisedAsAssembly[0].command = cDisguisedAsAssembly[0].command
+      .replace(' -c ', ' -x assembler -c ')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(cDisguisedAsAssembly, sourceRoot),
+      /language override differs from its source extension/,
+    )
+    for (const [source, option] of [
+      [relabeledAssemblySource, '-ObjC'],
+      [relabeledLowercaseAssemblySource, '-ObjC++'],
+    ]) {
+      const objectiveCModeDisguise = structuredClone(compileCommands)
+      objectiveCModeDisguise[0].file = source
+      objectiveCModeDisguise[0].command = objectiveCModeDisguise[0].command
+        .replace(cSource, source)
+        .replace(' -c ', ` ${option} -c `)
+      expectFailure(
+        () => validateThreadSanitizerCompileCommands(objectiveCModeDisguise, sourceRoot),
+        /uses an unsupported driver language mode/,
+      )
+    }
+    const clangCLDisguise = structuredClone(compileCommands)
+    clangCLDisguise[0].file = relabeledAssemblySource
+    clangCLDisguise[0].command = clangCLDisguise[0].command
+      .replace(cSource, relabeledAssemblySource)
+      .replace(' -c ', ' --driver-mode=cl /TC -c ')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(clangCLDisguise, sourceRoot),
+      /uses an unsupported driver language mode/,
+    )
+    const conditionalCompilerOption = structuredClone(compileCommands)
+    conditionalCompilerOption[0].command = conditionalCompilerOption[0].command
+      .replace(' -fsanitize=thread ', ' -Xarch_x86_64 -fsanitize=thread ')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(conditionalCompilerOption, sourceRoot),
+      /uses opaque compiler pass-through options/,
+    )
+    const additionalSanitizer = structuredClone(compileCommands)
+    additionalSanitizer[0].command = additionalSanitizer[0].command
+      .replace(' -fsanitize=thread ', ' -fsanitize=thread -fsanitize=undefined ')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(additionalSanitizer, sourceRoot),
+      /not exactly once Thread Sanitizer-instrumented/,
+    )
+    const preprocessorOnlyAction = structuredClone(compileCommands)
+    preprocessorOnlyAction[0].command = preprocessorOnlyAction[0].command
+      .replace(' -c ', ' -E -c ')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(preprocessorOnlyAction, sourceRoot),
+      /uses a non-compiling driver action/,
+    )
+    const printOnlyAction = structuredClone(compileCommands)
+    printOnlyAction[1].arguments.splice(-2, 0, '-###')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(printOnlyAction, sourceRoot),
+      /uses a non-compiling driver action/,
+    )
+    const optionConsumedSanitizer = structuredClone(compileCommands)
+    const consumedSanitizerIndex = optionConsumedSanitizer[1].arguments
+      .indexOf('-fsanitize=thread')
+    optionConsumedSanitizer[1].arguments.splice(consumedSanitizerIndex, 0, '-D')
+    expectFailure(
+      () => validateThreadSanitizerCompileCommands(optionConsumedSanitizer, sourceRoot),
+      /uses an unreviewed compiler option or positional input.*: -D/,
+    )
+    assert.deepEqual(
+      parsePOSIXCompileCommand('/usr/bin/clang -DNAME=\\"reviewed\\" "quoted path/source.c"'),
+      ['/usr/bin/clang', '-DNAME="reviewed"', 'quoted path/source.c'],
+    )
+    const escapedNull = `\\${String.fromCharCode(0)}`
+    for (const command of [
+      `/usr/bin/clang -DVALUE=${escapedNull}`,
+      `/usr/bin/clang "-DVALUE=${escapedNull}"`,
+    ]) {
+      expectFailure(
+        () => parsePOSIXCompileCommand(command),
+        /contains a forbidden escaped control character/,
+      )
+    }
+    for (const command of [
+      '/usr/bin/clang $(/usr/bin/true)',
+      '/usr/bin/clang `/usr/bin/true`',
+      '/usr/bin/clang && /usr/bin/true',
+      '/usr/bin/clang || /usr/bin/true',
+    ]) {
+      expectFailure(
+        () => parsePOSIXCompileCommand(command),
+        /contains forbidden shell (?:expansion|syntax)/,
+      )
+    }
 
     const binaryEvidence = {
       architectures: 'arm64\n',
@@ -1336,7 +2019,7 @@ function selfTest() {
   } finally {
     rmSync(fixture, { recursive: true, force: true })
   }
-  console.log('[bare-kit] verifier self-test passed (tamper, schema, closure, hash, portable hunk headings, activation, artifact shape, sanitizer isolation, native TSan compile invocations, symbols, and load-command rejection)')
+  console.log('[bare-kit] verifier self-test passed (tamper, schema, closure, hash, portable hunk headings, activation, artifact shape, sanitizer isolation, strict native TSan argv/source attestation, symbols, and load-command rejection)')
 }
 
 function option(name) {
