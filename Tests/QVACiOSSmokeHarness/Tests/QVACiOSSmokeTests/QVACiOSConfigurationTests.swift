@@ -3,6 +3,10 @@ import XCTest
 @testable import QVACClient
 
 final class QVACiOSConfigurationTests: XCTestCase {
+    /// This bounds the scripted RPC itself without coupling correctness to the
+    /// much tighter scheduling assumptions that caused the former polling race.
+    private static let scriptedHandshakeTimeout = Duration.seconds(10)
+
     func testIOSRuntimeContextCurrentMatchesMobileContract() {
         XCTAssertEqual(
             QVACRuntimeContext.current,
@@ -210,20 +214,32 @@ final class QVACiOSConfigurationTests: XCTestCase {
             }
         }
 
-        let transport = HandshakeTransport()
+        let successReply = BareRPCResponsePayload.success(
+            Data(#"{"success":true}"#.utf8)
+        )
+        let transport = HandshakeTransport(scriptedReplies: [successReply, successReply])
         let runtime = QVACRuntimeContext.current
         let config: JSONValue = .object(["mode": .string("ios-test")])
-        let initialization = Task {
-            try await QVACClient(
+        let client: QVACClient
+        do {
+            client = try await QVACClient(
                 configuration: .testing(transport, shutdownBeforeClose: true),
                 runtimeContext: runtime,
                 config: config,
-                initHandshakeTimeout: .seconds(2),
+                initHandshakeTimeout: Self.scriptedHandshakeTimeout,
                 logger: nil
             )
+        } catch {
+            await transport.close()
+            throw error
         }
+        await client.close()
+        await client.close()
 
-        let initRequest = try await Self.waitForRequest(index: 0, on: transport)
+        let requests = try Self.requests(in: await transport.outbound())
+        XCTAssertEqual(requests.count, 2)
+        let initRequest = try XCTUnwrap(requests.first)
+        XCTAssertEqual(initRequest.command, 1)
         let initObject = try Self.object(from: initRequest.payload)
         XCTAssertEqual(initObject["type"] as? String, "__init_config")
         XCTAssertEqual((initObject["config"] as? [String: String])?["mode"], "ios-test")
@@ -231,140 +247,175 @@ final class QVACiOSConfigurationTests: XCTestCase {
         XCTAssertEqual(encodedRuntime["runtime"] as? String, "react-native")
         XCTAssertEqual(encodedRuntime["platform"] as? String, "ios")
         XCTAssertEqual(encodedRuntime["deviceBrand"] as? String, "Apple")
-        await transport.reply(id: initRequest.id, success: true)
-
-        let client = try await initialization.value
-        let closing = Task { await client.close() }
-        let shutdownRequest = try await Self.waitForRequest(index: 1, on: transport)
+        let shutdownRequest = try XCTUnwrap(requests.last)
+        XCTAssertEqual(shutdownRequest.command, 1)
         XCTAssertEqual(
             try Self.object(from: shutdownRequest.payload)["type"] as? String,
             "__shutdown__"
         )
-        await transport.reply(id: shutdownRequest.id, success: true)
-        await closing.value
-        await client.close()
 
         let closeCount = await transport.closeCount()
         let writeAfterCloseCount = await transport.writeAfterCloseCount()
+        let unusedReplyCount = await transport.unusedScriptedReplyCount()
         XCTAssertEqual(closeCount, 1)
         XCTAssertEqual(writeAfterCloseCount, 0)
+        XCTAssertEqual(unusedReplyCount, 0)
     }
 
     func testRejectedInitHandshakeIsNormalizedAndClosesTransport() async throws {
-        let transport = HandshakeTransport()
-        let initialization = Task {
-            try await QVACClient(
+        let transport = HandshakeTransport(scriptedReplies: [
+            .success(Data(
+                #"{"error":"mobile worker rejected config","success":false}"#.utf8
+            )),
+        ])
+        let result: Result<QVACClient, Error>
+        do {
+            result = .success(try await QVACClient(
                 configuration: .testing(transport),
                 runtimeContext: .current,
-                initHandshakeTimeout: .seconds(2),
+                initHandshakeTimeout: Self.scriptedHandshakeTimeout,
                 logger: nil
-            )
+            ))
+        } catch {
+            result = .failure(error)
         }
 
-        let request = try await Self.waitForRequest(index: 0, on: transport)
-        await transport.reply(
-            id: request.id,
-            success: false,
-            error: "mobile worker rejected config"
-        )
-
-        do {
-            let client = try await initialization.value
+        switch result {
+        case .success(let client):
             await client.close()
             XCTFail("expected rejected init handshake")
-        } catch let error as QVACError {
-            guard case let .transport(reason, underlying) = error else {
-                return XCTFail("expected QVACError.transport, got \(error)")
+        case .failure(let error as QVACError):
+            if case let .transport(reason, underlying) = error {
+                XCTAssertEqual(
+                    reason,
+                    "init_config rejected by worker: mobile worker rejected config"
+                )
+                XCTAssertTrue(underlying is QVACInitConfigFailed)
+            } else {
+                XCTFail("expected QVACError.transport, got \(error)")
             }
-            XCTAssertEqual(
-                reason,
-                "init_config rejected by worker: mobile worker rejected config"
-            )
-            XCTAssertTrue(underlying is QVACInitConfigFailed)
-        } catch {
+        case .failure(let error):
             XCTFail("public initializer leaked non-QVAC error: \(error)")
         }
 
+        let requests = try Self.requests(in: await transport.outbound())
+        XCTAssertEqual(requests.count, 1)
+        let request = try XCTUnwrap(requests.first)
+        XCTAssertEqual(request.command, 1)
+        XCTAssertEqual(
+            try Self.object(from: request.payload)["type"] as? String,
+            "__init_config"
+        )
         let closeCount = await transport.closeCount()
         let writeAfterCloseCount = await transport.writeAfterCloseCount()
+        let unusedReplyCount = await transport.unusedScriptedReplyCount()
         XCTAssertEqual(closeCount, 1)
         XCTAssertEqual(writeAfterCloseCount, 0)
+        XCTAssertEqual(unusedReplyCount, 0)
     }
 
     func testHandshakeHelpersRejectEmptyAndNegativeReplies() async throws {
-        let cases: [(shutdown: Bool, success: Bool?, error: String?, expected: String)] = [
-            (false, nil, nil, "empty reply"),
-            (false, false, nil, "unknown error"),
-            (true, nil, nil, "empty shutdown reply"),
-            (true, false, nil, "shutdown rejected"),
-            (true, false, "worker busy", "worker busy"),
+        let cases: [(
+            label: String,
+            shutdown: Bool,
+            reply: BareRPCResponsePayload,
+            expected: String
+        )] = [
+            ("empty init reply", false, .success(nil), "empty reply"),
+            (
+                "negative init reply without diagnostic",
+                false,
+                .success(Data(#"{"success":false}"#.utf8)),
+                "unknown error"
+            ),
+            ("empty shutdown reply", true, .success(nil), "empty shutdown reply"),
+            (
+                "negative shutdown reply without diagnostic",
+                true,
+                .success(Data(#"{"success":false}"#.utf8)),
+                "shutdown rejected"
+            ),
+            (
+                "negative shutdown reply with diagnostic",
+                true,
+                .success(Data(#"{"error":"worker busy","success":false}"#.utf8)),
+                "worker busy"
+            ),
         ]
 
         for fixture in cases {
-            let transport = HandshakeTransport()
+            let transport = HandshakeTransport(scriptedReplies: [fixture.reply])
             let rpc = BareRPCClient(transport: transport)
-            let request = Task {
+
+            let result: Result<Void, Error>
+            do {
                 if fixture.shutdown {
-                    try await QVACHandshake.sendShutdown(on: rpc, timeout: .seconds(2))
+                    try await QVACHandshake.sendShutdown(
+                        on: rpc,
+                        timeout: Self.scriptedHandshakeTimeout
+                    )
                 } else {
                     try await QVACHandshake.sendInitConfig(
                         on: rpc,
                         runtimeContext: .current,
-                        timeout: .seconds(2)
+                        timeout: Self.scriptedHandshakeTimeout
                     )
                 }
-            }
-            let outbound = try await Self.waitForRequest(index: 0, on: transport)
-            if let success = fixture.success {
-                await transport.reply(
-                    id: outbound.id,
-                    success: success,
-                    error: fixture.error
-                )
-            } else {
-                await transport.replyEmpty(id: outbound.id)
+                result = .success(())
+            } catch {
+                result = .failure(error)
             }
 
-            do {
-                try await request.value
-                XCTFail("expected handshake failure: \(fixture.expected)")
-            } catch let error as QVACInitConfigFailed {
-                XCTAssertEqual(error.message, fixture.expected)
-            } catch {
-                XCTFail("unexpected handshake error: \(error)")
-            }
+            let inFlight = await rpc.__testInFlightCounts()
             await rpc.close()
+
+            switch result {
+            case .success:
+                XCTFail("\(fixture.label): expected handshake failure: \(fixture.expected)")
+            case .failure(let error as QVACInitConfigFailed):
+                XCTAssertEqual(error.message, fixture.expected, fixture.label)
+            case .failure(let error):
+                XCTFail("\(fixture.label): unexpected handshake error: \(error)")
+            }
+
+            XCTAssertEqual(inFlight.sends, 0, fixture.label)
+            XCTAssertEqual(inFlight.streams, 0, fixture.label)
+            XCTAssertEqual(inFlight.duplexes, 0, fixture.label)
+
+            let requests = try Self.requests(in: await transport.outbound())
+            XCTAssertEqual(requests.count, 1, fixture.label)
+            let outbound = try XCTUnwrap(requests.first, fixture.label)
+            XCTAssertEqual(outbound.command, 1, fixture.label)
+            XCTAssertEqual(
+                try Self.object(from: outbound.payload)["type"] as? String,
+                fixture.shutdown ? "__shutdown__" : "__init_config",
+                fixture.label
+            )
+            let closeCount = await transport.closeCount()
+            let writeAfterCloseCount = await transport.writeAfterCloseCount()
+            let unusedReplyCount = await transport.unusedScriptedReplyCount()
+            XCTAssertEqual(closeCount, 1, fixture.label)
+            XCTAssertEqual(writeAfterCloseCount, 0, fixture.label)
+            XCTAssertEqual(unusedReplyCount, 0, fixture.label)
         }
     }
 
-    private static func waitForRequest(
-        index: Int,
-        on transport: HandshakeTransport
-    ) async throws -> (id: UInt64, payload: Data) {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(5))
-        while clock.now < deadline {
-            let reader = BareRPCFrameReader()
-            try reader.append(await transport.outbound())
-            var requests: [(UInt64, Data)] = []
-            while let frame = reader.next() {
-                guard case let .request(id, _, _, payload?) = frame else { continue }
-                requests.append((id, payload))
-            }
-            if requests.indices.contains(index) { return requests[index] }
-            try await Task.sleep(for: .milliseconds(2))
+    private static func requests(
+        in data: Data
+    ) throws -> [(id: UInt64, command: UInt64, payload: Data)] {
+        let reader = BareRPCFrameReader()
+        try reader.append(data)
+        var requests: [(UInt64, UInt64, Data)] = []
+        while let frame = reader.next() {
+            guard case let .request(id, command, _, payload?) = frame else { continue }
+            requests.append((id, command, payload))
         }
-        throw TestDeadlineExceeded(context: "request \(index)")
+        return requests
     }
 
     private static func object(from data: Data) throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
-}
-
-private struct TestDeadlineExceeded: Error, CustomStringConvertible {
-    let context: String
-    var description: String { "timed out waiting for \(context)" }
 }
 
 private final class HandshakeInboundPipe: @unchecked Sendable {
@@ -380,10 +431,16 @@ private final class HandshakeInboundPipe: @unchecked Sendable {
 
 private actor HandshakeTransport: BareTransport {
     nonisolated private let inbound = HandshakeInboundPipe()
+    private let scriptedReplies: [BareRPCResponsePayload]
     private var outboundBytes = Data()
     private var closed = false
+    private var nextScriptedReplyIndex = 0
     private var recordedCloseCount = 0
     private var recordedWriteAfterCloseCount = 0
+
+    init(scriptedReplies: [BareRPCResponsePayload] = []) {
+        self.scriptedReplies = scriptedReplies
+    }
 
     nonisolated func inboundStream() -> AsyncThrowingStream<Data, Error> {
         inbound.stream
@@ -395,6 +452,23 @@ private actor HandshakeTransport: BareTransport {
             throw BareRPCConnectionClosed()
         }
         outboundBytes.append(data)
+
+        guard scriptedReplies.indices.contains(nextScriptedReplyIndex) else { return }
+        let reader = BareRPCFrameReader()
+        try reader.append(data)
+        while let frame = reader.next() {
+            guard case let .request(id, _, _, _) = frame else { continue }
+            let scriptedReply = scriptedReplies[nextScriptedReplyIndex]
+            let response = try BareRPCCodec.encodeResponseFrame(
+                id: id,
+                stream: [],
+                payload: scriptedReply,
+                maximumBodyBytes: Int(UInt32.max)
+            )
+            nextScriptedReplyIndex += 1
+            inbound.continuation.yield(response)
+            return
+        }
     }
 
     func close() {
@@ -407,36 +481,7 @@ private actor HandshakeTransport: BareTransport {
     func outbound() -> Data { outboundBytes }
     func closeCount() -> Int { recordedCloseCount }
     func writeAfterCloseCount() -> Int { recordedWriteAfterCloseCount }
-
-    func reply(id: UInt64, success: Bool, error: String? = nil) {
-        let data: Data
-        if let error {
-            data = Data(#"{"error":"\#(error)","success":\#(success)}"#.utf8)
-        } else {
-            data = Data(#"{"success":\#(success)}"#.utf8)
-        }
-        guard let frame = try? BareRPCCodec.encodeResponseFrame(
-            id: id,
-            stream: [],
-            payload: .success(data),
-            maximumBodyBytes: Int(UInt32.max)
-        ) else {
-            inbound.continuation.finish(throwing: BareRPCProtocolError("invalid test reply"))
-            return
-        }
-        inbound.continuation.yield(frame)
-    }
-
-    func replyEmpty(id: UInt64) {
-        guard let frame = try? BareRPCCodec.encodeResponseFrame(
-            id: id,
-            stream: [],
-            payload: .success(nil),
-            maximumBodyBytes: Int(UInt32.max)
-        ) else {
-            inbound.continuation.finish(throwing: BareRPCProtocolError("invalid test reply"))
-            return
-        }
-        inbound.continuation.yield(frame)
+    func unusedScriptedReplyCount() -> Int {
+        scriptedReplies.count - nextScriptedReplyIndex
     }
 }
