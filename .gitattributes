@@ -1,1 +1,4 @@
 Sources/QVACClient/Resources/worker.mobile.bundle binary
+# Unified-diff context uses a single leading space, including on blank lines.
+# Treat the byte-pinned native patch as patch syntax rather than source text.
+tools/native/bare-kit/*.patch -whitespace

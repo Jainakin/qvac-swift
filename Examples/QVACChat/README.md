@@ -27,6 +27,11 @@ Capabilities settings.
 The first run downloads the model configured in `ContentView.swift`; allow time
 and storage for that download. Subsequent runs can use the worker's local cache.
 
+For release validation, select the `QVACChat-PhysicalDevice` scheme and run its
+UI test on a provisioned, unlocked device. The test fails if it is launched on a
+simulator. It records screenshots while it loads the immutable model revision,
+receives streamed completion output, and unloads the model.
+
 ## macOS
 
 Install the locked runtime from the repository root:

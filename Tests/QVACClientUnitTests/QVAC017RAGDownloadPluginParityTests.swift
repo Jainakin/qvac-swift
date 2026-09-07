@@ -290,6 +290,296 @@ final class QVAC017RAGDownloadPluginParityTests: XCTestCase {
         await client.close()
     }
 
+    func test_rag_chunk_options_and_embedded_metadata_preserve_every_017_field() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let chunksTask = Task {
+            try await client.ragChunk(
+                documents: ["first", "second"],
+                chunkOpts: .init(
+                    chunkSize: 128.5,
+                    chunkOverlap: 16.25,
+                    chunkStrategy: .paragraph,
+                    splitStrategy: .sentence
+                )
+            )
+        }
+
+        var frames = try await Self.waitForFrames(1, on: transport)
+        var (id, request) = try Self.request(in: frames)
+        let options = try XCTUnwrap(request["chunkOpts"] as? [String: Any])
+        XCTAssertEqual(options["chunkSize"] as? Double, 128.5)
+        XCTAssertEqual(options["chunkOverlap"] as? Double, 16.25)
+        XCTAssertEqual(options["chunkStrategy"] as? String, "paragraph")
+        XCTAssertEqual(options["splitStrategy"] as? String, "sentence")
+        try await Self.feedReply(
+            id: id,
+            response: .rag(.init(operation: "chunk", success: true, chunks: [])),
+            to: transport
+        )
+        let chunks = try await chunksTask.value
+        XCTAssertTrue(chunks.isEmpty)
+
+        let saveRun = try await client.ragSaveEmbeddings(
+            documents: [
+                .init(
+                    id: "doc-1",
+                    content: "content",
+                    embedding: [0.25, 0.75],
+                    embeddingModelId: "embed-model",
+                    metadata: ["source": .string("unit-test")]
+                ),
+            ],
+            modelId: "embed-model",
+            workspace: "docs"
+        )
+        frames = try await Self.waitForFrames(2, on: transport)
+        (id, request) = try Self.request(in: Array(frames.dropFirst()))
+        let documents = try XCTUnwrap(request["documents"] as? [[String: Any]])
+        let first = try XCTUnwrap(documents.first)
+        XCTAssertEqual(first["id"] as? String, "doc-1")
+        XCTAssertEqual(first["content"] as? String, "content")
+        XCTAssertEqual(first["embedding"] as? [Double], [0.25, 0.75])
+        XCTAssertEqual(first["embeddingModelId"] as? String, "embed-model")
+        XCTAssertEqual((first["metadata"] as? [String: String])?["source"], "unit-test")
+        try await Self.feedReply(
+            id: id,
+            response: .rag(.init(
+                operation: "saveEmbeddings",
+                success: true,
+                processed: [.object([
+                    "status": .string("rejected"),
+                    "error": .string("duplicate"),
+                ])]
+            )),
+            to: transport
+        )
+        let saved = try await saveRun.result.value
+        XCTAssertEqual(saved, [.init(status: .rejected, id: nil, error: "duplicate")])
+        await client.close()
+    }
+
+    func test_rag_workspace_lifecycle_round_trips_typed_results_and_exact_requests() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+
+        let listTask = Task { try await client.ragListWorkspaces() }
+        var frames = try await Self.waitForFrames(1, on: transport)
+        var (id, request) = try Self.request(in: frames)
+        XCTAssertEqual(request["operation"] as? String, "listWorkspaces")
+        try await Self.feedReply(
+            id: id,
+            response: .rag(.init(
+                operation: "listWorkspaces",
+                success: true,
+                workspaces: [
+                    .object(["name": .string("open-docs"), "open": .bool(true)]),
+                    .object(["name": .string("archive"), "open": .bool(false)]),
+                ]
+            )),
+            to: transport
+        )
+        let workspaces = try await listTask.value
+        XCTAssertEqual(
+            workspaces,
+            [
+                .init(name: "open-docs", open: true),
+                .init(name: "archive", open: false),
+            ]
+        )
+
+        let closeTask = Task {
+            try await client.ragCloseWorkspace(workspace: "open-docs", deleteOnClose: true)
+        }
+        frames = try await Self.waitForFrames(2, on: transport)
+        (id, request) = try Self.request(in: Array(frames.dropFirst()))
+        XCTAssertEqual(request["operation"] as? String, "closeWorkspace")
+        XCTAssertEqual(request["workspace"] as? String, "open-docs")
+        XCTAssertEqual(request["deleteOnClose"] as? Bool, true)
+        try await Self.feedReply(
+            id: id,
+            response: .rag(.init(operation: "closeWorkspace", success: true)),
+            to: transport
+        )
+        try await closeTask.value
+
+        let deleteTask = Task { try await client.ragDeleteWorkspace(workspace: "archive") }
+        frames = try await Self.waitForFrames(3, on: transport)
+        (id, request) = try Self.request(in: Array(frames.dropFirst(2)))
+        XCTAssertEqual(request["operation"] as? String, "deleteWorkspace")
+        XCTAssertEqual(request["workspace"] as? String, "archive")
+        try await Self.feedReply(
+            id: id,
+            response: .rag(.init(operation: "deleteWorkspace", success: true)),
+            to: transport
+        )
+        try await deleteTask.value
+
+        do {
+            try await client.ragDeleteWorkspace(workspace: "")
+            XCTFail("empty workspace name must be rejected locally")
+        } catch let QVACError.invalidArgument(message) {
+            XCTAssertTrue(message.contains("workspace must not be empty"))
+        }
+        do {
+            try await client.ragDeleteEmbeddings(ids: [])
+            XCTFail("empty embedding id list must be rejected locally")
+        } catch let QVACError.invalidArgument(message) {
+            XCTAssertTrue(message.contains("ids must not be empty"))
+        }
+        await client.close()
+    }
+
+    func test_rag_unary_adapters_reject_missing_wrong_and_mismatched_results() async throws {
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let task = Task { try await client.ragListWorkspaces() }
+            let frames = try await Self.waitForFrames(1, on: transport)
+            let (id, _) = try Self.request(in: frames)
+            try await Self.feedReply(
+                id: id,
+                response: .rag(.init(operation: "listWorkspaces", success: true)),
+                to: transport
+            )
+            do {
+                _ = try await task.value
+                XCTFail("missing workspace array must fail")
+            } catch let QVACError.protocolViolation(message) {
+                XCTAssertTrue(message.contains("omitted workspaces"))
+            }
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let task = Task { try await client.ragChunk(documents: ["document"]) }
+            let frames = try await Self.waitForFrames(1, on: transport)
+            let (id, _) = try Self.request(in: frames)
+            try await Self.feedReply(
+                id: id,
+                response: .rag(.init(
+                    operation: "chunk",
+                    success: true,
+                    chunks: [.object(["id": .string("missing-content")])]
+                )),
+                to: transport
+            )
+            do {
+                _ = try await task.value
+                XCTFail("malformed chunk must fail")
+            } catch let QVACError.protocolViolation(message) {
+                XCTAssertTrue(message.contains("string id and content"))
+            }
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let task = Task { try await client.ragSearch(modelId: "embed", query: "query") }
+            let frames = try await Self.waitForFrames(1, on: transport)
+            let (id, _) = try Self.request(in: frames)
+            try await Self.feedReply(
+                id: id,
+                response: .rag(.init(operation: "chunk", success: true, results: [])),
+                to: transport
+            )
+            do {
+                _ = try await task.value
+                XCTFail("mismatched RAG operation must fail")
+            } catch let QVACError.protocolViolation(message) {
+                XCTAssertTrue(message.contains("≠ search"))
+            }
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let task = Task { try await client.ragSearch(modelId: "embed", query: "") }
+            do {
+                _ = try await task.value
+                XCTFail("empty query must fail")
+            } catch let QVACError.invalidArgument(message) {
+                XCTAssertTrue(message.contains("query must not be empty"))
+            }
+            let outbound = await transport.outbound()
+            XCTAssertTrue(outbound.isEmpty)
+            await client.close()
+        }
+    }
+
+    func test_rag_progress_stream_propagates_worker_error_wrong_type_and_missing_terminal() async throws {
+        enum Fixture {
+            case workerError
+            case wrongType
+            case missingTerminal
+        }
+
+        for fixture in [Fixture.workerError, .wrongType, .missingTerminal] {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let run = try await client.ragIngest(
+                modelId: "embedding-model",
+                documents: ["document"],
+                withProgress: true
+            )
+            let frames = try await Self.waitForFrames(2, on: transport)
+            let (id, _) = try Self.request(in: frames)
+            switch fixture {
+            case .workerError:
+                await Self.feedServerStream(
+                    id: id,
+                    records: [#"{"type":"error","code":52800,"message":"save failed"}"#],
+                    to: transport
+                )
+            case .wrongType:
+                await Self.feedServerStream(
+                    id: id,
+                    records: [#"{"type":"heartbeat","number":1}"#],
+                    to: transport
+                )
+            case .missingTerminal:
+                await Self.feedServerStream(
+                    id: id,
+                    records: [
+                        #"{"type":"rag:progress","operation":"ingest","workspace":"docs","stage":"embed","current":1,"total":2,"timestamp":1}"#,
+                    ],
+                    to: transport
+                )
+            }
+
+            do {
+                _ = try await run.result.value
+                XCTFail("malformed RAG progress sequence must fail")
+            } catch let QVACError.server(code, message) {
+                if case .workerError = fixture {
+                    XCTAssertEqual(code, .ragSaveFailed)
+                    XCTAssertEqual(message, "save failed")
+                } else {
+                    XCTFail("unexpected server error for \(fixture)")
+                }
+            } catch let QVACError.protocolViolation(message) {
+                if case .wrongType = fixture {
+                    XCTAssertTrue(message.contains("rag or rag:progress"))
+                } else {
+                    XCTFail("unexpected protocol violation for \(fixture): \(message)")
+                }
+            } catch let QVACError.client(code, _) {
+                if case .missingTerminal = fixture {
+                    XCTAssertEqual(code, .streamEndedWithoutResponse)
+                } else {
+                    XCTFail("unexpected client error for \(fixture)")
+                }
+            } catch {
+                XCTFail("unexpected RAG failure for \(fixture): \(error)")
+            }
+            await client.close()
+        }
+    }
+
     func test_rag_stream_ignores_other_operation_progress_and_drains_profile() async throws {
         let transport = MockTransport()
         let profiling = ProfilingCounter()

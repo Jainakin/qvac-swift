@@ -17,7 +17,7 @@ import OSLog
 /// remains available to developers with appropriate log-data access.
 ///
 /// Used as the default logger in
-/// ``QVACClient/init(configuration:runtimeContext:config:initHandshakeTimeout:maximumWireMessageBytes:maximumBufferedStreamBytes:profilingMetadataHandler:logger:)``
+/// ``QVACClient/init(configuration:runtimeContext:config:initHandshakeTimeout:maximumWireMessageBytes:maximumOutboundPayloadBytes:maximumInlineBinaryBytes:maximumInlineBinaryItems:maximumBatchPrompts:maximumAccumulatedResultBytes:maximumVLAActionBytes:maximumMetadataResponseBytes:maximumRegistryResponseBytes:maximumBufferedStreamBytes:profilingMetadataHandler:logger:)``
 /// so users get init / handshake / frame visibility out of the box without
 /// having to plumb anything. Pass `nil` to opt out.
 // `OSLog.Logger` is safe to share across concurrency domains, but the macOS 14
@@ -51,6 +51,47 @@ public actor QVACClient {
     /// QVAC 0.17 video/upscale results may exceed the historical 64 MiB limit, so
     /// production clients default to 256 MiB while retaining a finite memory bound.
     public static let defaultMaximumWireMessageBytes = 256 * 1024 * 1024
+
+    /// Default ceiling for an encoded request or outbound duplex chunk. This is
+    /// intentionally lower than the inbound wire ceiling: media results can be
+    /// large, while request framing otherwise retains multiple payload copies.
+    public static let defaultMaximumOutboundPayloadBytes = 48 * 1024 * 1024
+
+    /// Default aggregate raw-byte budget for convenience APIs that inline
+    /// binary values as base64 JSON. The separate, lower ceiling prevents a
+    /// request from transiently consuming several hundred MiB while Swift holds
+    /// the source bytes, base64 text, encoded JSON, bare-rpc body, and frame.
+    public static let defaultMaximumInlineBinaryBytes = 24 * 1024 * 1024
+
+    /// Default number of separately encoded binary values accepted by one rich
+    /// convenience request. The byte ceiling alone cannot bound the allocation
+    /// overhead of an array containing a very large number of tiny values.
+    public static let defaultMaximumInlineBinaryItems = 1_024
+
+    /// Default number of prompt coordinators one batch-completion operation may
+    /// allocate. The encoded request-byte ceiling cannot bound a large array of
+    /// tiny prompts, while each prompt requires independent result and stream state.
+    public static let defaultMaximumBatchPrompts = 256
+
+    /// Default ceiling for decoded Float32 action data returned by one VLA run.
+    /// VLA responses carry actions as base64 inside JSON, so bounding only the
+    /// wire record would still permit several simultaneously retained large copies.
+    public static let defaultMaximumVLAActionBytes = 8 * 1024 * 1024
+
+    /// Default encoded-response ceiling for small metadata RPCs whose schemas
+    /// otherwise admit open-ended JSON strings or objects.
+    public static let defaultMaximumMetadataResponseBytes = 256 * 1_024
+
+    /// Default encoded-response ceiling for unpaginated registry list/search
+    /// operations. This is intentionally larger than the small-metadata ceiling:
+    /// the QVAC 0.17 registry already contains hundreds of records, while the
+    /// dedicated bound still prevents unconstrained response allocation.
+    public static let defaultMaximumRegistryResponseBytes = 4 * 1_024 * 1_024
+
+    /// Quotes plus a separator are the smallest JSON structure attributable to
+    /// each separately encoded base64 value. Operation-specific keys and outer
+    /// containers only make the eventual payload larger.
+    private static let inlineBinaryJSONStructuralBytesPerItem = 3
 
     /// Opaque worker configuration. Construct it with `macOS`, `iOS`, or
     /// `iOSWithBundledResource`; transport implementation types are not part
@@ -112,10 +153,11 @@ public actor QVACClient {
         }
 
         /// macOS convenience — prefers the lockfile-local
-        /// `node_modules/bare-runtime/bin/bare`, then falls back to discovering
-        /// `bare` on `$PATH`, and uses the SDK's `worker.js` from the supplied
-        /// node_modules directory. Pass `homeDirectory` to isolate the worker's
-        /// `HOME_DIR`; otherwise it uses the current process home directory.
+        /// `node_modules/bare-runtime/bin/bare`, then searches common install
+        /// locations, nvm installations, and `$PATH`. The SDK's `worker.js` is
+        /// loaded from the supplied node_modules directory. Pass `homeDirectory`
+        /// to isolate the worker's `HOME_DIR`; otherwise it uses the current
+        /// process home directory.
         public static func macOS(
             nodeModulesDir: URL,
             bareExecutable: URL? = nil,
@@ -128,7 +170,7 @@ public actor QVACClient {
                 .appendingPathComponent("@qvac/sdk/dist/server/worker.js")
             let packageBare = nodeModulesDir
                 .appendingPathComponent("bare-runtime/bin/bare")
-            let localBare = FileManager.default.isExecutableFile(atPath: packageBare.path)
+            let localBare = Self.isExecutableRegularFile(packageBare)
                 ? packageBare
                 : nil
             let bare = bareExecutable ?? localBare ?? Self.discoverBareOnPath()
@@ -240,51 +282,126 @@ public actor QVACClient {
 
         #if os(macOS)
         private static func discoverBareOnPath() -> URL? {
-            // 1. Common static install locations.
-            let staticCandidates = [
-                "/opt/homebrew/bin/bare",
-                "/usr/local/bin/bare",
-            ]
-            for c in staticCandidates where FileManager.default.fileExists(atPath: c) {
-                return URL(fileURLWithPath: c)
+            selectBareExecutable(
+                staticCandidates: [
+                    URL(fileURLWithPath: "/opt/homebrew/bin/bare"),
+                    URL(fileURLWithPath: "/usr/local/bin/bare"),
+                ],
+                nvmRoot: URL(
+                    fileURLWithPath: NSHomeDirectory(),
+                    isDirectory: true
+                ).appendingPathComponent(".nvm/versions/node", isDirectory: true),
+                pathLookup: { whichBare() }
+            )
+        }
+
+        /// Shared discovery policy kept separate from process launch so precedence,
+        /// numeric nvm ordering, and executable-file validation remain deterministic.
+        private static func selectBareExecutable(
+            staticCandidates: [URL],
+            nvmRoot: URL,
+            pathLookup: () -> URL?
+        ) -> URL? {
+            // 1. Common static install locations, in explicit precedence order.
+            for candidate in staticCandidates where isExecutableRegularFile(candidate) {
+                return candidate
             }
-            // 2. nvm: scan ~/.nvm/versions/node/v*/bin/bare. nvm uses versioned dirs
-            //    (v22.0.0), not a `current` symlink, so we pick the alphabetically last
-            //    (highest semver-ish version that has `bare` installed).
-            let nvmRoot = "\(NSHomeDirectory())/.nvm/versions/node"
-            if let versions = try? FileManager.default.contentsOfDirectory(atPath: nvmRoot) {
-                for v in versions.sorted(by: >) {
-                    let p = "\(nvmRoot)/\(v)/bin/bare"
-                    if FileManager.default.fileExists(atPath: p) {
-                        return URL(fileURLWithPath: p)
+
+            // 2. nvm uses versioned directories such as `v22.10.0`. Foundation's
+            // numeric comparison is intentional: a bytewise sort incorrectly ranks
+            // v9 above v22 and v22.9 above v22.10.
+            if let versions = try? FileManager.default.contentsOfDirectory(
+                atPath: nvmRoot.path
+            ) {
+                let orderedVersions = versions.sorted { left, right in
+                    let comparison = left.compare(
+                        right,
+                        options: [.numeric, .caseInsensitive],
+                        range: nil,
+                        locale: Locale(identifier: "en_US_POSIX")
+                    )
+                    if comparison == .orderedSame {
+                        return left.utf8.lexicographicallyPrecedes(right.utf8) == false
+                            && left != right
+                    }
+                    return comparison == .orderedDescending
+                }
+                for version in orderedVersions {
+                    let candidate = nvmRoot
+                        .appendingPathComponent(version, isDirectory: true)
+                        .appendingPathComponent("bin/bare", isDirectory: false)
+                    if isExecutableRegularFile(candidate) {
+                        return candidate
                     }
                 }
             }
-            // 3. $PATH search via `/usr/bin/which`. Keeps us honest if the user has bare
-            //    installed somewhere unusual (e.g. asdf, mise, custom $HOME bin).
-            if let viaWhich = whichBare() {
-                return viaWhich
+
+            // 3. `$PATH` lookup covers asdf, mise, and custom per-user bins. Validate
+            // the result independently instead of trusting `which` output.
+            guard let pathCandidate = pathLookup(),
+                  isExecutableRegularFile(pathCandidate) else {
+                return nil
             }
-            return nil
+            return pathCandidate
         }
 
-        private static func whichBare() -> URL? {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-            proc.arguments = ["bare"]
+        private static func isExecutableRegularFile(_ candidate: URL) -> Bool {
+            var isDirectory = ObjCBool(false)
+            guard FileManager.default.fileExists(
+                atPath: candidate.path,
+                isDirectory: &isDirectory
+            ), !isDirectory.boolValue else {
+                return false
+            }
+            return FileManager.default.isExecutableFile(atPath: candidate.path)
+        }
+
+        /// Deterministic macOS discovery seam. It exercises the exact production
+        /// selection policy without depending on the developer machine's `/opt`,
+        /// home directory, or current process environment.
+        static func __testDiscoverBare(
+            staticCandidates: [URL],
+            nvmRoot: URL,
+            pathCandidate: URL?
+        ) -> URL? {
+            selectBareExecutable(
+                staticCandidates: staticCandidates,
+                nvmRoot: nvmRoot,
+                pathLookup: { pathCandidate }
+            )
+        }
+
+        static func __testWhichBare(searchPath: String) -> URL? {
+            whichBare(environment: ["PATH": searchPath])
+        }
+
+        private static func whichBare(
+            environment: [String: String]? = nil
+        ) -> URL? {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+            process.arguments = ["bare"]
+            if let environment {
+                process.environment = environment
+            }
             let pipe = Pipe()
-            proc.standardOutput = pipe
-            proc.standardError = Pipe()
-            do { try proc.run() } catch { return nil }
-            proc.waitUntilExit()
-            guard proc.terminationStatus == 0,
+            process.standardOutput = pipe
+            process.standardError = Pipe()
+            do {
+                try process.run()
+            } catch {
+                return nil
+            }
+            process.waitUntilExit()
+            guard process.terminationStatus == 0,
                   let data = try? pipe.fileHandleForReading.readToEnd(),
                   let path = String(data: data, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines),
-                  !path.isEmpty,
-                  FileManager.default.fileExists(atPath: path)
-            else { return nil }
-            return URL(fileURLWithPath: path)
+                  !path.isEmpty else {
+                return nil
+            }
+            let candidate = URL(fileURLWithPath: path)
+            return isExecutableRegularFile(candidate) ? candidate : nil
         }
         #endif
     }
@@ -305,6 +422,14 @@ public actor QVACClient {
     private(set) var transport: BareTransport
     private(set) var rpc: BareRPCClient
     let maximumWireMessageBytes: Int
+    let maximumOutboundPayloadBytes: Int
+    let maximumInlineBinaryBytes: Int
+    let maximumInlineBinaryItems: Int
+    let maximumBatchPrompts: Int
+    let maximumAccumulatedResultBytes: Int
+    let maximumVLAActionBytes: Int
+    let maximumMetadataResponseBytes: Int
+    let maximumRegistryResponseBytes: Int
     let maximumBufferedStreamBytes: Int
     private let shutdownBeforeClose: Bool
     private let shutdownTimeout: Duration
@@ -331,6 +456,14 @@ public actor QVACClient {
     init(
         testing transport: BareTransport,
         maximumWireMessageBytes: Int = QVACClient.defaultMaximumWireMessageBytes,
+        maximumOutboundPayloadBytes: Int? = nil,
+        maximumInlineBinaryBytes: Int = QVACClient.defaultMaximumInlineBinaryBytes,
+        maximumInlineBinaryItems: Int = QVACClient.defaultMaximumInlineBinaryItems,
+        maximumBatchPrompts: Int = QVACClient.defaultMaximumBatchPrompts,
+        maximumAccumulatedResultBytes: Int? = nil,
+        maximumVLAActionBytes: Int? = nil,
+        maximumMetadataResponseBytes: Int? = nil,
+        maximumRegistryResponseBytes: Int? = nil,
         maximumBufferedStreamBytes: Int? = nil,
         shutdownBeforeClose: Bool = false,
         shutdownTimeout: Duration = .seconds(10),
@@ -338,10 +471,56 @@ public actor QVACClient {
         logger: BareRPCLogger? = nil
     ) {
         precondition(maximumWireMessageBytes > 0 && maximumWireMessageBytes <= Int(UInt32.max))
+        let outboundLimit = maximumOutboundPayloadBytes
+            ?? min(QVACClient.defaultMaximumOutboundPayloadBytes, maximumWireMessageBytes)
+        precondition(outboundLimit > 0 && outboundLimit <= maximumWireMessageBytes)
+        precondition(
+            maximumInlineBinaryBytes > 0
+                && maximumInlineBinaryBytes <= Int(UInt32.max)
+        )
+        precondition(
+            maximumInlineBinaryItems > 0
+                && maximumInlineBinaryItems <= Int(UInt32.max)
+        )
+        precondition(maximumBatchPrompts > 0 && maximumBatchPrompts <= Int(UInt32.max))
+        let resultLimit = maximumAccumulatedResultBytes ?? maximumWireMessageBytes
+        precondition(resultLimit > 0 && resultLimit <= Int(UInt32.max))
+        let vlaActionLimit = maximumVLAActionBytes
+            ?? min(
+                QVACClient.defaultMaximumVLAActionBytes,
+                maximumWireMessageBytes,
+                resultLimit
+            )
+        precondition(vlaActionLimit > 0 && vlaActionLimit <= maximumWireMessageBytes)
+        precondition(vlaActionLimit <= resultLimit)
+        let metadataLimit = maximumMetadataResponseBytes
+            ?? min(
+                QVACClient.defaultMaximumMetadataResponseBytes,
+                maximumWireMessageBytes,
+                resultLimit
+            )
+        precondition(metadataLimit > 0 && metadataLimit <= maximumWireMessageBytes)
+        precondition(metadataLimit <= resultLimit)
+        let registryLimit = maximumRegistryResponseBytes
+            ?? min(
+                QVACClient.defaultMaximumRegistryResponseBytes,
+                maximumWireMessageBytes,
+                resultLimit
+            )
+        precondition(registryLimit > 0 && registryLimit <= maximumWireMessageBytes)
+        precondition(registryLimit <= resultLimit)
         let bufferLimit = maximumBufferedStreamBytes ?? maximumWireMessageBytes
         precondition(bufferLimit > 0 && bufferLimit <= Int(UInt32.max))
         self.transport = transport
         self.maximumWireMessageBytes = maximumWireMessageBytes
+        self.maximumOutboundPayloadBytes = outboundLimit
+        self.maximumInlineBinaryBytes = maximumInlineBinaryBytes
+        self.maximumInlineBinaryItems = maximumInlineBinaryItems
+        self.maximumBatchPrompts = maximumBatchPrompts
+        self.maximumAccumulatedResultBytes = resultLimit
+        self.maximumVLAActionBytes = vlaActionLimit
+        self.maximumMetadataResponseBytes = metadataLimit
+        self.maximumRegistryResponseBytes = registryLimit
         self.maximumBufferedStreamBytes = bufferLimit
         self.shutdownBeforeClose = shutdownBeforeClose
         self.shutdownTimeout = shutdownTimeout
@@ -367,12 +546,34 @@ public actor QVACClient {
     /// If the worker bundle crashes during startup or runs in direct mode (no
     /// RPC handler), the call throws ``QVACError/transport(reason:underlying:)``
     /// rather than hanging.
+    ///
+    /// `maximumAccumulatedResultBytes` bounds eager high-level values assembled
+    /// across multiple response records; each individual record remains bounded
+    /// by `maximumWireMessageBytes`. VLA action decoding has a dedicated
+    /// `maximumVLAActionBytes` ceiling (8 MiB by default), additionally bounded by
+    /// the wire and aggregate-result ceilings because its binary data is retained
+    /// as part of the operation result.
+    /// Small open-ended metadata objects use `maximumMetadataResponseBytes`
+    /// (256 KiB by default), independently of the larger media wire ceiling.
+    /// Unpaginated registry list/search responses use the independent
+    /// `maximumRegistryResponseBytes` ceiling (4 MiB by default), leaving
+    /// practical growth headroom without weakening smaller metadata endpoints.
+    /// `maximumBatchPrompts` independently bounds the per-prompt tasks, streams,
+    /// and accumulator state created by one batch-completion request.
     public init(
         configuration: Configuration,
         runtimeContext: QVACRuntimeContext? = .current,
         config: JSONValue? = nil,
         initHandshakeTimeout: Duration = .seconds(60),
         maximumWireMessageBytes: Int = QVACClient.defaultMaximumWireMessageBytes,
+        maximumOutboundPayloadBytes: Int? = nil,
+        maximumInlineBinaryBytes: Int = QVACClient.defaultMaximumInlineBinaryBytes,
+        maximumInlineBinaryItems: Int = QVACClient.defaultMaximumInlineBinaryItems,
+        maximumBatchPrompts: Int = QVACClient.defaultMaximumBatchPrompts,
+        maximumAccumulatedResultBytes: Int? = nil,
+        maximumVLAActionBytes: Int? = nil,
+        maximumMetadataResponseBytes: Int? = nil,
+        maximumRegistryResponseBytes: Int? = nil,
         maximumBufferedStreamBytes: Int? = nil,
         profilingMetadataHandler: (@Sendable (QVACProfilingMetadata) -> Void)? = nil,
         logger: BareRPCLogger? = QVACOSLogger.default
@@ -386,6 +587,80 @@ public actor QVACClient {
                 "maximumWireMessageBytes must be between 1 and UInt32.max"
             )
         }
+        guard maximumInlineBinaryBytes > 0,
+              maximumInlineBinaryBytes <= Int(UInt32.max) else {
+            throw QVACError.invalidArgument(
+                "maximumInlineBinaryBytes must be between 1 and UInt32.max"
+            )
+        }
+        guard maximumInlineBinaryItems > 0,
+              maximumInlineBinaryItems <= Int(UInt32.max) else {
+            throw QVACError.invalidArgument(
+                "maximumInlineBinaryItems must be between 1 and UInt32.max"
+            )
+        }
+        guard maximumBatchPrompts > 0,
+              maximumBatchPrompts <= Int(UInt32.max) else {
+            throw QVACError.invalidArgument(
+                "maximumBatchPrompts must be between 1 and UInt32.max"
+            )
+        }
+        let resultLimit = maximumAccumulatedResultBytes ?? maximumWireMessageBytes
+        guard resultLimit > 0, resultLimit <= Int(UInt32.max) else {
+            throw QVACError.invalidArgument(
+                "maximumAccumulatedResultBytes must be between 1 and UInt32.max"
+            )
+        }
+        let vlaActionLimit = maximumVLAActionBytes
+            ?? min(
+                Self.defaultMaximumVLAActionBytes,
+                maximumWireMessageBytes,
+                resultLimit
+            )
+        guard vlaActionLimit > 0,
+              vlaActionLimit <= maximumWireMessageBytes,
+              vlaActionLimit <= resultLimit else {
+            throw QVACError.invalidArgument(
+                "maximumVLAActionBytes must be between 1 and both "
+                    + "maximumWireMessageBytes and maximumAccumulatedResultBytes"
+            )
+        }
+        let metadataLimit = maximumMetadataResponseBytes
+            ?? min(
+                Self.defaultMaximumMetadataResponseBytes,
+                maximumWireMessageBytes,
+                resultLimit
+            )
+        guard metadataLimit > 0,
+              metadataLimit <= maximumWireMessageBytes,
+              metadataLimit <= resultLimit else {
+            throw QVACError.invalidArgument(
+                "maximumMetadataResponseBytes must be between 1 and both "
+                    + "maximumWireMessageBytes and maximumAccumulatedResultBytes"
+            )
+        }
+        let registryLimit = maximumRegistryResponseBytes
+            ?? min(
+                Self.defaultMaximumRegistryResponseBytes,
+                maximumWireMessageBytes,
+                resultLimit
+            )
+        guard registryLimit > 0,
+              registryLimit <= maximumWireMessageBytes,
+              registryLimit <= resultLimit else {
+            throw QVACError.invalidArgument(
+                "maximumRegistryResponseBytes must be between 1 and both "
+                    + "maximumWireMessageBytes and maximumAccumulatedResultBytes"
+            )
+        }
+        let outboundLimit = maximumOutboundPayloadBytes
+            ?? min(Self.defaultMaximumOutboundPayloadBytes, maximumWireMessageBytes)
+        guard outboundLimit > 0, outboundLimit <= maximumWireMessageBytes else {
+            throw QVACError.invalidArgument(
+                "maximumOutboundPayloadBytes must be between 1 and "
+                    + "maximumWireMessageBytes"
+            )
+        }
         let bufferLimit = maximumBufferedStreamBytes ?? maximumWireMessageBytes
         guard bufferLimit > 0, bufferLimit <= Int(UInt32.max) else {
             throw QVACError.invalidArgument(
@@ -393,6 +668,14 @@ public actor QVACClient {
             )
         }
         self.maximumWireMessageBytes = maximumWireMessageBytes
+        self.maximumOutboundPayloadBytes = outboundLimit
+        self.maximumInlineBinaryBytes = maximumInlineBinaryBytes
+        self.maximumInlineBinaryItems = maximumInlineBinaryItems
+        self.maximumBatchPrompts = maximumBatchPrompts
+        self.maximumAccumulatedResultBytes = resultLimit
+        self.maximumVLAActionBytes = vlaActionLimit
+        self.maximumMetadataResponseBytes = metadataLimit
+        self.maximumRegistryResponseBytes = registryLimit
         self.maximumBufferedStreamBytes = bufferLimit
         self.logger = logger
         self.profilingMetadataHandler = profilingMetadataHandler
@@ -401,6 +684,13 @@ public actor QVACClient {
         self.initHandshakeTimeout = initHandshakeTimeout
         let log = logger ?? NoOpRPCLogger()
         log.log(.info, "QVACClient init: starting transport")
+
+        guard let maximumInboundBufferedBytes = BoundedTransportInboundChannel
+            .retainedCapacity(maximumWireMessageBytes: maximumWireMessageBytes) else {
+            throw QVACError.invalidArgument(
+                "maximumWireMessageBytes exceeds the transport buffering capacity"
+            )
+        }
 
         let initialTransport: BareTransport
         let reconnectFactory: Configuration.TransportFactory?
@@ -412,7 +702,7 @@ public actor QVACClient {
                 do {
                     return try await UnixDomainSocketTransport.connect(
                         cfg,
-                        maximumInboundBufferedBytes: maximumWireMessageBytes + 4
+                        maximumInboundBufferedBytes: maximumInboundBufferedBytes
                     )
                 } catch let error as UnixDomainSocketTransport.SpawnError {
                     throw QVACError.transport(reason: error.description, underlying: error)
@@ -433,7 +723,7 @@ public actor QVACClient {
                 do {
                     return try BareIPCTransport.connect(
                         cfg,
-                        maximumInboundBufferedBytes: maximumWireMessageBytes + 4
+                        maximumInboundBufferedBytes: maximumInboundBufferedBytes
                     )
                 } catch let error as BareIPCTransport.Error {
                     throw QVACError.transport(reason: error.description, underlying: error)
@@ -479,7 +769,8 @@ public actor QVACClient {
                 on: self.rpc,
                 config: config,
                 runtimeContext: runtimeContext,
-                timeout: initHandshakeTimeout
+                timeout: initHandshakeTimeout,
+                maximumOutboundPayloadBytes: outboundLimit
             )
             log.log(.info, "QVACClient init: handshake OK, client ready")
             self.initialized = true
@@ -594,7 +885,8 @@ public actor QVACClient {
     func sendTyped<Response: Decodable & Sendable>(
         _ request: QVACRequest,
         decoding _: Response.Type = Response.self,
-        rpcOptions: QVACRPCOptions = .init()
+        rpcOptions: QVACRPCOptions = .init(),
+        maximumResponseBytes: Int? = nil
     ) async throws -> Response {
         let timeout = try Self.validatedRPCOptions(rpcOptions)
         let payload = try encode(request, rpcOptions: rpcOptions)
@@ -604,14 +896,165 @@ public actor QVACClient {
         let rpc = try await rpcForNewRequest()
         let respData: Data?
         do {
-            respData = try await rpc.send(command: nextCommand(), data: payload, timeout: timeout)
+            respData = try await rpc.send(
+                command: nextCommand(),
+                data: payload,
+                timeout: timeout,
+                maximumResponseBytes: maximumResponseBytes
+            )
         } catch {
             throw Self.publicRPCError(error, operation: request.discriminator)
         }
         guard let data = respData else {
             throw QVACError.protocolViolation("empty reply")
         }
+        if let maximumResponseBytes, data.count > maximumResponseBytes {
+            throw QVACError.resourceLimitExceeded(
+                operation: request.discriminator,
+                resource: "response bytes",
+                maximumBytes: maximumResponseBytes,
+                attemptedBytes: data.count
+            )
+        }
         return try decodeOrThrow(Response.self, from: data)
+    }
+
+    /// Reject binary convenience inputs that cannot possibly fit in this
+    /// client's wire ceiling. This lower-bound preflight deliberately runs
+    /// before base64 or JSON allocation; exact encoded size remains enforced by
+    /// `BareRPCCodec` after request construction.
+    func validateBase64InputSizes<RawByteCounts: Sequence>(
+        _ rawByteCounts: RawByteCounts,
+        appending additionalRawByteCount: Int? = nil,
+        operation: String
+    ) throws where RawByteCounts.Element == Int {
+        var rawAggregate = 0
+        var encodedLowerBound = 0
+        var itemCount = 0
+
+        func accountForInput(_ rawByteCount: Int) throws {
+            let (nextItemCount, itemCountOverflow) = itemCount.addingReportingOverflow(1)
+            guard !itemCountOverflow, nextItemCount <= maximumInlineBinaryItems else {
+                throw QVACError.invalidArgument(
+                    "\(operation) has more than maximumInlineBinaryItems "
+                        + "\(maximumInlineBinaryItems) binary inputs"
+                )
+            }
+            itemCount = nextItemCount
+            guard rawByteCount >= 0 else {
+                throw QVACError.invalidArgument(
+                    "\(operation) binary input size must not be negative"
+                )
+            }
+            let (nextRawAggregate, rawOverflow) = rawAggregate.addingReportingOverflow(
+                rawByteCount
+            )
+            guard !rawOverflow else {
+                throw QVACError.invalidArgument(
+                    "\(operation) aggregate raw binary input size arithmetic overflowed"
+                )
+            }
+            rawAggregate = nextRawAggregate
+            guard let encodedByteCount = qvacBase64EncodedByteCount(rawByteCount) else {
+                throw QVACError.invalidArgument(
+                    "\(operation) binary input size arithmetic overflowed"
+                )
+            }
+            let (next, overflow) = encodedLowerBound.addingReportingOverflow(encodedByteCount)
+            guard !overflow else {
+                throw QVACError.invalidArgument(
+                    "\(operation) aggregate binary input size arithmetic overflowed"
+                )
+            }
+            encodedLowerBound = next
+        }
+        for rawByteCount in rawByteCounts {
+            try accountForInput(rawByteCount)
+        }
+        if let additionalRawByteCount {
+            try accountForInput(additionalRawByteCount)
+        }
+        guard rawAggregate <= maximumInlineBinaryBytes else {
+            throw QVACError.invalidArgument(
+                "\(operation) binary inputs total \(rawAggregate) raw bytes, exceeding "
+                    + "maximumInlineBinaryBytes \(maximumInlineBinaryBytes)"
+            )
+        }
+        guard let baseEncodedBudget = qvacBase64EncodedByteCount(maximumInlineBinaryBytes) else {
+            throw QVACError.invalidArgument(
+                "\(operation) inline binary budget cannot be represented as base64"
+            )
+        }
+        // Encoding values separately can add up to four bytes of padding per
+        // segment compared with encoding the same aggregate as one value.
+        let (segmentationAllowance, segmentationOverflow) = itemCount
+            .multipliedReportingOverflow(by: 4)
+        guard !segmentationOverflow else {
+            throw QVACError.invalidArgument(
+                "\(operation) inline binary item overhead arithmetic overflowed"
+            )
+        }
+        let (encodedBudgetWithPadding, paddingOverflow) = baseEncodedBudget
+            .addingReportingOverflow(segmentationAllowance)
+        guard !paddingOverflow else {
+            throw QVACError.invalidArgument(
+                "\(operation) encoded inline binary budget arithmetic overflowed"
+            )
+        }
+        guard encodedLowerBound <= encodedBudgetWithPadding else {
+            throw QVACError.invalidArgument(
+                "\(operation) binary inputs require \(encodedLowerBound) base64 bytes, "
+                    + "exceeding the safe encoded-input budget \(encodedBudgetWithPadding)"
+            )
+        }
+        let (jsonStructuralBytes, structuralOverflow) = itemCount
+            .multipliedReportingOverflow(by: Self.inlineBinaryJSONStructuralBytesPerItem)
+        let (outboundLowerBound, outboundOverflow) = encodedLowerBound
+            .addingReportingOverflow(jsonStructuralBytes)
+        guard !structuralOverflow, !outboundOverflow else {
+            throw QVACError.invalidArgument(
+                "\(operation) inline binary JSON structure arithmetic overflowed"
+            )
+        }
+        // A request containing base64 text necessarily has non-base64 JSON and
+        // bare-rpc framing bytes, so equality is already guaranteed not to fit.
+        guard outboundLowerBound < maximumOutboundPayloadBytes else {
+            throw QVACError.invalidArgument(
+                "\(operation) binary inputs require at least \(outboundLowerBound) "
+                    + "base64 and JSON-structure bytes, exceeding maximumOutboundPayloadBytes "
+                    + "\(maximumOutboundPayloadBytes)"
+            )
+        }
+    }
+
+    func validateInlineBinaryItemCount(_ itemCount: Int, operation: String) throws {
+        guard itemCount >= 0, itemCount <= maximumInlineBinaryItems else {
+            throw QVACError.invalidArgument(
+                "\(operation) has more than maximumInlineBinaryItems "
+                    + "\(maximumInlineBinaryItems) binary inputs"
+            )
+        }
+    }
+
+    /// Create independent checked accounting for one high-level aggregate.
+    func makeResultByteBudget(
+        operation: String,
+        resource: String = "accumulated result bytes"
+    ) -> QVACResultByteBudget {
+        QVACResultByteBudget(
+            operation: operation,
+            resource: resource,
+            maximumBytes: maximumAccumulatedResultBytes
+        )
+    }
+
+    func validateOutboundPayloadSize(_ byteCount: Int, operation: String) throws {
+        guard byteCount <= maximumOutboundPayloadBytes else {
+            throw QVACError.invalidArgument(
+                "\(operation) outbound payload is \(byteCount) bytes; "
+                    + "maximumOutboundPayloadBytes is \(maximumOutboundPayloadBytes)"
+            )
+        }
     }
 
     /// Send `request`, stream NDJSON chunks back, and decode each line into `Response`.
@@ -664,6 +1107,7 @@ public actor QVACClient {
                 raw: raw,
                 operation: request.discriminator,
                 maximumRecordBytes: maximumWireMessageBytes,
+                maximumOutboundPayloadBytes: maximumOutboundPayloadBytes,
                 profilingMetadataHandler: profilingMetadataHandler
             )
         } catch {
@@ -675,7 +1119,12 @@ public actor QVACClient {
     private func encode(_ request: QVACRequest, rpcOptions: QVACRPCOptions) throws -> Data {
         do {
             let payload = try JSONEncoder.qvac.encode(request)
-            return try Self.applyingProfilingOptions(rpcOptions.profiling, to: payload)
+            try validateOutboundPayloadSize(payload.count, operation: request.discriminator)
+            let profiled = try Self.applyingProfilingOptions(rpcOptions.profiling, to: payload)
+            try validateOutboundPayloadSize(profiled.count, operation: request.discriminator)
+            return profiled
+        } catch let error as QVACError {
+            throw error
         } catch {
             throw QVACError.encoding("could not encode request: \(error)")
         }
@@ -916,6 +1365,14 @@ public actor QVACClient {
                 attemptedBytes: overflow.attemptedBufferedBytes
             )
         }
+        if let overflow = error as? BareRPCResponsePayloadLimitExceeded {
+            return QVACError.resourceLimitExceeded(
+                operation: operation,
+                resource: "response bytes",
+                maximumBytes: overflow.maximumBytes,
+                attemptedBytes: overflow.attemptedBytes
+            )
+        }
         if let invalid = error as? BareRPCInvalidArgument {
             return QVACError.invalidArgument(invalid.reason)
         }
@@ -993,6 +1450,7 @@ public actor QVACClient {
             if nextReconnectAttemptID == 0 { nextReconnectAttemptID = 1 }
 
             let maximumWireMessageBytes = self.maximumWireMessageBytes
+            let maximumOutboundPayloadBytes = self.maximumOutboundPayloadBytes
             let maximumBufferedStreamBytes = self.maximumBufferedStreamBytes
             let runtimeContext = self.runtimeContext
             let workerConfig = self.workerConfig
@@ -1016,6 +1474,7 @@ public actor QVACClient {
                     config: workerConfig,
                     initHandshakeTimeout: initHandshakeTimeout,
                     maximumWireMessageBytes: maximumWireMessageBytes,
+                    maximumOutboundPayloadBytes: maximumOutboundPayloadBytes,
                     maximumBufferedStreamBytes: maximumBufferedStreamBytes,
                     logger: logger
                 )
@@ -1103,6 +1562,7 @@ public actor QVACClient {
         config: JSONValue?,
         initHandshakeTimeout: Duration,
         maximumWireMessageBytes: Int,
+        maximumOutboundPayloadBytes: Int,
         maximumBufferedStreamBytes: Int,
         logger: BareRPCLogger?
     ) async throws -> RPCConnection {
@@ -1119,7 +1579,8 @@ public actor QVACClient {
                 on: rpc,
                 config: config,
                 runtimeContext: runtimeContext,
-                timeout: initHandshakeTimeout
+                timeout: initHandshakeTimeout,
+                maximumOutboundPayloadBytes: maximumOutboundPayloadBytes
             )
             try Task.checkCancellation()
             return RPCConnection(transport: transport, rpc: rpc)
@@ -1161,6 +1622,31 @@ public actor QVACClient {
             return QVACError.transport(reason: message)
         }
         return publicRPCError(error, operation: "__init_config")
+    }
+
+    /// Exercises the exact replacement-connection construction path without
+    /// requiring a preceding transport failure. This keeps reconnect handshake
+    /// preflight tests deterministic and avoids mutating live client state.
+    static func __testMakeReplacementConnection(
+        transport: BareTransport,
+        runtimeContext: QVACRuntimeContext? = nil,
+        config: JSONValue? = nil,
+        initHandshakeTimeout: Duration = .seconds(1),
+        maximumWireMessageBytes: Int = QVACClient.defaultMaximumWireMessageBytes,
+        maximumOutboundPayloadBytes: Int = QVACClient.defaultMaximumOutboundPayloadBytes,
+        maximumBufferedStreamBytes: Int = QVACClient.defaultMaximumWireMessageBytes
+    ) async throws {
+        let connection = try await makeConnection(
+            transportFactory: { transport },
+            runtimeContext: runtimeContext,
+            config: config,
+            initHandshakeTimeout: initHandshakeTimeout,
+            maximumWireMessageBytes: maximumWireMessageBytes,
+            maximumOutboundPayloadBytes: maximumOutboundPayloadBytes,
+            maximumBufferedStreamBytes: maximumBufferedStreamBytes,
+            logger: nil
+        )
+        await connection.rpc.close()
     }
 
     /// Internal observability for deterministic lifecycle tests.
@@ -1373,7 +1859,7 @@ private actor QVACTypedStreamDriver<Response: Sendable & Decodable> {
                     if reachedEOF { return nil }
 
                     if let chunk = try await iterator.next() {
-                        decoder.receive(chunk)
+                        try decoder.receive(chunk)
                     } else {
                         reachedEOF = true
                     }
@@ -1392,17 +1878,30 @@ private actor QVACTypedStreamDriver<Response: Sendable & Decodable> {
     /// matching the profiling semantics of union-backed rich stream adapters.
     private func drainConcreteStreamAfterTerminalError() async throws {
         let timeout = terminalDrainTimeout
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { try await self.consumeConcreteTerminalTail() }
+        let raw = self.raw
+        try await withThrowingTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                try await self.consumeConcreteTerminalTail()
+                return true
+            }
             group.addTask {
                 try await Task.sleep(for: timeout)
-                throw BareRPCRequestTimeout(timeout: timeout)
+                return false
             }
             defer { group.cancelAll() }
-            guard try await group.next() != nil else {
+            guard let drained = try await group.next() else {
                 throw QVACError.protocolViolation(
                     "terminal response drain had no active task"
                 )
+            }
+            guard drained else {
+                // A task-group scope awaits all children before it can unwind. End the
+                // raw RPC before throwing so the pending iterator and remote peer both
+                // observe deterministic fail-closed teardown. The channel's cancellation
+                // gate keeps repeated outer cleanup idempotent and emits at most one
+                // remote destroy frame.
+                raw.destroy()
+                throw BareRPCRequestTimeout(timeout: timeout)
             }
         }
     }
@@ -1425,7 +1924,7 @@ private actor QVACTypedStreamDriver<Response: Sendable & Decodable> {
             if reachedEOF { return }
 
             if let chunk = try await iterator.next() {
-                decoder.receive(chunk)
+                try decoder.receive(chunk)
             } else {
                 reachedEOF = true
             }
@@ -1445,6 +1944,7 @@ public final class QVACDuplexSession<Response: Sendable & Decodable>: @unchecked
     private let raw: BareRPCDuplexSession
     private let operation: String
     private let maximumRecordBytes: Int
+    private let maximumOutboundPayloadBytes: Int
     private let profilingMetadataHandler: (@Sendable (QVACProfilingMetadata) -> Void)?
     private var consumed = false
     private let lock = NSLock()
@@ -1453,17 +1953,25 @@ public final class QVACDuplexSession<Response: Sendable & Decodable>: @unchecked
         raw: BareRPCDuplexSession,
         operation: String,
         maximumRecordBytes: Int = QVACClient.defaultMaximumWireMessageBytes,
+        maximumOutboundPayloadBytes: Int = QVACClient.defaultMaximumOutboundPayloadBytes,
         profilingMetadataHandler: (@Sendable (QVACProfilingMetadata) -> Void)? = nil
     ) {
         self.raw = raw
         self.operation = operation
         self.maximumRecordBytes = maximumRecordBytes
+        self.maximumOutboundPayloadBytes = maximumOutboundPayloadBytes
         self.profilingMetadataHandler = profilingMetadataHandler
     }
 
     /// Write a chunk of arbitrary binary data to the server. For audio APIs this is
     /// raw PCM/Opus/wav bytes.
     public func write(_ chunk: Data) async throws {
+        guard chunk.count <= maximumOutboundPayloadBytes else {
+            throw QVACError.invalidArgument(
+                "\(operation) outbound chunk is \(chunk.count) bytes; "
+                    + "maximumOutboundPayloadBytes is \(maximumOutboundPayloadBytes)"
+            )
+        }
         do {
             try await raw.write(chunk)
         } catch {

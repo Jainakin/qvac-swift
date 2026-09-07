@@ -1,0 +1,352 @@
+{
+  "schemaVersion": 1,
+  "test": {
+    "module": "QVACClientUnitTests",
+    "product": "QVACClientPackageTests",
+    "expectedCount": 620,
+    "inventoryPath": "tools/ci/unit-test-inventory.txt",
+    "inventorySHA256": "a251633a8f990fb260dcd283a3dbed2fae389047049129f55832680030cede64"
+  },
+  "scope": {
+    "sourceRoot": "Sources/QVACClient",
+    "generatedFiles": [
+      "Sources/QVACClient/Generated/QVACErrorCodes.generated.swift",
+      "Sources/QVACClient/Generated/QVACModelTypeContract.generated.swift",
+      "Sources/QVACClient/Generated/QVACSDKContract.generated.swift",
+      "Sources/QVACClient/Generated/QVACTypes.generated.swift"
+    ],
+    "platformExclusions": [
+      {
+        "path": "Sources/QVACClient/Internal/Transport/BareIPCTransport.swift",
+        "reason": "iOS-only BareKit transport; it is not compiled into the macOS test product"
+      }
+    ]
+  },
+  "gate": {
+    "handwritten": {
+      "lines": {
+        "minimumPercentBasisPoints": 9500,
+        "minimumCovered": 14000,
+        "minimumTotal": 14500,
+        "maximumUncovered": 750
+      },
+      "functions": {
+        "minimumPercentBasisPoints": 9200,
+        "minimumCovered": 1250,
+        "minimumTotal": 1330,
+        "maximumUncovered": 120
+      },
+      "regions": {
+        "minimumPercentBasisPoints": 8900,
+        "minimumCovered": 4200,
+        "minimumTotal": 4650,
+        "maximumUncovered": 570
+      },
+      "perFileMinimumPercentBasisPoints": {
+        "lines": 9000,
+        "functions": 6000,
+        "regions": 8000
+      }
+    },
+    "generated": {
+      "lines": {
+        "minimumPercentBasisPoints": 8500,
+        "minimumCovered": 3350,
+        "minimumTotal": 3900,
+        "maximumUncovered": 600
+      },
+      "functions": {
+        "minimumPercentBasisPoints": 9800,
+        "minimumCovered": 320,
+        "minimumTotal": 320,
+        "maximumUncovered": 10
+      },
+      "regions": {
+        "minimumPercentBasisPoints": 8400,
+        "minimumCovered": 1850,
+        "minimumTotal": 2200,
+        "maximumUncovered": 350
+      },
+      "perFileMinimumPercentBasisPoints": {
+        "lines": 8000,
+        "functions": 9500,
+        "regions": 500
+      }
+    },
+    "criticalFiles": [
+      {
+        "path": "Sources/QVACClient/Internal/BareRPC/BareRPCClient.swift",
+        "lines": {
+          "minimumPercentBasisPoints": 9500,
+          "minimumCovered": 1450,
+          "minimumTotal": 1470,
+          "maximumUncovered": 75
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 9400,
+          "minimumCovered": 168,
+          "minimumTotal": 170,
+          "maximumUncovered": 12
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 9000,
+          "minimumCovered": 470,
+          "minimumTotal": 490,
+          "maximumUncovered": 60
+        }
+      },
+      {
+        "path": "Sources/QVACClient/Internal/BareRPC/BareRPCWire.swift",
+        "lines": {
+          "minimumPercentBasisPoints": 9300,
+          "minimumCovered": 370,
+          "minimumTotal": 385,
+          "maximumUncovered": 35
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 9000,
+          "minimumCovered": 39,
+          "minimumTotal": 40,
+          "maximumUncovered": 6
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 8800,
+          "minimumCovered": 165,
+          "minimumTotal": 175,
+          "maximumUncovered": 30
+        }
+      },
+      {
+        "path": "Sources/QVACClient/Internal/BareRPC/Handshake.swift",
+        "lines": {
+          "minimumPercentBasisPoints": 9300,
+          "minimumCovered": 64,
+          "minimumTotal": 65,
+          "maximumUncovered": 10
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 8000,
+          "minimumCovered": 8,
+          "minimumTotal": 9,
+          "maximumUncovered": 3
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 9000,
+          "minimumCovered": 42,
+          "minimumTotal": 44,
+          "maximumUncovered": 10
+        }
+      },
+      {
+        "path": "Sources/QVACClient/Internal/CheckedWireSize.swift",
+        "lines": {
+          "minimumPercentBasisPoints": 9000,
+          "minimumCovered": 9,
+          "minimumTotal": 9,
+          "maximumUncovered": 3
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 9000,
+          "minimumCovered": 1,
+          "minimumTotal": 1,
+          "maximumUncovered": 1
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 8000,
+          "minimumCovered": 6,
+          "minimumTotal": 7,
+          "maximumUncovered": 3
+        }
+      },
+      {
+        "path": "Sources/QVACClient/Internal/CompactEncoding/CompactEncoding.swift",
+        "lines": {
+          "minimumPercentBasisPoints": 9500,
+          "minimumCovered": 350,
+          "minimumTotal": 360,
+          "maximumUncovered": 20
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 9500,
+          "minimumCovered": 84,
+          "minimumTotal": 86,
+          "maximumUncovered": 8
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 9000,
+          "minimumCovered": 175,
+          "minimumTotal": 185,
+          "maximumUncovered": 25
+        }
+      },
+      {
+        "path": "Sources/QVACClient/Internal/MediaRequestValidation.swift",
+        "lines": {
+          "minimumPercentBasisPoints": 9500,
+          "minimumCovered": 260,
+          "minimumTotal": 265,
+          "maximumUncovered": 15
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 9500,
+          "minimumCovered": 20,
+          "minimumTotal": 20,
+          "maximumUncovered": 2
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 9500,
+          "minimumCovered": 145,
+          "minimumTotal": 148,
+          "maximumUncovered": 12
+        }
+      },
+      {
+        "path": "Sources/QVACClient/Internal/QVACNDJSONDecoder.swift",
+        "lines": {
+          "minimumPercentBasisPoints": 9300,
+          "minimumCovered": 165,
+          "minimumTotal": 170,
+          "maximumUncovered": 15
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 9000,
+          "minimumCovered": 21,
+          "minimumTotal": 22,
+          "maximumUncovered": 4
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 9000,
+          "minimumCovered": 80,
+          "minimumTotal": 85,
+          "maximumUncovered": 12
+        }
+      },
+      {
+        "path": "Sources/QVACClient/Internal/QVACPullMappedStream.swift",
+        "lines": {
+          "minimumPercentBasisPoints": 9400,
+          "minimumCovered": 275,
+          "minimumTotal": 285,
+          "maximumUncovered": 20
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 9500,
+          "minimumCovered": 25,
+          "minimumTotal": 26,
+          "maximumUncovered": 4
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 9000,
+          "minimumCovered": 83,
+          "minimumTotal": 88,
+          "maximumUncovered": 15
+        }
+      },
+      {
+        "path": "Sources/QVACClient/Internal/QVACResultByteBudget.swift",
+        "lines": {
+          "minimumPercentBasisPoints": 9300,
+          "minimumCovered": 92,
+          "minimumTotal": 95,
+          "maximumUncovered": 12
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 9500,
+          "minimumCovered": 13,
+          "minimumTotal": 14,
+          "maximumUncovered": 3
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 8500,
+          "minimumCovered": 47,
+          "minimumTotal": 52,
+          "maximumUncovered": 10
+        }
+      },
+      {
+        "path": "Sources/QVACClient/Internal/Transport/BareTransport.swift",
+        "lines": {
+          "minimumPercentBasisPoints": 9400,
+          "minimumCovered": 260,
+          "minimumTotal": 265,
+          "maximumUncovered": 18
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 9000,
+          "minimumCovered": 24,
+          "minimumTotal": 25,
+          "maximumUncovered": 5
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 8600,
+          "minimumCovered": 70,
+          "minimumTotal": 76,
+          "maximumUncovered": 15
+        }
+      },
+      {
+        "path": "Sources/QVACClient/Internal/Transport/UnixDomainSocketTransport.swift",
+        "lines": {
+          "minimumPercentBasisPoints": 9100,
+          "minimumCovered": 1190,
+          "minimumTotal": 1250,
+          "maximumUncovered": 130
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 9200,
+          "minimumCovered": 108,
+          "minimumTotal": 112,
+          "maximumUncovered": 15
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 8200,
+          "minimumCovered": 290,
+          "minimumTotal": 345,
+          "maximumUncovered": 70
+        }
+      },
+      {
+        "path": "Sources/QVACClient/Public/QVACBufferedStream.swift",
+        "lines": {
+          "minimumPercentBasisPoints": 9300,
+          "minimumCovered": 590,
+          "minimumTotal": 610,
+          "maximumUncovered": 45
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 9500,
+          "minimumCovered": 66,
+          "minimumTotal": 68,
+          "maximumUncovered": 6
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 8800,
+          "minimumCovered": 175,
+          "minimumTotal": 188,
+          "maximumUncovered": 30
+        }
+      },
+      {
+        "path": "Sources/QVACClient/Public/QVACClient.swift",
+        "lines": {
+          "minimumPercentBasisPoints": 9100,
+          "minimumCovered": 1500,
+          "minimumTotal": 1580,
+          "maximumUncovered": 140
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 9000,
+          "minimumCovered": 140,
+          "minimumTotal": 150,
+          "maximumUncovered": 20
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 8600,
+          "minimumCovered": 470,
+          "minimumTotal": 530,
+          "maximumUncovered": 80
+        }
+      }
+    ]
+  }
+}

@@ -15,6 +15,9 @@ public extension QVACClient {
     // MARK: - Domain types
 
     /// Chunking controls accepted by QVAC SDK 0.17.
+    ///
+    /// The SDK schema permits fractional and nonpositive numeric controls, but
+    /// requires every supplied number to be finite.
     struct RagChunkOptions: Sendable, Equatable {
         public enum ChunkStrategy: String, Sendable {
             case character
@@ -70,6 +73,7 @@ public extension QVACClient {
     }
 
     /// A pre-embedded document accepted by `ragSaveEmbeddings`.
+    /// Every embedding component must be finite.
     struct RagEmbeddedDocument: Sendable, Equatable {
         public let id: String
         public let content: String
@@ -158,6 +162,7 @@ public extension QVACClient {
     // MARK: - 1) ragIngest — chunk + embed + save (full pipeline)
 
     /// Ingest documents end-to-end: chunk them, embed each chunk, save to the workspace.
+    /// When supplied, `progressInterval` must be finite and greater than zero.
     @discardableResult
     func ragIngest(
         modelId: String,
@@ -169,6 +174,8 @@ public extension QVACClient {
         progressInterval: Double? = nil,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> RagOperationRun<RagIngestResult> {
+        try Self.validateRagChunkOptions(chunkOpts, operation: "rag ingest")
+        try Self.validateRagProgressInterval(progressInterval, operation: "rag ingest")
         var req = RagRequest(operation: "ingest")
         req.modelId = modelId
         req.documents = .array(documents.map(JSONValue.string))
@@ -194,6 +201,7 @@ public extension QVACClient {
     }
 
     /// Scalar-document spelling accepted by the 0.17 RAG wire schema.
+    /// When supplied, `progressInterval` must be finite and greater than zero.
     @discardableResult
     func ragIngest(
         modelId: String,
@@ -205,6 +213,8 @@ public extension QVACClient {
         progressInterval: Double? = nil,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> RagOperationRun<RagIngestResult> {
+        try Self.validateRagChunkOptions(chunkOpts, operation: "rag ingest")
+        try Self.validateRagProgressInterval(progressInterval, operation: "rag ingest")
         var req = RagRequest(operation: "ingest")
         req.modelId = modelId
         req.documents = .string(documents)
@@ -277,6 +287,7 @@ public extension QVACClient {
         chunkOpts: RagChunkOptions? = nil,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> [RagChunk] {
+        try Self.validateRagChunkOptions(chunkOpts, operation: "rag chunk")
         var req = RagRequest(operation: "chunk")
         req.documents = .array(documents.map(JSONValue.string))
         req.chunkOpts = chunkOpts?.wireValue
@@ -294,6 +305,7 @@ public extension QVACClient {
         chunkOpts: RagChunkOptions? = nil,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> [RagChunk] {
+        try Self.validateRagChunkOptions(chunkOpts, operation: "rag chunk")
         var req = RagRequest(operation: "chunk")
         req.documents = .string(documents)
         req.chunkOpts = chunkOpts?.wireValue
@@ -308,7 +320,8 @@ public extension QVACClient {
     // MARK: - 4) ragSaveEmbeddings — save pre-embedded docs (skip chunk + embed steps)
 
     /// Save documents that you've already embedded externally (e.g. you ran `embed` yourself
-    /// and want to persist the vectors).
+    /// and want to persist the vectors). Embedding components must be finite. When supplied,
+    /// `progressInterval` must also be finite and greater than zero.
     @discardableResult
     func ragSaveEmbeddings(
         documents: [RagEmbeddedDocument],
@@ -318,6 +331,11 @@ public extension QVACClient {
         progressInterval: Double? = nil,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> RagOperationRun<[RagSaveResult]> {
+        try Self.validateRagEmbeddedDocuments(documents)
+        try Self.validateRagProgressInterval(
+            progressInterval,
+            operation: "rag saveEmbeddings"
+        )
         var req = RagRequest(operation: "saveEmbeddings")
         req.documents = .array(documents.map(\.wireValue))
         req.modelId = modelId
@@ -422,6 +440,48 @@ public extension QVACClient {
     }
 
     // MARK: - Internal
+
+    private static func validateRagChunkOptions(
+        _ options: RagChunkOptions?,
+        operation: String
+    ) throws {
+        if let chunkSize = options?.chunkSize, !chunkSize.isFinite {
+            throw QVACError.invalidArgument(
+                "\(operation) chunkOpts.chunkSize must be a finite number"
+            )
+        }
+        if let chunkOverlap = options?.chunkOverlap, !chunkOverlap.isFinite {
+            throw QVACError.invalidArgument(
+                "\(operation) chunkOpts.chunkOverlap must be a finite number"
+            )
+        }
+    }
+
+    private static func validateRagProgressInterval(
+        _ progressInterval: Double?,
+        operation: String
+    ) throws {
+        if let progressInterval,
+           !progressInterval.isFinite || progressInterval <= 0 {
+            throw QVACError.invalidArgument(
+                "\(operation) progressInterval must be a finite positive number"
+            )
+        }
+    }
+
+    private static func validateRagEmbeddedDocuments(
+        _ documents: [RagEmbeddedDocument]
+    ) throws {
+        for (documentIndex, document) in documents.enumerated() {
+            for (embeddingIndex, value) in document.embedding.enumerated()
+            where !value.isFinite {
+                throw QVACError.invalidArgument(
+                    "rag saveEmbeddings documents[\(documentIndex)].embedding"
+                        + "[\(embeddingIndex)] must be a finite number"
+                )
+            }
+        }
+    }
 
     private func makeRagRun<Output: Sendable>(
         _ input: RagRequest,
@@ -549,7 +609,7 @@ public extension QVACClient {
                 "rag response operation \(response.operation) ≠ \(op)"
             )
         }
-        guard response.success == true else {
+        guard response.error == nil, response.success == true else {
             let code: QVACErrorCode
             switch op {
             case "chunk": code = .ragChunkFailed
@@ -613,9 +673,27 @@ public extension QVACClient {
             )
         }
         let id: String?
-        if case .string(let value) = object["id"] { id = value } else { id = nil }
+        if let rawId = object["id"] {
+            guard case .string(let value) = rawId else {
+                throw QVACError.protocolViolation(
+                    "rag save result id must be a string when present"
+                )
+            }
+            id = value
+        } else {
+            id = nil
+        }
         let error: String?
-        if case .string(let value) = object["error"] { error = value } else { error = nil }
+        if let rawError = object["error"] {
+            guard case .string(let value) = rawError else {
+                throw QVACError.protocolViolation(
+                    "rag save result error must be a string when present"
+                )
+            }
+            error = value
+        } else {
+            error = nil
+        }
         return RagSaveResult(status: status, id: id, error: error)
     }
 
@@ -626,7 +704,16 @@ public extension QVACClient {
             throw QVACError.protocolViolation("rag reindex result must contain reindexed")
         }
         let details: [String: JSONValue]?
-        if case .object(let value) = object["details"] { details = value } else { details = nil }
+        if let rawDetails = object["details"] {
+            guard case .object(let value) = rawDetails else {
+                throw QVACError.protocolViolation(
+                    "rag reindex result details must be an object when present"
+                )
+            }
+            details = value
+        } else {
+            details = nil
+        }
         return RagReindexResult(reindexed: reindexed, details: details)
     }
 

@@ -81,9 +81,27 @@ struct BareRPCError: Error, Equatable, Sendable, CustomStringConvertible {
     var description: String { "\(code) \(message) (errno=\(errno))" }
 }
 
+/// A syntactically valid response field declared more bytes than the operation
+/// elected to retain. This is an operation-local resource failure, not a framing
+/// failure: the decoder validates and skips the complete field so unrelated
+/// multiplexed requests can continue on the same connection.
+struct BareRPCResponsePayloadLimitExceeded: Error, Equatable, Sendable {
+    let maximumBytes: Int
+    let attemptedBytes: Int
+
+    init(maximumBytes: Int, attemptedBytes: Int) {
+        self.maximumBytes = maximumBytes
+        self.attemptedBytes = attemptedBytes
+    }
+}
+
 enum BareRPCCodecError: Error, Equatable, Sendable {
     case truncated
     case unknownType(UInt64)
+    /// A frame declared more body bytes than its selected wire shape consumed.
+    /// Accepting the suffix would make malformed or conflicting flag combinations
+    /// appear valid while silently discarding peer-controlled bytes.
+    case trailingBytes(Int)
     /// The length prefix on an incoming frame exceeds `BareRPCFrameReader.maxFrameSize`.
     /// Likely a malformed worker or a hostile peer attempting a DoS via oversize frames.
     case frameTooLarge(declared: UInt32, max: Int)
@@ -94,12 +112,40 @@ enum BareRPCCodecError: Error, Equatable, Sendable {
 enum BareRPCFrame: Sendable, Equatable {
     case request(id: UInt64, command: UInt64, stream: BareRPCStreamFlags, data: Data?)
     case response(id: UInt64, stream: BareRPCStreamFlags, payload: BareRPCResponsePayload)
+    /// A unary RESPONSE whose data field was deliberately not copied because it
+    /// exceeded the retaining request's operation-specific response ceiling.
+    case responsePayloadLimitExceeded(
+        id: UInt64,
+        stream: BareRPCStreamFlags,
+        error: BareRPCResponsePayloadLimitExceeded
+    )
+    /// An ERROR payload was structurally validated but not materialized because
+    /// its aggregate message/code UTF-8 bytes exceeded the operation's ceiling,
+    /// or because its operation had already settled.
+    case errorPayloadLimitExceeded(
+        id: UInt64,
+        error: BareRPCResponsePayloadLimitExceeded
+    )
+    /// A STREAM(DATA) field was structurally validated and advanced over before
+    /// copying because its channel could not admit the retained value.
+    case streamPayloadLimitExceeded(
+        id: UInt64,
+        flags: BareRPCStreamFlags,
+        error: BareRPCStreamBufferOverflow
+    )
+    /// A STREAM(DATA) field for an unowned or already-terminal direction was
+    /// structurally validated and skipped without constructing a `Data` value.
+    case streamPayloadSkipped(id: UInt64, flags: BareRPCStreamFlags)
     case stream(id: UInt64, flags: BareRPCStreamFlags, payload: BareRPCStreamPayload)
 
     var id: UInt64 {
         switch self {
         case .request(let id, _, _, _),
              .response(let id, _, _),
+             .responsePayloadLimitExceeded(let id, _, _),
+             .errorPayloadLimitExceeded(let id, _),
+             .streamPayloadLimitExceeded(let id, _, _),
+             .streamPayloadSkipped(let id, _),
              .stream(let id, _, _):
             return id
         }
@@ -259,6 +305,15 @@ enum BareRPCCodec {
                 "outbound request payload is \(data.count) bytes; maximumWireMessageBytes is \(maximumBodyBytes)"
             )
         }
+        try validateBodyLengthBeforeAllocation(
+            requestBodyLength(
+                id: id,
+                command: command,
+                stream: stream,
+                data: data
+            ),
+            maximumBodyBytes: maximumBodyBytes
+        )
         return try prefixWithLength(
             encodeRequestBody(id: id, command: command, stream: stream, data: data),
             maximumBodyBytes: maximumBodyBytes
@@ -276,6 +331,10 @@ enum BareRPCCodec {
                 "outbound stream chunk is \(data.count) bytes; maximumWireMessageBytes is \(maximumBodyBytes)"
             )
         }
+        try validateBodyLengthBeforeAllocation(
+            streamBodyLength(id: id, flags: flags, payload: payload),
+            maximumBodyBytes: maximumBodyBytes
+        )
         return try prefixWithLength(
             encodeStreamBody(id: id, flags: flags, payload: payload),
             maximumBodyBytes: maximumBodyBytes
@@ -288,6 +347,10 @@ enum BareRPCCodec {
         payload: BareRPCResponsePayload,
         maximumBodyBytes: Int
     ) throws -> Data {
+        try validateBodyLengthBeforeAllocation(
+            responseBodyLength(id: id, stream: stream, payload: payload),
+            maximumBodyBytes: maximumBodyBytes
+        )
         return try prefixWithLength(
             encodeResponseBody(id: id, stream: stream, payload: payload),
             maximumBodyBytes: maximumBodyBytes
@@ -297,15 +360,42 @@ enum BareRPCCodec {
     // MARK: Decode
 
     /// Decode a complete frame body (everything after the uint32 LE length prefix).
-    static func decodeFrameBody(_ body: Data) throws -> BareRPCFrame {
+    static func decodeFrameBody(
+        _ body: Data,
+        maximumRetainedResponsePayloadBytes: (UInt64) -> Int = { _ in Int.max },
+        maximumRetainedErrorPayloadBytes: (UInt64) -> Int? = { _ in Int.max },
+        streamPayloadAdmission: (
+            UInt64,
+            BareRPCStreamFlags,
+            Int
+        ) -> BareRPCStreamPayloadAdmission = { _, _, _ in .retain },
+        payloadMaterializationObserver: ((Range<Int>) -> Void)? = nil
+    ) throws -> BareRPCFrame {
         var state = EncoderState(buffer: body)
-        return try decodeFrame(from: &state)
+        return try decodeFrame(
+            from: &state,
+            maximumRetainedResponsePayloadBytes: maximumRetainedResponsePayloadBytes,
+            maximumRetainedErrorPayloadBytes: maximumRetainedErrorPayloadBytes,
+            streamPayloadAdmission: streamPayloadAdmission,
+            payloadMaterializationObserver: payloadMaterializationObserver
+        )
     }
 
     /// Decode a body already resident in a larger receive buffer. Keeping the storage
     /// copy-on-write avoids duplicating an entire 0.17 video frame before extracting its
     /// payload.
-    static func decodeFrameBody(_ storage: Data, in range: Range<Int>) throws -> BareRPCFrame {
+    static func decodeFrameBody(
+        _ storage: Data,
+        in range: Range<Int>,
+        maximumRetainedResponsePayloadBytes: (UInt64) -> Int = { _ in Int.max },
+        maximumRetainedErrorPayloadBytes: (UInt64) -> Int? = { _ in Int.max },
+        streamPayloadAdmission: (
+            UInt64,
+            BareRPCStreamFlags,
+            Int
+        ) -> BareRPCStreamPayloadAdmission = { _, _, _ in .retain },
+        payloadMaterializationObserver: ((Range<Int>) -> Void)? = nil
+    ) throws -> BareRPCFrame {
         guard range.lowerBound >= storage.startIndex,
               range.upperBound <= storage.endIndex,
               range.lowerBound <= range.upperBound else {
@@ -314,53 +404,222 @@ enum BareRPCCodec {
         var state = EncoderState(buffer: storage)
         state.start = range.lowerBound
         state.end = range.upperBound
-        return try decodeFrame(from: &state)
+        return try decodeFrame(
+            from: &state,
+            maximumRetainedResponsePayloadBytes: maximumRetainedResponsePayloadBytes,
+            maximumRetainedErrorPayloadBytes: maximumRetainedErrorPayloadBytes,
+            streamPayloadAdmission: streamPayloadAdmission,
+            payloadMaterializationObserver: payloadMaterializationObserver
+        )
     }
 
-    private static func decodeFrame(from state: inout EncoderState) throws -> BareRPCFrame {
+    private static func decodeFrame(
+        from state: inout EncoderState,
+        maximumRetainedResponsePayloadBytes: (UInt64) -> Int,
+        maximumRetainedErrorPayloadBytes: (UInt64) -> Int?,
+        streamPayloadAdmission: (
+            UInt64,
+            BareRPCStreamFlags,
+            Int
+        ) -> BareRPCStreamPayloadAdmission,
+        payloadMaterializationObserver: ((Range<Int>) -> Void)?
+    ) throws -> BareRPCFrame {
         let type = try c.uint.decode(&state)
         let id = try c.uint.decode(&state)
+        let frame: BareRPCFrame
         switch type {
         case BareRPCMessageType.request.rawValue:
             let command = try c.uint.decode(&state)
             let streamRaw = try c.uint.decode(&state)
             let flags = BareRPCStreamFlags(rawValue: streamRaw)
             let data: Data? = streamRaw == 0 ? try readDataField(&state) : nil
-            return .request(id: id, command: command, stream: flags, data: data)
+            frame = .request(id: id, command: command, stream: flags, data: data)
 
         case BareRPCMessageType.response.rawValue:
             let hasError = try c.bool.decode(&state)
             let streamRaw = try c.uint.decode(&state)
             let flags = BareRPCStreamFlags(rawValue: streamRaw)
             if hasError {
-                let err = try readError(&state)
-                return .response(id: id, stream: flags, payload: .failure(err))
+                switch try readError(
+                    &state,
+                    maximumRetainedUTF8Bytes: maximumRetainedErrorPayloadBytes(id),
+                    payloadMaterializationObserver: payloadMaterializationObserver
+                ) {
+                case .retained(let error):
+                    frame = .response(id: id, stream: flags, payload: .failure(error))
+                case .notRetained(let error):
+                    frame = .errorPayloadLimitExceeded(id: id, error: error)
+                }
+            } else if streamRaw == 0 {
+                let maximumBytes = max(0, maximumRetainedResponsePayloadBytes(id))
+                switch try readResponseDataField(
+                    &state,
+                    maximumRetainedBytes: maximumBytes,
+                    payloadMaterializationObserver: payloadMaterializationObserver
+                ) {
+                case .retained(let data):
+                    frame = .response(id: id, stream: flags, payload: .success(data))
+                case .limitExceeded(let attemptedBytes):
+                    frame = .responsePayloadLimitExceeded(
+                        id: id,
+                        stream: flags,
+                        error: BareRPCResponsePayloadLimitExceeded(
+                            maximumBytes: maximumBytes,
+                            attemptedBytes: attemptedBytes
+                        )
+                    )
+                }
+            } else {
+                frame = .response(id: id, stream: flags, payload: .success(nil))
             }
-            if streamRaw == 0 {
-                let data = try readDataField(&state)
-                return .response(id: id, stream: flags, payload: .success(data))
-            }
-            return .response(id: id, stream: flags, payload: .success(nil))
 
         case BareRPCMessageType.stream.rawValue:
             let streamRaw = try c.uint.decode(&state)
             let flags = BareRPCStreamFlags(rawValue: streamRaw)
             if flags.contains(.error) {
-                let err = try readError(&state)
-                return .stream(id: id, flags: flags, payload: .error(err))
+                switch try readError(
+                    &state,
+                    maximumRetainedUTF8Bytes: maximumRetainedErrorPayloadBytes(id),
+                    payloadMaterializationObserver: payloadMaterializationObserver
+                ) {
+                case .retained(let error):
+                    frame = .stream(id: id, flags: flags, payload: .error(error))
+                case .notRetained(let error):
+                    frame = .errorPayloadLimitExceeded(id: id, error: error)
+                }
+            } else if flags.contains(.data) {
+                let payloadByteCount = try readDataFieldLength(&state)
+                switch streamPayloadAdmission(id, flags, payloadByteCount) {
+                case .retain:
+                    let data: Data
+                    if payloadByteCount == 0 {
+                        data = Data()
+                    } else {
+                        let range = state.start..<(state.start + payloadByteCount)
+                        payloadMaterializationObserver?(range)
+                        data = state.buffer.subdata(in: range)
+                    }
+                    state.start += payloadByteCount
+                    frame = .stream(id: id, flags: flags, payload: .data(data))
+                case .skip:
+                    state.start += payloadByteCount
+                    frame = .streamPayloadSkipped(id: id, flags: flags)
+                case .reject(let error):
+                    state.start += payloadByteCount
+                    frame = .streamPayloadLimitExceeded(
+                        id: id,
+                        flags: flags,
+                        error: error
+                    )
+                }
+            } else {
+                frame = .stream(id: id, flags: flags, payload: .control)
             }
-            if flags.contains(.data) {
-                let data = try readDataField(&state) ?? Data()
-                return .stream(id: id, flags: flags, payload: .data(data))
-            }
-            return .stream(id: id, flags: flags, payload: .control)
 
         default:
             throw BareRPCCodecError.unknownType(type)
         }
+        guard state.start == state.end else {
+            throw BareRPCCodecError.trailingBytes(state.end - state.start)
+        }
+        return frame
     }
 
     // MARK: Helpers
+
+    /// Calculate complete encoded body lengths without allocating the body or
+    /// copying its payload. Frame entry points apply the configured and UInt32
+    /// limits to these plans before their first frame-sized allocation.
+    private static func requestBodyLength(
+        id: UInt64,
+        command: UInt64,
+        stream: BareRPCStreamFlags,
+        data: Data?
+    ) -> Int {
+        var state = EncoderState()
+        c.uint.preencode(&state, BareRPCMessageType.request.rawValue)
+        c.uint.preencode(&state, id)
+        c.uint.preencode(&state, command)
+        c.uint.preencode(&state, stream.rawValue)
+        guard stream.rawValue == 0 else { return state.end }
+        let payloadCount = data?.count ?? 0
+        c.uint.preencode(&state, UInt64(payloadCount))
+        return saturatingBodyLength(headerBytes: state.end, payloadBytes: payloadCount)
+    }
+
+    private static func responseBodyLength(
+        id: UInt64,
+        stream: BareRPCStreamFlags,
+        payload: BareRPCResponsePayload
+    ) -> Int {
+        var state = EncoderState()
+        c.uint.preencode(&state, BareRPCMessageType.response.rawValue)
+        c.uint.preencode(&state, id)
+        switch payload {
+        case .failure(let error):
+            c.bool.preencode(&state, true)
+            c.uint.preencode(&state, stream.rawValue)
+            preencodeError(&state, error)
+            return state.end
+        case .success(let data):
+            c.bool.preencode(&state, false)
+            c.uint.preencode(&state, stream.rawValue)
+            guard stream.rawValue == 0 else { return state.end }
+            let payloadCount = data?.count ?? 0
+            c.uint.preencode(&state, UInt64(payloadCount))
+            return saturatingBodyLength(
+                headerBytes: state.end,
+                payloadBytes: payloadCount
+            )
+        }
+    }
+
+    private static func streamBodyLength(
+        id: UInt64,
+        flags: BareRPCStreamFlags,
+        payload: BareRPCStreamPayload
+    ) -> Int {
+        var state = EncoderState()
+        c.uint.preencode(&state, BareRPCMessageType.stream.rawValue)
+        c.uint.preencode(&state, id)
+        c.uint.preencode(&state, flags.rawValue)
+        switch payload {
+        case .error(let error):
+            preencodeError(&state, error)
+            return state.end
+        case .data(let data):
+            c.uint.preencode(&state, UInt64(data.count))
+            return saturatingBodyLength(
+                headerBytes: state.end,
+                payloadBytes: data.count
+            )
+        case .control:
+            return state.end
+        }
+    }
+
+    private static func saturatingBodyLength(
+        headerBytes: Int,
+        payloadBytes: Int
+    ) -> Int {
+        let (total, overflow) = headerBytes.addingReportingOverflow(payloadBytes)
+        return overflow ? Int.max : total
+    }
+
+    private static func validateBodyLengthBeforeAllocation(
+        _ bodyLength: Int,
+        maximumBodyBytes: Int
+    ) throws {
+        guard bodyLength <= maximumBodyBytes else {
+            throw BareRPCInvalidArgument(
+                "outbound bare-rpc frame is \(bodyLength) bytes; "
+                    + "maximumWireMessageBytes is \(maximumBodyBytes)"
+            )
+        }
+        guard bodyLength <= Int(UInt32.max) else {
+            throw BareRPCInvalidArgument("outbound bare-rpc frame exceeds the UInt32 wire capacity")
+        }
+    }
 
     private static func prefixWithValidatedLength(_ body: Data) -> Data {
         var out = Data(count: 4 + body.count)
@@ -405,14 +664,48 @@ enum BareRPCCodec {
     }
 
     private static func readDataField(_ state: inout EncoderState) throws -> Data? {
-        let encodedLength = try c.uint.decode(&state)
-        guard encodedLength <= UInt64(Int.max) else { throw BareRPCCodecError.truncated }
-        let len = Int(encodedLength)
+        let len = try readDataFieldLength(&state)
         if len == 0 { return nil }
-        guard state.end - state.start >= len else { throw BareRPCCodecError.truncated }
         let d = state.buffer.subdata(in: state.start..<(state.start + len))
         state.start += len
         return d
+    }
+
+    private enum RetainedResponseDataField {
+        case retained(Data?)
+        case limitExceeded(attemptedBytes: Int)
+    }
+
+    /// Decode and validate a unary RESPONSE data field while avoiding its
+    /// `Data.subdata` allocation when the retaining request already knows that
+    /// the field exceeds its operation-specific ceiling.
+    private static func readResponseDataField(
+        _ state: inout EncoderState,
+        maximumRetainedBytes: Int,
+        payloadMaterializationObserver: ((Range<Int>) -> Void)?
+    ) throws -> RetainedResponseDataField {
+        let len = try readDataFieldLength(&state)
+        guard len > maximumRetainedBytes else {
+            if len == 0 { return .retained(nil) }
+            let range = state.start..<(state.start + len)
+            payloadMaterializationObserver?(range)
+            let data = state.buffer.subdata(in: range)
+            state.start += len
+            return .retained(data)
+        }
+        // The complete field is resident and structurally valid. Advance over it
+        // without materializing a second frame-sized Data value. decodeFrame's
+        // final state check still rejects any trailing bytes after this field.
+        state.start += len
+        return .limitExceeded(attemptedBytes: len)
+    }
+
+    private static func readDataFieldLength(_ state: inout EncoderState) throws -> Int {
+        let encodedLength = try c.uint.decode(&state)
+        guard encodedLength <= UInt64(Int.max) else { throw BareRPCCodecError.truncated }
+        let len = Int(encodedLength)
+        guard state.end - state.start >= len else { throw BareRPCCodecError.truncated }
+        return len
     }
 
     private static func preencodeError(_ state: inout EncoderState, _ e: BareRPCError) {
@@ -427,12 +720,129 @@ enum BareRPCCodec {
         c.int.encode(&state, e.errno)
     }
 
-    private static func readError(_ state: inout EncoderState) throws -> BareRPCError {
-        let message = try c.utf8.decode(&state)
-        let code = try c.utf8.decode(&state)
-        let errno = try c.int.decode(&state)
-        return BareRPCError(message: message, code: code, errno: errno)
+    private enum RetainedErrorPayload {
+        case retained(BareRPCError)
+        case notRetained(BareRPCResponsePayloadLimitExceeded)
     }
+
+    private struct EncodedUTF8Field {
+        let range: Range<Int>
+        var byteCount: Int { range.count }
+    }
+
+    /// Parse both length-prefixed strings and errno before deciding whether to
+    /// materialize either `String`. Oversized or unowned diagnostics are scanned
+    /// with the strict UTF-8 validator below, then skipped without a frame-sized
+    /// `Data.subdata` or `String` allocation.
+    private static func readError(
+        _ state: inout EncoderState,
+        maximumRetainedUTF8Bytes: Int?,
+        payloadMaterializationObserver: ((Range<Int>) -> Void)?
+    ) throws -> RetainedErrorPayload {
+        let messageField = try readUTF8Field(&state)
+        let codeField = try readUTF8Field(&state)
+        let errno = try c.int.decode(&state)
+        let (attemptedBytes, overflowed) = messageField.byteCount.addingReportingOverflow(
+            codeField.byteCount
+        )
+        let attempted = overflowed ? Int.max : attemptedBytes
+        let maximum = maximumRetainedUTF8Bytes.map { max(0, $0) }
+
+        guard let maximum, attempted <= maximum else {
+            guard isValidUTF8(state.buffer, in: messageField.range),
+                  isValidUTF8(state.buffer, in: codeField.range) else {
+                throw CompactEncodingError.invalidUTF8
+            }
+            return .notRetained(.init(
+                maximumBytes: maximum ?? 0,
+                attemptedBytes: attempted
+            ))
+        }
+
+        payloadMaterializationObserver?(messageField.range)
+        let messageData = state.buffer.subdata(in: messageField.range)
+        payloadMaterializationObserver?(codeField.range)
+        let codeData = state.buffer.subdata(in: codeField.range)
+        guard let message = String(data: messageData, encoding: .utf8),
+              let code = String(data: codeData, encoding: .utf8) else {
+            throw CompactEncodingError.invalidUTF8
+        }
+        return .retained(BareRPCError(message: message, code: code, errno: errno))
+    }
+
+    private static func readUTF8Field(
+        _ state: inout EncoderState
+    ) throws -> EncodedUTF8Field {
+        let encodedLength = try c.uint.decode(&state)
+        guard encodedLength <= UInt64(Int.max) else {
+            throw CompactEncodingError.outOfBounds
+        }
+        let length = Int(encodedLength)
+        guard state.end - state.start >= length else {
+            throw CompactEncodingError.outOfBounds
+        }
+        let range = state.start..<(state.start + length)
+        state.start += length
+        return EncodedUTF8Field(range: range)
+    }
+
+    /// Allocation-free strict UTF-8 validation, including overlong encodings,
+    /// surrogate code points, and Unicode's U+10FFFF upper bound.
+    private static func isValidUTF8(_ data: Data, in range: Range<Int>) -> Bool {
+        var index = range.lowerBound
+        while index < range.upperBound {
+            let first = data[index]
+            switch first {
+            case 0x00...0x7F:
+                index += 1
+            case 0xC2...0xDF:
+                guard index + 1 < range.upperBound,
+                      isContinuationByte(data[index + 1]) else { return false }
+                index += 2
+            case 0xE0:
+                guard index + 2 < range.upperBound,
+                      (0xA0...0xBF).contains(data[index + 1]),
+                      isContinuationByte(data[index + 2]) else { return false }
+                index += 3
+            case 0xE1...0xEC, 0xEE...0xEF:
+                guard index + 2 < range.upperBound,
+                      isContinuationByte(data[index + 1]),
+                      isContinuationByte(data[index + 2]) else { return false }
+                index += 3
+            case 0xED:
+                guard index + 2 < range.upperBound,
+                      (0x80...0x9F).contains(data[index + 1]),
+                      isContinuationByte(data[index + 2]) else { return false }
+                index += 3
+            case 0xF0:
+                guard index + 3 < range.upperBound,
+                      (0x90...0xBF).contains(data[index + 1]),
+                      isContinuationByte(data[index + 2]),
+                      isContinuationByte(data[index + 3]) else { return false }
+                index += 4
+            case 0xF1...0xF3:
+                guard index + 3 < range.upperBound,
+                      isContinuationByte(data[index + 1]),
+                      isContinuationByte(data[index + 2]),
+                      isContinuationByte(data[index + 3]) else { return false }
+                index += 4
+            case 0xF4:
+                guard index + 3 < range.upperBound,
+                      (0x80...0x8F).contains(data[index + 1]),
+                      isContinuationByte(data[index + 2]),
+                      isContinuationByte(data[index + 3]) else { return false }
+                index += 4
+            default:
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func isContinuationByte(_ byte: UInt8) -> Bool {
+        (0x80...0xBF).contains(byte)
+    }
+
 }
 
 // MARK: - Streaming frame reader
@@ -480,14 +890,56 @@ final class BareRPCFrameReader {
 
     /// Feed bytes from the wire. Throws on protocol-level decode failures (truncation
     /// is NOT an error — the reader simply waits for more bytes).
-    func append(_ data: Data) throws {
+    func append(
+        _ data: Data,
+        maximumRetainedResponsePayloadBytes: (UInt64) -> Int = { _ in Int.max },
+        maximumRetainedErrorPayloadBytes: (UInt64) -> Int? = { _ in Int.max },
+        streamPayloadAdmission: (
+            UInt64,
+            BareRPCStreamFlags,
+            Int
+        ) -> BareRPCStreamPayloadAdmission = { _, _, _ in .retain }
+    ) throws {
+        prepareToAppend(data)
+        try drain(
+            maximumRetainedResponsePayloadBytes: maximumRetainedResponsePayloadBytes,
+            maximumRetainedErrorPayloadBytes: maximumRetainedErrorPayloadBytes,
+            streamPayloadAdmission: streamPayloadAdmission,
+            onFrame: { pending.append($0) }
+        )
+        compactConsumedStorage()
+    }
+
+    /// Production receive path: dispatch each decoded frame before decoding the
+    /// next one. This makes admission for coalesced stream frames observe the
+    /// byte charges introduced by every earlier frame in the same adapter read.
+    func appendConsumingFrames(
+        _ data: Data,
+        maximumRetainedResponsePayloadBytes: (UInt64) -> Int,
+        maximumRetainedErrorPayloadBytes: (UInt64) -> Int?,
+        streamPayloadAdmission: (
+            UInt64,
+            BareRPCStreamFlags,
+            Int
+        ) -> BareRPCStreamPayloadAdmission,
+        onFrame: (BareRPCFrame) -> Void
+    ) throws {
+        prepareToAppend(data)
+        try drain(
+            maximumRetainedResponsePayloadBytes: maximumRetainedResponsePayloadBytes,
+            maximumRetainedErrorPayloadBytes: maximumRetainedErrorPayloadBytes,
+            streamPayloadAdmission: streamPayloadAdmission,
+            onFrame: onFrame
+        )
+        compactConsumedStorage()
+    }
+
+    private func prepareToAppend(_ data: Data) {
         if consumed > Self.compactThreshold {
             buffer = Data(buffer.suffix(from: buffer.startIndex + consumed))
             consumed = 0
         }
         buffer.append(data)
-        try drain()
-        compactConsumedStorage()
     }
 
     /// Pull the next fully-decoded frame, or `nil` if none ready yet.
@@ -511,7 +963,16 @@ final class BareRPCFrameReader {
     /// Number of bytes buffered but not yet decoded (after consumed bytes).
     var bufferedBytes: Int { buffer.count - consumed }
 
-    private func drain() throws {
+    private func drain(
+        maximumRetainedResponsePayloadBytes: (UInt64) -> Int,
+        maximumRetainedErrorPayloadBytes: (UInt64) -> Int?,
+        streamPayloadAdmission: (
+            UInt64,
+            BareRPCStreamFlags,
+            Int
+        ) -> BareRPCStreamPayloadAdmission,
+        onFrame: (BareRPCFrame) -> Void
+    ) throws {
         while true {
             switch state {
             case .awaitingLength:
@@ -528,10 +989,13 @@ final class BareRPCFrameReader {
                 let start = buffer.startIndex + consumed
                 let frame = try BareRPCCodec.decodeFrameBody(
                     buffer,
-                    in: start..<(start + needed)
+                    in: start..<(start + needed),
+                    maximumRetainedResponsePayloadBytes: maximumRetainedResponsePayloadBytes,
+                    maximumRetainedErrorPayloadBytes: maximumRetainedErrorPayloadBytes,
+                    streamPayloadAdmission: streamPayloadAdmission
                 )
                 consumed += needed
-                pending.append(frame)
+                onFrame(frame)
                 state = .awaitingLength
             }
         }

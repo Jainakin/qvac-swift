@@ -456,6 +456,50 @@ final class UnixDomainSocketTransportTests: XCTestCase {
         XCTAssertEqual(errno, EBADF)
     }
 
+    func test_cancelled_after_successful_accept_closes_descriptor_before_configuration() async {
+        var sockets = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        defer {
+            _ = Darwin.close(sockets[0])
+            _ = Darwin.close(sockets[1])
+        }
+
+        let adoptionReached = expectation(description: "accepted descriptor reached adoption")
+        let releaseAdoption = DispatchSemaphore(value: 0)
+        let acceptedFD = sockets[0]
+        defer { releaseAdoption.signal() }
+
+        let adoption = Task {
+            try UnixDomainSocketTransport_TestHook.adoptAcceptedFD(
+                acceptedFD,
+                beforeCancellationCheck: {
+                    adoptionReached.fulfill()
+                    _ = releaseAdoption.wait(timeout: .now() + 5)
+                },
+                configure: { _ in
+                    XCTFail("a canceled accepted descriptor must not be configured")
+                }
+            )
+        }
+
+        await fulfillment(of: [adoptionReached], timeout: 5)
+        adoption.cancel()
+        releaseAdoption.signal()
+
+        do {
+            _ = try await adoption.value
+            XCTFail("expected cancellation after successful accept")
+        } catch is CancellationError {
+            // The helper owns the descriptor once accept resolves and must close it.
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+
+        errno = 0
+        XCTAssertEqual(fcntl(sockets[0], F_GETFD), -1)
+        XCTAssertEqual(errno, EBADF)
+    }
+
     func test_production_reader_overflow_is_explicit_closes_connection_and_joins_thread() async throws {
         var sockets = [Int32](repeating: -1, count: 2)
         XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
@@ -536,6 +580,17 @@ private enum UnixDomainSocketTransport_TestHook {
     }
     static func configureConnectedSocket(_ fd: Int32) throws {
         try UnixDomainSocketTransport.__testConfigureConnectedSocket(fd)
+    }
+    static func adoptAcceptedFD(
+        _ fd: Int32,
+        beforeCancellationCheck: () -> Void,
+        configure: (Int32) throws -> Void
+    ) throws -> Int32 {
+        try UnixDomainSocketTransport.__testAdoptAcceptedFD(
+            fd,
+            beforeCancellationCheck: beforeCancellationCheck,
+            configure: configure
+        )
     }
     static func closeAcceptedFDWhenResolutionLoses(_ fd: Int32) {
         UnixDomainSocketTransport.__testCloseAcceptedFDWhenResolutionLoses(fd)

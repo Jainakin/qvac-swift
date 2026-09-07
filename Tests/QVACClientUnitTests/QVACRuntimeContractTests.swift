@@ -76,6 +76,111 @@ final class QVACRuntimeContractTests: XCTestCase {
         XCTAssertEqual(custom.modelType, "vendor-custom-model")
     }
 
+    func test_descriptor_model_type_resolution_pins_precedence_aliases_and_legacy_engines() throws {
+        struct Fixture {
+            let name: String
+            let explicit: String?
+            let engine: String?
+            let addon: String?
+            let expected: String
+        }
+
+        let fixtures = [
+            Fixture(
+                name: "explicit alias wins over descriptor metadata",
+                explicit: "llm",
+                engine: "onnx-tts",
+                addon: "ocr",
+                expected: "llamacpp-completion"
+            ),
+            Fixture(
+                name: "explicit custom type is preserved",
+                explicit: "vendor-custom-model",
+                engine: "llamacpp-completion",
+                addon: nil,
+                expected: "vendor-custom-model"
+            ),
+            Fixture(
+                name: "legacy scoped engine maps to canonical",
+                explicit: nil,
+                engine: "@qvac/diffusion-cpp",
+                addon: nil,
+                expected: "sdcpp-generation"
+            ),
+            Fixture(
+                name: "historical onnx tts engine maps to supported canonical type",
+                explicit: nil,
+                engine: "onnx-tts",
+                addon: nil,
+                expected: "tts-ggml"
+            ),
+            Fixture(
+                name: "canonical engine is retained",
+                explicit: nil,
+                engine: "ggml-vla",
+                addon: nil,
+                expected: "ggml-vla"
+            ),
+            Fixture(
+                name: "engine alias is normalized",
+                explicit: nil,
+                engine: "classification",
+                addon: nil,
+                expected: "ggml-classification"
+            ),
+            Fixture(
+                name: "recognized engine takes precedence over recognized addon",
+                explicit: nil,
+                engine: "llamacpp-embedding",
+                addon: "whisper",
+                expected: "llamacpp-embedding"
+            ),
+            Fixture(
+                name: "recognized addon is used after unknown engine",
+                explicit: nil,
+                engine: "future-engine",
+                addon: "parakeet",
+                expected: "parakeet-transcription"
+            ),
+        ]
+
+        for fixture in fixtures {
+            let descriptor = QVACClient.ModelDescriptor(
+                src: "hf:org/model",
+                engine: fixture.engine,
+                addon: fixture.addon
+            )
+            XCTAssertEqual(
+                try QVACClient.resolveModelType(fixture.explicit, descriptor: descriptor),
+                fixture.expected,
+                fixture.name
+            )
+        }
+    }
+
+    func test_descriptor_model_type_resolution_rejects_missing_or_unknown_metadata() {
+        for descriptor in [
+            QVACClient.ModelDescriptor(src: "hf:org/model"),
+            QVACClient.ModelDescriptor(
+                src: "hf:org/model",
+                engine: "future-engine",
+                addon: "future-addon"
+            ),
+        ] {
+            XCTAssertThrowsError(
+                try QVACClient.resolveModelType(nil, descriptor: descriptor)
+            ) { error in
+                guard case .invalidArgument(let message) = error as? QVACError else {
+                    return XCTFail("expected invalidArgument, got \(error)")
+                }
+                XCTAssertEqual(
+                    message,
+                    "modelType is required when a model descriptor has no recognized engine or addon"
+                )
+            }
+        }
+    }
+
     func test_cancel_request_target_uses_only_native_017_fields() throws {
         let request = QVACClient.makeCancelRequest(
             .request(requestId: "request-123", clearCache: true)

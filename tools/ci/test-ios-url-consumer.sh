@@ -128,6 +128,9 @@ fi
 record "resolved-binary-targets=38"
 
 record "running __init_config + heartbeat on simulator=$SIMULATOR_UDID"
+# Xcode-generated SwiftPM targets suppress warnings by default. Clear that
+# setting before treating warnings as errors so the compiler receives no
+# contradictory warning policy flags.
 xcodebuild \
     -scheme QVACiOSURLConsumer-Package \
     -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
@@ -136,6 +139,9 @@ xcodebuild \
     -derivedDataPath "$DERIVED_DATA" \
     -disableAutomaticPackageResolution \
     -parallel-testing-enabled NO \
+    SWIFT_SUPPRESS_WARNINGS=NO \
+    SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+    OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
     -only-testing:QVACiOSURLSmokeTests/QVACiOSSmokeTests/testBundledWorkerHandshakeHeartbeatAndIdempotentClose \
     -resultBundlePath "$RESULT_BUNDLE" \
     test 2>&1 | tee -a "$LOG_PATH"

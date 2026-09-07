@@ -135,6 +135,16 @@ final class CompactEncodingTests: XCTestCase {
         XCTAssertEqual(try c.uint16.decode(Data([0x78, 0x56])), 0x5678)
     }
 
+    func test_uint24_little_endian_boundaries_and_truncation() throws {
+        XCTAssertEqual(hex(c.uint24.encode(0)), "000000")
+        XCTAssertEqual(hex(c.uint24.encode(0x12_34_56)), "563412")
+        XCTAssertEqual(hex(c.uint24.encode(0xff_ff_ff)), "ffffff")
+        XCTAssertEqual(try c.uint24.decode(Data([0xef, 0xcd, 0xab])), 0xab_cd_ef)
+        XCTAssertThrowsError(try c.uint24.decode(Data([0x01, 0x02]))) { error in
+            XCTAssertEqual(error as? CompactEncodingError, .outOfBounds)
+        }
+    }
+
     func test_uint64_LE() throws {
         let v: UInt64 = 0x0123456789abcdef
         XCTAssertEqual(hex(c.uint64.encode(v)), "efcdab8967452301")
@@ -217,17 +227,28 @@ final class CompactEncodingTests: XCTestCase {
 
     // MARK: - Property-based encode-then-decode
 
-    func test_uint_roundtrip_random() throws {
-        for _ in 0..<200 {
-            let v = UInt64.random(in: 0...UInt64.max)
-            XCTAssertEqual(try c.uint.decode(c.uint.encode(v)), v)
+    func test_uint_roundtrip_deterministic_sequence() throws {
+        var generator = DeterministicGenerator(seed: 0x8e71_4d2a_9c35_f607)
+        for index in 0..<200 {
+            let value = generator.next()
+            XCTAssertEqual(
+                try c.uint.decode(c.uint.encode(value)),
+                value,
+                "deterministic UInt64 case \(index), 0x\(String(value, radix: 16))"
+            )
         }
     }
 
-    func test_int_roundtrip_random() throws {
-        for _ in 0..<200 {
-            let v = Int64.random(in: Int64.min...Int64.max)
-            XCTAssertEqual(try c.int.decode(c.int.encode(v)), v)
+    func test_int_roundtrip_deterministic_sequence() throws {
+        var generator = DeterministicGenerator(seed: 0xd4c3_b2a1_7065_182f)
+        for index in 0..<200 {
+            let value = Int64(bitPattern: generator.next())
+            XCTAssertEqual(
+                try c.int.decode(c.int.encode(value)),
+                value,
+                "deterministic Int64 case \(index), bitPattern 0x"
+                    + String(UInt64(bitPattern: value), radix: 16)
+            )
         }
     }
 
@@ -240,5 +261,23 @@ final class CompactEncodingTests: XCTestCase {
             }
             XCTAssertEqual(try c.buffer.decode(c.buffer.encode(d)), d, "buffer size \(size)")
         }
+    }
+}
+
+/// A fixed SplitMix64 sequence keeps broad integer round-trip coverage exactly
+/// reproducible across machines, Swift releases, and sanitizer reruns.
+private struct DeterministicGenerator {
+    private var state: UInt64
+
+    init(seed: UInt64) {
+        state = seed
+    }
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9e37_79b9_7f4a_7c15
+        var value = state
+        value = (value ^ (value >> 30)) &* 0xbf58_476d_1ce4_e5b9
+        value = (value ^ (value >> 27)) &* 0x94d0_49bb_1331_11eb
+        return value ^ (value >> 31)
     }
 }

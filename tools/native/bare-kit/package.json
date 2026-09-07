@@ -1,0 +1,12 @@
+{
+  "name": "qvac-swift-bare-kit-builder",
+  "version": "2.3.0-qvac.1",
+  "private": true,
+  "description": "Pinned build tool for the QVAC BareKit 2.3.0 patch candidate.",
+  "engines": {
+    "node": "22.22.0"
+  },
+  "dependencies": {
+    "bare-make": "1.8.0"
+  }
+}

@@ -28,14 +28,29 @@ content ID, SHA-256, non-overlap, and absence of local build paths are verified.
 
 ## Resource limits
 
-The default maximum bare-rpc message and NDJSON record is 256 MiB. The same
-`maximumWireMessageBytes` ceiling rejects oversized encoded requests and duplex
-chunks before a write. Binary duplex data above it must be split into smaller chunks.
+The default maximum size for an inbound bare-rpc message or decoded NDJSON
+record is 256 MiB.
+Encoded requests and outbound duplex chunks use a separate 48 MiB
+`maximumOutboundPayloadBytes` ceiling (or the lower wire limit), and oversized
+values, including initial and replacement `__init_config` handshakes, are rejected
+before a transport write. Convenience APIs that convert `Data` to inline base64
+additionally enforce a 24 MiB aggregate `maximumInlineBinaryBytes` raw-input
+budget and a 1,024-item `maximumInlineBinaryItems` ceiling before base64 or JSON
+allocation. The item ceiling also bounds per-value container overhead. Binary
+duplex data above the outbound limit must be split into smaller chunks.
+
 Inbound transport buffers and each raw stream queue are byte-bounded. Transport
 adapters deliver at most 64 KiB to the frame decoder at a time; raw operation queues
 use the per-operation `maximumBufferedStreamBytes` budget (the wire ceiling by default).
 Raw queue accounting includes payload bytes plus a conservative per-DATA-frame
 structural allowance, so empty and tiny frames cannot bypass that bound.
+The multiplexer checks remaining queue capacity before copying a STREAM(DATA)
+field out of the receive frame. Data for settled or unknown operations is validated
+and skipped. Remote bare-rpc error message and code text has a separate 64 KiB
+aggregate UTF-8 retention ceiling (or the lower wire ceiling); oversized and late
+errors are strict-UTF-8-validated without constructing diagnostic strings. A valid
+resource-limit failure terminates only its owning operation, while malformed framing
+still closes the transport generation.
 Public fan-out streams are separately bounded. Lossless views retain whole wire
 batches within both a batch-count ceiling and `maximumBufferedStreamBytes`, then
 flatten multi-value frames lazily. They fail explicitly on slow-consumer overflow
@@ -44,11 +59,44 @@ progress views retain a bounded window of the newest snapshots and coalesce olde
 snapshots under burst load. Buffer budgets apply per stream and per concurrent
 operation.
 
-The limit is configurable because video and upscaling can return a complete base64
-media output in one record. Base64 parsing, JSON decoding, and final
-`Data` ownership can temporarily use several times the payload size. Choose a lower
-limit for memory-constrained deployments that do not support large media outputs,
-and validate the chosen limit on representative physical devices.
+High-level APIs that eagerly assemble a result from multiple records enforce
+`maximumAccumulatedResultBytes`, which defaults to `maximumWireMessageBytes`.
+Accounting includes conservative retained-container overhead, not only payload
+bytes. VLA action data is additionally bounded by `maximumVLAActionBytes`, which
+defaults to the smallest of 8 MiB, the wire ceiling, and the accumulated-result
+ceiling. This dedicated bound covers both response pre-copy admission and decoded
+Float32 action bytes, limiting the simultaneous base64, binary, and array
+representations. Crossings report
+``QVACError/resourceLimitExceeded(operation:resource:maximumBytes:attemptedBytes:)``.
+Metadata/control responses with open-ended JSON fields have a separate encoded
+`maximumMetadataResponseBytes` ceiling. It defaults to the smallest of 256 KiB,
+the wire ceiling, and the accumulated-result ceiling; explicit values cannot
+exceed either client-wide cap. The ceiling applies to loaded/static model info,
+system-resource snapshots, registry-get responses, and VLA hyperparameters.
+Unpaginated registry list/search responses instead use
+`maximumRegistryResponseBytes`, which defaults to the smallest of 4 MiB, the wire
+ceiling, and the accumulated-result ceiling. The larger dedicated ceiling leaves
+headroom for the 0.17 catalog without weakening bounded single-object metadata.
+The unary multiplexer rejects a data field above the applicable ceiling
+before copying that field out of the frame buffer or parsing its JSON, and the
+rejection affects only its owning request. Bare-rpc framing must still receive and
+validate the complete frame under `maximumWireMessageBytes`; the metadata ceiling
+is therefore a decode/retention boundary, not a replacement for the global inbound
+wire bound. Generic plugin and model-result payloads remain governed by the wire
+and operation-specific result limits because they may legitimately carry large
+tensors or media.
+
+Batch completion accepts at most `maximumBatchPrompts` prompts (256 by default).
+The client checks this limit before request encoding and before allocating
+per-prompt tasks, streams, or result state. Configure it to the largest batch the
+application intentionally permits, and reduce it for memory-constrained devices.
+
+The limits are configurable because video and upscaling can return a complete
+base64 media output in one record, while image, audio, and tensor requests may
+inline several buffers. Base64 parsing, JSON decoding, and final `Data` ownership
+can temporarily use several times the payload size. Choose lower limits for
+memory-constrained deployments and validate them on representative physical
+devices.
 
 QVACClient does not add model RAM, disk, or inference-time quotas. Applications
 decide which models and operations are permitted and should set an explicit

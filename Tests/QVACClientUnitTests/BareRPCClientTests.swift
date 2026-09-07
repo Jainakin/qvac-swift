@@ -1,5 +1,6 @@
-// BareRPCClient tests — exercise the full request/response/stream/duplex mux against
-// a programmable in-memory transport. No network, no subprocess.
+// BareRPCClient tests exercise the full request/response/stream/duplex mux primarily
+// against a programmable in-memory transport. Bounded macOS cases also verify the
+// public subprocess and Unix-domain-socket boundary.
 
 import XCTest
 @testable import QVACClient
@@ -222,6 +223,42 @@ final class BareRPCClientTests: XCTestCase {
         func calls() -> Int { invocationCount }
     }
 
+    /// Suspends the replacement factory even after its caller is cancelled. This
+    /// models native startup code that cannot observe Swift task cancellation until
+    /// after it has acquired a transport resource.
+    private actor NonCooperativeReconnectFactory {
+        private let initial: MockTransport
+        private let replacement: MockTransport
+        private var invocationCount = 0
+        private var released = false
+        private var reconnectWaiter: CheckedContinuation<Void, Never>?
+
+        init(initial: MockTransport, replacement: MockTransport) {
+            self.initial = initial
+            self.replacement = replacement
+        }
+
+        func make() async -> BareTransport {
+            invocationCount += 1
+            guard invocationCount > 1 else { return initial }
+            if !released {
+                await withCheckedContinuation { continuation in
+                    reconnectWaiter = continuation
+                }
+            }
+            return replacement
+        }
+
+        func calls() -> Int { invocationCount }
+        func reconnectIsWaiting() -> Bool { reconnectWaiter != nil }
+
+        func releaseReconnect() {
+            released = true
+            reconnectWaiter?.resume()
+            reconnectWaiter = nil
+        }
+    }
+
     #if os(macOS)
     /// Returns an in-memory first generation and creates a real UDS transport for
     /// the reconnect. This covers cancellation while the factory itself is still
@@ -253,6 +290,25 @@ final class BareRPCClientTests: XCTestCase {
         private var value = false
         func set() { value = true }
         func get() -> Bool { value }
+    }
+
+    private final class ResponseIteratorBox<Element: Sendable>: @unchecked Sendable {
+        private var iterator: QVACResponseStream<Element>.AsyncIterator
+
+        init(_ iterator: QVACResponseStream<Element>.AsyncIterator) {
+            self.iterator = iterator
+        }
+
+        func next() async throws -> Element? {
+            try await iterator.next()
+        }
+    }
+
+    private enum ConcurrentReadOutcome: Sendable {
+        case value
+        case protocolViolation(String)
+        case unexpected(String)
+        case timedOut
     }
 
     actor StartGate {
@@ -628,12 +684,13 @@ final class BareRPCClientTests: XCTestCase {
     // MARK: - send (single-shot RPC)
 
     func test_transport_inbound_channel_overflow_is_explicit_and_discards_queued_bytes() async {
-        let channel = BoundedTransportInboundChannel(maximumBufferedBytes: 4)
+        let firstCost = 3 + BoundedTransportInboundChannel.retainedValueOverheadBytes
+        let channel = BoundedTransportInboundChannel(maximumBufferedBytes: firstCost)
         let stream = channel.stream()
         XCTAssertNil(channel.yield(Data(repeating: 1, count: 3)))
         let overflow = channel.yield(Data(repeating: 2, count: 2))
-        XCTAssertEqual(overflow?.maximumBufferedBytes, 4)
-        XCTAssertEqual(overflow?.attemptedBufferedBytes, 5)
+        XCTAssertEqual(overflow?.maximumBufferedBytes, firstCost)
+        XCTAssertEqual(overflow?.attemptedBufferedBytes, firstCost + 2)
 
         var iterator = stream.makeAsyncIterator()
         do {
@@ -644,20 +701,170 @@ final class BareRPCClientTests: XCTestCase {
         } catch {
             XCTFail("unexpected error: \(error)")
         }
+
+        let emptyCost = BoundedTransportInboundChannel.retainedValueOverheadBytes
+        let emptyChannel = BoundedTransportInboundChannel(
+            maximumBufferedBytes: 2 * emptyCost
+        )
+        let emptyStream = emptyChannel.stream()
+        XCTAssertNil(emptyChannel.yield(Data()))
+        XCTAssertNil(emptyChannel.yield(Data()))
+        XCTAssertEqual(emptyChannel.__testState().queuedValues, 2)
+        let emptyOverflow = emptyChannel.yield(Data())
+        XCTAssertEqual(emptyOverflow?.attemptedBufferedBytes, 3 * emptyCost)
+        var emptyIterator = emptyStream.makeAsyncIterator()
+        do {
+            _ = try await emptyIterator.next()
+            XCTFail("empty adapter values must retain their per-value charge")
+        } catch let error as BareTransportInboundBufferOverflow {
+            XCTAssertEqual(error, emptyOverflow)
+        } catch {
+            XCTFail("unexpected empty-value overflow error: \(error)")
+        }
     }
 
     func test_transport_inbound_channel_splits_large_adapter_reads_into_bounded_chunks() async throws {
         let chunk = BoundedTransportInboundChannel.maximumDeliveryChunkBytes
+        let maximumWireMessageBytes = chunk + 3
+        let coalescedFrame = Data(
+            (0..<(maximumWireMessageBytes + MemoryLayout<UInt32>.size)).map {
+                UInt8(truncatingIfNeeded: $0)
+            }
+        )
+        let retainedCapacity = try XCTUnwrap(
+            BoundedTransportInboundChannel.retainedCapacity(
+                maximumWireMessageBytes: maximumWireMessageBytes
+            )
+        )
+        XCTAssertEqual(
+            retainedCapacity,
+            coalescedFrame.count
+                + 3 * BoundedTransportInboundChannel.retainedValueOverheadBytes
+        )
+        XCTAssertNil(BoundedTransportInboundChannel.retainedCapacity(
+            maximumWireMessageBytes: Int.max
+        ))
+
         let channel = BoundedTransportInboundChannel(
-            maximumBufferedBytes: chunk * 3
+            maximumBufferedBytes: retainedCapacity
         )
         let stream = channel.stream()
-        XCTAssertNil(channel.yield(Data(repeating: 0xa5, count: chunk * 2 + 7)))
+        XCTAssertNil(channel.yield(coalescedFrame))
         channel.finish()
 
         var sizes: [Int] = []
         for try await value in stream { sizes.append(value.count) }
-        XCTAssertEqual(sizes, [chunk, chunk, 7])
+        XCTAssertEqual(sizes, [chunk, 7])
+
+        // Native callback boundaries are deliberately not delivery boundaries.
+        // A complete maximum-size wire frame must fit even when it arrives one
+        // byte at a time before the consumer starts, and must reconstruct exactly.
+        let fragmentedChannel = BoundedTransportInboundChannel(
+            maximumBufferedBytes: retainedCapacity
+        )
+        let fragmentedStream = fragmentedChannel.stream()
+        var fragmentedOverflow: BareTransportInboundBufferOverflow?
+        for byte in coalescedFrame {
+            if let overflow = fragmentedChannel.yield(Data([byte])) {
+                fragmentedOverflow = overflow
+                break
+            }
+        }
+        XCTAssertNil(fragmentedOverflow)
+        XCTAssertEqual(fragmentedChannel.__testState().queuedValues, 2)
+        fragmentedChannel.finish()
+        var reconstructed = Data()
+        for try await value in fragmentedStream {
+            XCTAssertLessThanOrEqual(value.count, chunk)
+            reconstructed.append(value)
+        }
+        XCTAssertEqual(reconstructed, coalescedFrame)
+
+        // Also cross a logical-delivery boundary inside one callback, after a
+        // short callback has already populated the tail.
+        let unevenChannel = BoundedTransportInboundChannel(
+            maximumBufferedBytes: retainedCapacity
+        )
+        let unevenStream = unevenChannel.stream()
+        XCTAssertNil(unevenChannel.yield(Data(coalescedFrame.prefix(3))))
+        XCTAssertNil(unevenChannel.yield(Data(coalescedFrame.dropFirst(3).prefix(chunk))))
+        XCTAssertNil(unevenChannel.yield(Data(coalescedFrame.suffix(4))))
+        unevenChannel.finish()
+        var unevenReconstruction = Data()
+        for try await value in unevenStream {
+            XCTAssertLessThanOrEqual(value.count, chunk)
+            unevenReconstruction.append(value)
+        }
+        XCTAssertEqual(unevenReconstruction, coalescedFrame)
+
+        // The extra retained-value allowance is necessary when a tiny first
+        // callback has already been leased to the consumer and the remaining
+        // maximum-size frame is queued in independently coalesced chunks.
+        let inFlightChannel = BoundedTransportInboundChannel(
+            maximumBufferedBytes: retainedCapacity
+        )
+        let inFlightStream = inFlightChannel.stream()
+        let firstByteTask = Task { () throws -> Data? in
+            var iterator = inFlightStream.makeAsyncIterator()
+            return try await iterator.next()
+        }
+        let waiterClock = ContinuousClock()
+        let waiterDeadline = waiterClock.now.advanced(by: .seconds(1))
+        while !inFlightChannel.__testState().hasPendingWaiter,
+              waiterClock.now < waiterDeadline {
+            await Task.yield()
+        }
+        XCTAssertTrue(inFlightChannel.__testState().hasPendingWaiter)
+        XCTAssertNil(inFlightChannel.yield(Data(coalescedFrame.prefix(1))))
+        let firstByte = try await firstByteTask.value
+        XCTAssertEqual(firstByte, Data(coalescedFrame.prefix(1)))
+        for byte in coalescedFrame.dropFirst() {
+            XCTAssertNil(inFlightChannel.yield(Data([byte])))
+        }
+        XCTAssertEqual(inFlightChannel.__testState().bufferedBytes, retainedCapacity)
+        inFlightChannel.finish()
+        var inFlightReconstruction = firstByte ?? Data()
+        var inFlightIterator = inFlightStream.makeAsyncIterator()
+        while let value = try await inFlightIterator.next() {
+            inFlightReconstruction.append(value)
+        }
+        XCTAssertEqual(inFlightReconstruction, coalescedFrame)
+
+        let undersizedChannel = BoundedTransportInboundChannel(
+            maximumBufferedBytes: retainedCapacity - 1
+        )
+        let undersizedStream = undersizedChannel.stream()
+        let undersizedFirstByteTask = Task { () throws -> Data? in
+            var iterator = undersizedStream.makeAsyncIterator()
+            return try await iterator.next()
+        }
+        let undersizedWaiterClock = ContinuousClock()
+        let undersizedWaiterDeadline = undersizedWaiterClock.now.advanced(by: .seconds(1))
+        while !undersizedChannel.__testState().hasPendingWaiter,
+              undersizedWaiterClock.now < undersizedWaiterDeadline {
+            await Task.yield()
+        }
+        XCTAssertTrue(undersizedChannel.__testState().hasPendingWaiter)
+        XCTAssertNil(undersizedChannel.yield(Data(coalescedFrame.prefix(1))))
+        let undersizedFirstByte = try await undersizedFirstByteTask.value
+        XCTAssertEqual(undersizedFirstByte, Data(coalescedFrame.prefix(1)))
+        var overflow: BareTransportInboundBufferOverflow?
+        for byte in coalescedFrame.dropFirst() {
+            if let failure = undersizedChannel.yield(Data([byte])) {
+                overflow = failure
+                break
+            }
+        }
+        let exactOverflow = try XCTUnwrap(overflow)
+        XCTAssertEqual(exactOverflow.maximumBufferedBytes, retainedCapacity - 1)
+        XCTAssertEqual(exactOverflow.attemptedBufferedBytes, retainedCapacity)
+        do {
+            var iterator = undersizedStream.makeAsyncIterator()
+            _ = try await iterator.next()
+            XCTFail("a one-byte-short retained budget must fail fragmented delivery")
+        } catch let error as BareTransportInboundBufferOverflow {
+            XCTAssertEqual(error, exactOverflow)
+        }
     }
 
     func test_invalid_low_level_size_limits_throw_instead_of_trapping() {
@@ -669,6 +876,16 @@ final class BareRPCClientTests: XCTestCase {
             transport: MockTransport(),
             maximumWireMessageBytes: 1024,
             maximumBufferedStreamBytes: 0
+        ))
+        XCTAssertThrowsError(try BareRPCClient(
+            transport: MockTransport(),
+            maximumWireMessageBytes: 1024,
+            maximumRetainedErrorBytes: 0
+        ))
+        XCTAssertThrowsError(try BareRPCClient(
+            transport: MockTransport(),
+            maximumWireMessageBytes: 1024,
+            maximumRetainedErrorBytes: 1025
         ))
     }
 
@@ -705,10 +922,14 @@ final class BareRPCClientTests: XCTestCase {
             on: rpc,
             transport: mock
         )
-        let session = QVACDuplexSession<Response>(raw: raw, operation: "duplex-size-test")
+        let session = QVACDuplexSession<Response>(
+            raw: raw,
+            operation: "duplex-size-test",
+            maximumOutboundPayloadBytes: 32
+        )
 
         do {
-            try await session.write(Data(repeating: 0xab, count: 65))
+            try await session.write(Data(repeating: 0xab, count: 33))
             XCTFail("expected outbound duplex chunk limit failure")
         } catch let error as QVACError {
             guard case .invalidArgument = error else {
@@ -744,6 +965,244 @@ final class BareRPCClientTests: XCTestCase {
         await rpc.close()
     }
 
+    func test_send_rejects_invalid_response_limits_before_allocating_id_or_writing() async throws {
+        let mock = MockTransport()
+        let rpc = try BareRPCClient(
+            transport: mock,
+            maximumWireMessageBytes: 64
+        )
+
+        for maximum in [0, 65] {
+            do {
+                _ = try await rpc.send(
+                    command: 80,
+                    data: Data("request".utf8),
+                    maximumResponseBytes: maximum
+                )
+                XCTFail("invalid maximumResponseBytes \(maximum) was accepted")
+            } catch let error as BareRPCInvalidArgument {
+                XCTAssertEqual(
+                    error.reason,
+                    "maximumResponseBytes must be between 1 and maximumWireMessageBytes"
+                )
+            } catch {
+                XCTFail("unexpected response-limit error: \(error)")
+            }
+        }
+
+        let outbound = await mock.outbound()
+        XCTAssertTrue(outbound.isEmpty)
+        await rpc.close()
+    }
+
+    func test_oversized_unary_response_is_operation_local_under_concurrency_and_connection_reuse() async throws {
+        let mock = MockTransport()
+        let rpc = try BareRPCClient(
+            transport: mock,
+            maximumWireMessageBytes: 4_096
+        )
+        let limited = Task {
+            try await rpc.send(
+                command: 91,
+                data: Data("limited".utf8),
+                maximumResponseBytes: 3
+            )
+        }
+        let ordinary = Task {
+            try await rpc.send(command: 92, data: Data("ordinary".utf8))
+        }
+
+        let requests = try await Self.waitForFrames(2, on: mock)
+        let idsByCommand = Dictionary(uniqueKeysWithValues: requests.compactMap {
+            frame -> (UInt64, UInt64)? in
+            guard case .request(let id, let command, _, _) = frame else { return nil }
+            return (command, id)
+        })
+        let limitedID = try XCTUnwrap(idsByCommand[91])
+        let ordinaryID = try XCTUnwrap(idsByCommand[92])
+        let oversized = Data([0x01, 0x02, 0x03, 0x04])
+        let ordinaryPayload = Data("okay".utf8)
+        var inbound = BareRPCCodec.__testEncodeResponseFrame(
+            id: limitedID,
+            stream: [],
+            payload: .success(oversized)
+        )
+        inbound.append(BareRPCCodec.__testEncodeResponseFrame(
+            id: ordinaryID,
+            stream: [],
+            payload: .success(ordinaryPayload)
+        ))
+        await mock.feedInbound(inbound)
+
+        do {
+            _ = try await limited.value
+            XCTFail("oversized unary response was retained")
+        } catch let error as BareRPCResponsePayloadLimitExceeded {
+            XCTAssertEqual(
+                error,
+                .init(maximumBytes: 3, attemptedBytes: oversized.count)
+            )
+        } catch {
+            XCTFail("unexpected response-limit error: \(error)")
+        }
+        let ordinaryResult = try await ordinary.value
+        XCTAssertEqual(ordinaryResult, ordinaryPayload)
+        try await Self.waitForNoInFlight(rpc)
+        var closeCount = await mock.closes()
+        XCTAssertEqual(closeCount, 0)
+
+        let reuse = Task {
+            try await rpc.send(command: 93, data: Data("reuse".utf8))
+        }
+        let allRequests = try await Self.waitForFrames(3, on: mock)
+        let reuseID = try XCTUnwrap(allRequests.compactMap { frame -> UInt64? in
+            guard case .request(let id, let command, _, _) = frame,
+                  command == 93 else { return nil }
+            return id
+        }.first)
+        let reusePayload = Data("reused".utf8)
+        await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+            id: reuseID,
+            stream: [],
+            payload: .success(reusePayload)
+        ))
+        let reuseResult = try await reuse.value
+        XCTAssertEqual(reuseResult, reusePayload)
+        closeCount = await mock.closes()
+        XCTAssertEqual(closeCount, 0)
+        await rpc.close()
+    }
+
+    func test_remote_error_utf8_limit_accepts_exact_rejects_cap_plus_one_and_reuses_connection() async throws {
+        let mock = MockTransport()
+        let maximumErrorBytes = 8
+        let rpc = try BareRPCClient(
+            transport: mock,
+            maximumWireMessageBytes: 4_096,
+            maximumRetainedErrorBytes: maximumErrorBytes
+        )
+
+        let exactRequest = Task {
+            try await rpc.send(command: 96, data: Data("exact".utf8))
+        }
+        let firstFrames = try await Self.waitForFrames(1, on: mock)
+        guard case .request(let exactID, _, _, _) = firstFrames[0] else {
+            return XCTFail("expected exact-boundary request")
+        }
+        let exactError = BareRPCError(message: "12345", code: "ABC", errno: -1)
+        XCTAssertEqual(
+            exactError.message.utf8.count + exactError.code.utf8.count,
+            maximumErrorBytes
+        )
+        await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+            id: exactID,
+            stream: [],
+            payload: .failure(exactError)
+        ))
+        do {
+            _ = try await exactRequest.value
+            XCTFail("exact-boundary remote error was not delivered")
+        } catch let received as BareRPCError {
+            XCTAssertEqual(received, exactError)
+        } catch {
+            XCTFail("unexpected exact-boundary error: \(error)")
+        }
+
+        let oversizedRequest = Task {
+            try await rpc.send(command: 97, data: Data("oversized".utf8))
+        }
+        let secondFrames = try await Self.waitForFrames(2, on: mock)
+        guard case .request(let oversizedID, _, _, _) = secondFrames[1] else {
+            return XCTFail("expected oversized-error request")
+        }
+        let oversizedError = BareRPCError(message: "123456", code: "ABC", errno: -2)
+        await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+            id: oversizedID,
+            stream: [],
+            payload: .failure(oversizedError)
+        ))
+        do {
+            _ = try await oversizedRequest.value
+            XCTFail("cap-plus-one remote error strings were retained")
+        } catch let error as BareRPCResponsePayloadLimitExceeded {
+            XCTAssertEqual(
+                error,
+                .init(maximumBytes: maximumErrorBytes, attemptedBytes: maximumErrorBytes + 1)
+            )
+        } catch {
+            XCTFail("unexpected remote-error limit failure: \(error)")
+        }
+
+        let reuse = Task {
+            try await rpc.send(command: 98, data: Data("reuse".utf8))
+        }
+        let thirdFrames = try await Self.waitForFrames(3, on: mock)
+        guard case .request(let reuseID, _, _, _) = thirdFrames[2] else {
+            return XCTFail("expected reuse request")
+        }
+        let response = Data("still-open".utf8)
+        await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+            id: reuseID,
+            stream: [],
+            payload: .success(response)
+        ))
+        let reuseResult = try await reuse.value
+        XCTAssertEqual(reuseResult, response)
+        let closeCount = await mock.closes()
+        XCTAssertEqual(closeCount, 0)
+        await rpc.close()
+    }
+
+    func test_oversized_stream_error_is_operation_local_and_connection_survives() async throws {
+        let mock = MockTransport()
+        let maximumErrorBytes = 8
+        let rpc = try BareRPCClient(
+            transport: mock,
+            maximumWireMessageBytes: 4_096,
+            maximumRetainedErrorBytes: maximumErrorBytes
+        )
+        let stream = try await rpc.stream(command: 99, data: Data("{}".utf8))
+        let initialFrames = try await Self.waitForFrames(2, on: mock)
+        guard case .request(let streamID, _, _, _) = initialFrames[0] else {
+            return XCTFail("expected stream request")
+        }
+        await mock.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+            id: streamID,
+            flags: [.response, .error],
+            payload: .error(.init(message: "123456", code: "ABC", errno: -3))
+        ))
+        do {
+            for try await _ in stream.chunks {}
+            XCTFail("oversized stream error was retained")
+        } catch let error as BareRPCResponsePayloadLimitExceeded {
+            XCTAssertEqual(
+                error,
+                .init(maximumBytes: maximumErrorBytes, attemptedBytes: maximumErrorBytes + 1)
+            )
+        } catch {
+            XCTFail("unexpected stream-error limit failure: \(error)")
+        }
+
+        let reuse = Task {
+            try await rpc.send(command: 100, data: Data("reuse".utf8))
+        }
+        let framesAfterReuse = try await Self.waitForFrames(3, on: mock)
+        guard case .request(let reuseID, _, _, _) = framesAfterReuse[2] else {
+            return XCTFail("expected reuse request")
+        }
+        let response = Data("healthy".utf8)
+        await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+            id: reuseID,
+            stream: [],
+            payload: .success(response)
+        ))
+        let reuseResult = try await reuse.value
+        XCTAssertEqual(reuseResult, response)
+        let closeCount = await mock.closes()
+        XCTAssertEqual(closeCount, 0)
+        await rpc.close()
+    }
+
     func test_send_propagates_typed_error() async throws {
         let mock = MockTransport()
         let rpc = BareRPCClient(transport: mock)
@@ -766,6 +1225,39 @@ final class BareRPCClientTests: XCTestCase {
         } catch let e as BareRPCError {
             XCTAssertEqual(e, serverError)
         }
+        await rpc.close()
+    }
+
+    func test_unary_send_rejects_streaming_response_shape() async throws {
+        let mock = MockTransport()
+        let rpc = BareRPCClient(transport: mock)
+        let request = Task {
+            try await rpc.send(
+                command: 71,
+                data: Data("request".utf8),
+                timeout: .seconds(1)
+            )
+        }
+        let frames = try await Self.waitForFrames(1, on: mock)
+        guard case .request(let id, _, _, _) = frames[0] else {
+            return XCTFail("expected request frame")
+        }
+
+        await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+            id: id,
+            stream: [.open],
+            payload: .success(nil)
+        ))
+
+        do {
+            _ = try await request.value
+            XCTFail("unary request accepted a streaming response")
+        } catch let error as BareRPCProtocolError {
+            XCTAssertEqual(error.reason, "unary request received a streaming RESPONSE")
+        } catch {
+            XCTFail("unexpected response-shape error: \(error)")
+        }
+        try await Self.waitForNoInFlight(rpc)
         await rpc.close()
     }
 
@@ -828,6 +1320,63 @@ final class BareRPCClientTests: XCTestCase {
         ))
         try await Task.sleep(for: .milliseconds(20))
         try await Self.waitForNoInFlight(rpc)
+        await rpc.close()
+    }
+
+    func test_cancelled_send_skips_oversized_late_payload_and_reuses_connection() async throws {
+        let mock = MockTransport()
+        let rpc = try BareRPCClient(
+            transport: mock,
+            maximumWireMessageBytes: 4_096
+        )
+        let cancelled = Task {
+            try await rpc.send(
+                command: 94,
+                data: Data("cancel".utf8),
+                maximumResponseBytes: 32
+            )
+        }
+        let firstRequest = try await Self.waitForFrames(1, on: mock)
+        guard case .request(let cancelledID, _, _, _) = firstRequest[0] else {
+            return XCTFail("expected cancelled request frame")
+        }
+
+        cancelled.cancel()
+        do {
+            _ = try await cancelled.value
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+        try await Self.waitForNoInFlight(rpc)
+
+        // With no pending unary owner, the decoder's zero-byte retention policy
+        // validates and skips this data field instead of copying a throwaway value.
+        await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+            id: cancelledID,
+            stream: [],
+            payload: .success(Data(repeating: 0xA5, count: 1_024))
+        ))
+
+        let reuse = Task {
+            try await rpc.send(command: 95, data: Data("reuse".utf8))
+        }
+        let allRequests = try await Self.waitForFrames(2, on: mock)
+        let reuseID = try XCTUnwrap(allRequests.compactMap { frame -> UInt64? in
+            guard case .request(let id, let command, _, _) = frame,
+                  command == 95 else { return nil }
+            return id
+        }.first)
+        let payload = Data("still-open".utf8)
+        await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+            id: reuseID,
+            stream: [],
+            payload: .success(payload)
+        ))
+        let reuseResult = try await reuse.value
+        XCTAssertEqual(reuseResult, payload)
+        let closeCount = await mock.closes()
+        XCTAssertEqual(closeCount, 0)
         await rpc.close()
     }
 
@@ -1214,7 +1763,505 @@ final class BareRPCClientTests: XCTestCase {
         XCTAssertEqual(closeCount, 1)
     }
 
+    func test_public_initializer_rejects_every_invalid_resource_limit_before_io() async {
+        let maximumUInt32 = Int(UInt32.max)
+
+        func assertRejected(
+            _ expected: String,
+            makeClient: () async throws -> QVACClient,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async {
+            do {
+                let client = try await makeClient()
+                await client.close()
+                XCTFail("expected invalid client configuration", file: file, line: line)
+            } catch let QVACError.invalidArgument(message) {
+                XCTAssertTrue(
+                    message.contains(expected),
+                    "expected '\(expected)' in '\(message)'",
+                    file: file,
+                    line: line
+                )
+            } catch {
+                XCTFail("expected invalidArgument, got \(error)", file: file, line: line)
+            }
+        }
+
+        let cases: [(String, () async throws -> QVACClient)] = [
+            ("initHandshakeTimeout", {
+                try await QVACClient(
+                    configuration: .testing(MockTransport()),
+                    runtimeContext: nil,
+                    initHandshakeTimeout: .zero,
+                    logger: nil
+                )
+            }),
+            ("maximumWireMessageBytes", {
+                try await QVACClient(
+                    configuration: .testing(MockTransport()),
+                    runtimeContext: nil,
+                    maximumWireMessageBytes: 0,
+                    logger: nil
+                )
+            }),
+            ("maximumWireMessageBytes", {
+                try await QVACClient(
+                    configuration: .testing(MockTransport()),
+                    runtimeContext: nil,
+                    maximumWireMessageBytes: maximumUInt32 + 1,
+                    logger: nil
+                )
+            }),
+            ("maximumInlineBinaryBytes", {
+                try await QVACClient(
+                    configuration: .testing(MockTransport()),
+                    runtimeContext: nil,
+                    maximumInlineBinaryBytes: 0,
+                    logger: nil
+                )
+            }),
+            ("maximumInlineBinaryBytes", {
+                try await QVACClient(
+                    configuration: .testing(MockTransport()),
+                    runtimeContext: nil,
+                    maximumInlineBinaryBytes: maximumUInt32 + 1,
+                    logger: nil
+                )
+            }),
+            ("maximumOutboundPayloadBytes", {
+                try await QVACClient(
+                    configuration: .testing(MockTransport()),
+                    runtimeContext: nil,
+                    maximumWireMessageBytes: 1_024,
+                    maximumOutboundPayloadBytes: 0,
+                    logger: nil
+                )
+            }),
+            ("maximumOutboundPayloadBytes", {
+                try await QVACClient(
+                    configuration: .testing(MockTransport()),
+                    runtimeContext: nil,
+                    maximumWireMessageBytes: 1_024,
+                    maximumOutboundPayloadBytes: 1_025,
+                    logger: nil
+                )
+            }),
+            ("maximumBufferedStreamBytes", {
+                try await QVACClient(
+                    configuration: .testing(MockTransport()),
+                    runtimeContext: nil,
+                    maximumBufferedStreamBytes: 0,
+                    logger: nil
+                )
+            }),
+            ("maximumBufferedStreamBytes", {
+                try await QVACClient(
+                    configuration: .testing(MockTransport()),
+                    runtimeContext: nil,
+                    maximumBufferedStreamBytes: maximumUInt32 + 1,
+                    logger: nil
+                )
+            }),
+        ]
+
+        for (expected, makeClient) in cases {
+            await assertRejected(expected, makeClient: makeClient)
+        }
+    }
+
+    func test_public_initializer_preserves_explicit_resource_limits() async throws {
+        let transport = MockTransport()
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(transport),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(1),
+                maximumWireMessageBytes: 4_096,
+                maximumOutboundPayloadBytes: 2_048,
+                maximumInlineBinaryBytes: 1_024,
+                maximumBufferedStreamBytes: 3_072,
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: transport)
+        let client = try await initialization.value
+
+        let limits = await (
+            client.maximumWireMessageBytes,
+            client.maximumOutboundPayloadBytes,
+            client.maximumInlineBinaryBytes,
+            client.maximumBufferedStreamBytes
+        )
+        XCTAssertEqual(limits.0, 4_096)
+        XCTAssertEqual(limits.1, 2_048)
+        XCTAssertEqual(limits.2, 1_024)
+        XCTAssertEqual(limits.3, 3_072)
+
+        await client.close()
+    }
+
     // MARK: - stream (server-pushed)
+
+    func test_plain_response_error_rejects_stream_and_duplex_during_setup() async throws {
+        let serverError = BareRPCError(
+            message: "handler rejected before opening its response stream",
+            code: "HANDLER_REJECTED",
+            errno: 52_220
+        )
+
+        do {
+            let transport = GatedWriteTransport()
+            let rpc = BareRPCClient(transport: transport)
+            let opening = Task {
+                try await rpc.stream(
+                    command: 72,
+                    data: Data("request".utf8),
+                    timeout: .seconds(1)
+                )
+            }
+            try await Self.waitForGatedCounts((writes: 1, closes: 0), on: transport)
+            let frames = Self.frames(in: await transport.outbound())
+            guard case .request(let id, _, _, _) = frames.first else {
+                await transport.close()
+                _ = try? await opening.value
+                return XCTFail("expected stream request frame")
+            }
+
+            // This is the exact shape emitted by upstream bare-rpc when the
+            // method handler throws before createResponseStream().
+            await transport.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+                id: id,
+                stream: [],
+                payload: .failure(serverError)
+            ))
+            do {
+                _ = try await opening.value
+                XCTFail("stream setup swallowed the handler error")
+            } catch let error as BareRPCError {
+                XCTAssertEqual(error, serverError)
+            } catch {
+                XCTFail("unexpected stream setup error: \(error)")
+            }
+            try await Self.waitForGatedCounts((writes: 1, closes: 1), on: transport)
+            try await Self.waitForNoInFlight(rpc)
+            await rpc.close()
+        }
+
+        do {
+            let transport = GatedWriteTransport()
+            let rpc = BareRPCClient(transport: transport)
+            let opening = Task {
+                try await rpc.duplex(
+                    command: 73,
+                    initialPayload: Data("request".utf8),
+                    timeout: .seconds(1)
+                )
+            }
+            try await Self.waitForGatedCounts((writes: 1, closes: 0), on: transport)
+            let frames = Self.frames(in: await transport.outbound())
+            guard case .request(let id, _, _, _) = frames.first else {
+                await transport.close()
+                _ = try? await opening.value
+                return XCTFail("expected duplex request frame")
+            }
+
+            await transport.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+                id: id,
+                stream: [],
+                payload: .failure(serverError)
+            ))
+            do {
+                _ = try await opening.value
+                XCTFail("duplex setup swallowed the handler error")
+            } catch let error as BareRPCError {
+                XCTAssertEqual(error, serverError)
+            } catch {
+                XCTFail("unexpected duplex setup error: \(error)")
+            }
+            try await Self.waitForGatedCounts((writes: 1, closes: 1), on: transport)
+            try await Self.waitForNoInFlight(rpc)
+            await rpc.close()
+        }
+    }
+
+    func test_plain_response_error_after_stream_setup_throws_without_idle_timeout() async throws {
+        let mock = MockTransport()
+        let rpc = BareRPCClient(transport: mock)
+        let stream = try await rpc.stream(
+            command: 74,
+            data: Data("request".utf8),
+            timeout: .seconds(30)
+        )
+        let frames = try await Self.waitForFrames(2, on: mock)
+        guard case .request(let id, _, _, _) = frames[0] else {
+            return XCTFail("expected stream request frame")
+        }
+        let serverError = BareRPCError(
+            message: "late handler rejection",
+            code: "LATE_HANDLER_REJECTED",
+            errno: 52_221
+        )
+        await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+            id: id,
+            stream: [],
+            payload: .failure(serverError)
+        ))
+
+        var iterator = stream.chunks.makeAsyncIterator()
+        do {
+            _ = try await iterator.next()
+            XCTFail("stream swallowed the plain RESPONSE error")
+        } catch let error as BareRPCError {
+            XCTAssertEqual(error, serverError)
+        } catch {
+            XCTFail("unexpected stream error: \(error)")
+        }
+        try await Self.waitForNoInFlight(rpc)
+        await rpc.close()
+    }
+
+    func test_stream_and_duplex_reject_nonopening_success_response() async throws {
+        do {
+            let mock = MockTransport()
+            let rpc = BareRPCClient(transport: mock)
+            let stream = try await rpc.stream(
+                command: 75,
+                data: Data("request".utf8),
+                timeout: .seconds(1)
+            )
+            let frames = try await Self.waitForFrames(2, on: mock)
+            guard case .request(let id, _, _, _) = frames[0] else {
+                return XCTFail("expected stream request frame")
+            }
+            await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+                id: id,
+                stream: [],
+                payload: .success(Data("unexpected unary result".utf8))
+            ))
+
+            var iterator = stream.chunks.makeAsyncIterator()
+            do {
+                _ = try await iterator.next()
+                XCTFail("stream accepted a non-opening response")
+            } catch let error as BareRPCProtocolError {
+                XCTAssertEqual(error.reason, "server stream received a non-opening RESPONSE")
+            } catch {
+                XCTFail("unexpected stream shape error: \(error)")
+            }
+            try await Self.waitForNoInFlight(rpc)
+            await rpc.close()
+        }
+
+        do {
+            let mock = MockTransport()
+            let rpc = BareRPCClient(transport: mock)
+            let opening = Task {
+                try await rpc.duplex(
+                    command: 76,
+                    initialPayload: Data("request".utf8),
+                    timeout: .seconds(1)
+                )
+            }
+            let frames = try await Self.waitForFrames(3, on: mock)
+            guard case .request(let id, _, _, _) = frames[0] else {
+                return XCTFail("expected duplex request frame")
+            }
+            await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+                id: id,
+                stream: [],
+                payload: .success(Data("unexpected unary result".utf8))
+            ))
+
+            do {
+                _ = try await opening.value
+                XCTFail("duplex accepted a non-opening response")
+            } catch let error as BareRPCProtocolError {
+                XCTAssertEqual(
+                    error.reason,
+                    "duplex response stream received a non-opening RESPONSE"
+                )
+            } catch {
+                XCTFail("unexpected duplex shape error: \(error)")
+            }
+            try await Self.waitForNoInFlight(rpc)
+            await rpc.close()
+        }
+    }
+
+    func test_stream_bootstrap_requires_exact_open_response_flags() async throws {
+        let malformedFlags: [BareRPCStreamFlags] = [
+            [.open, .end],
+            [.open, .response],
+            [.resume],
+        ]
+
+        for (offset, flags) in malformedFlags.enumerated() {
+            let mock = MockTransport()
+            let rpc = BareRPCClient(transport: mock)
+            let stream = try await rpc.stream(
+                command: UInt64(77 + offset),
+                data: Data("request".utf8),
+                timeout: .seconds(1)
+            )
+            let frames = try await Self.waitForFrames(2, on: mock)
+            guard case .request(let id, _, _, _) = frames[0] else {
+                await rpc.close()
+                return XCTFail("expected stream request frame")
+            }
+            await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+                id: id,
+                stream: flags,
+                payload: .success(nil)
+            ))
+
+            var iterator = stream.chunks.makeAsyncIterator()
+            do {
+                _ = try await iterator.next()
+                XCTFail("stream accepted malformed RESPONSE flags \(flags)")
+            } catch let error as BareRPCProtocolError {
+                XCTAssertEqual(error.reason, "server stream received a non-opening RESPONSE")
+            } catch {
+                XCTFail("unexpected stream shape error for \(flags): \(error)")
+            }
+            try await Self.waitForNoInFlight(rpc)
+            await rpc.close()
+        }
+
+        let mock = MockTransport()
+        let rpc = BareRPCClient(transport: mock)
+        let opening = Task {
+            try await rpc.duplex(
+                command: 80,
+                initialPayload: Data("request".utf8),
+                timeout: .seconds(1)
+            )
+        }
+        let frames = try await Self.waitForFrames(3, on: mock)
+        guard case .request(let id, _, _, _) = frames[0] else {
+            await rpc.close()
+            _ = try? await opening.value
+            return XCTFail("expected duplex request frame")
+        }
+        await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+            id: id,
+            stream: [.open, .request],
+            payload: .success(nil)
+        ))
+        do {
+            _ = try await opening.value
+            XCTFail("duplex accepted malformed RESPONSE flags")
+        } catch let error as BareRPCProtocolError {
+            XCTAssertEqual(
+                error.reason,
+                "duplex response stream received a non-opening RESPONSE"
+            )
+        } catch {
+            XCTFail("unexpected duplex shape error: \(error)")
+        }
+        try await Self.waitForNoInFlight(rpc)
+        await rpc.close()
+    }
+
+    func test_response_error_remains_authoritative_with_malformed_stream_flags() async throws {
+        let serverError = BareRPCError(
+            message: "authoritative response error",
+            code: "RESPONSE_ERROR",
+            errno: 52_222
+        )
+        let malformedFlags: BareRPCStreamFlags = [.open, .end]
+
+        do {
+            let mock = MockTransport()
+            let rpc = BareRPCClient(transport: mock)
+            let request = Task {
+                try await rpc.send(
+                    command: 81,
+                    data: Data("request".utf8),
+                    timeout: .seconds(1)
+                )
+            }
+            let frames = try await Self.waitForFrames(1, on: mock)
+            guard case .request(let id, _, _, _) = frames[0] else {
+                return XCTFail("expected unary request frame")
+            }
+            await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+                id: id,
+                stream: malformedFlags,
+                payload: .failure(serverError)
+            ))
+            do {
+                _ = try await request.value
+                XCTFail("unary request swallowed response error")
+            } catch let error as BareRPCError {
+                XCTAssertEqual(error, serverError)
+            } catch {
+                XCTFail("unexpected unary error: \(error)")
+            }
+            await rpc.close()
+        }
+
+        do {
+            let mock = MockTransport()
+            let rpc = BareRPCClient(transport: mock)
+            let stream = try await rpc.stream(
+                command: 82,
+                data: Data("request".utf8),
+                timeout: .seconds(1)
+            )
+            let frames = try await Self.waitForFrames(2, on: mock)
+            guard case .request(let id, _, _, _) = frames[0] else {
+                return XCTFail("expected stream request frame")
+            }
+            await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+                id: id,
+                stream: malformedFlags,
+                payload: .failure(serverError)
+            ))
+            var iterator = stream.chunks.makeAsyncIterator()
+            do {
+                _ = try await iterator.next()
+                XCTFail("stream swallowed response error")
+            } catch let error as BareRPCError {
+                XCTAssertEqual(error, serverError)
+            } catch {
+                XCTFail("unexpected stream error: \(error)")
+            }
+            await rpc.close()
+        }
+
+        do {
+            let mock = MockTransport()
+            let rpc = BareRPCClient(transport: mock)
+            let opening = Task {
+                try await rpc.duplex(
+                    command: 83,
+                    initialPayload: Data("request".utf8),
+                    timeout: .seconds(1)
+                )
+            }
+            let frames = try await Self.waitForFrames(3, on: mock)
+            guard case .request(let id, _, _, _) = frames[0] else {
+                await rpc.close()
+                _ = try? await opening.value
+                return XCTFail("expected duplex request frame")
+            }
+            await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+                id: id,
+                stream: malformedFlags,
+                payload: .failure(serverError)
+            ))
+            do {
+                _ = try await opening.value
+                XCTFail("duplex swallowed response error")
+            } catch let error as BareRPCError {
+                XCTAssertEqual(error, serverError)
+            } catch {
+                XCTFail("unexpected duplex error: \(error)")
+            }
+            await rpc.close()
+        }
+    }
 
     func test_stream_yields_data_chunks_until_end() async throws {
         let mock = MockTransport()
@@ -1518,6 +2565,147 @@ final class BareRPCClientTests: XCTestCase {
             return XCTFail("expected destroy frame")
         }
         XCTAssertEqual(flags, [.response, .destroy])
+        await rpc.close()
+    }
+
+    func test_stream_data_pre_copy_admission_accepts_exact_rejects_cap_plus_one_and_reuses_connection() async throws {
+        let mock = MockTransport()
+        let exactPayload = Data([0x01, 0x02, 0x03, 0x04])
+        let maximumBufferedBytes = exactPayload.count
+            + BoundedRPCDataChannel.retainedValueOverheadBytes
+        let rpc = try BareRPCClient(
+            transport: mock,
+            maximumWireMessageBytes: 4_096,
+            maximumBufferedStreamBytes: maximumBufferedBytes
+        )
+
+        let exactStream = try await rpc.stream(command: 101, data: Data("{}".utf8))
+        let firstFrames = try await Self.waitForFrames(2, on: mock)
+        guard case .request(let exactID, _, _, _) = firstFrames[0] else {
+            return XCTFail("expected exact-boundary stream request")
+        }
+        var exactInbound = BareRPCCodec.__testEncodeStreamFrame(
+            id: exactID,
+            flags: [.response, .data],
+            payload: .data(exactPayload)
+        )
+        exactInbound.append(BareRPCCodec.__testEncodeStreamFrame(
+            id: exactID,
+            flags: [.response, .end]
+        ))
+        await mock.feedInbound(exactInbound)
+        var exactChunks: [Data] = []
+        for try await chunk in exactStream.chunks { exactChunks.append(chunk) }
+        XCTAssertEqual(exactChunks, [exactPayload])
+
+        let oversizedStream = try await rpc.stream(command: 102, data: Data("{}".utf8))
+        let secondFrames = try await Self.waitForFrames(4, on: mock)
+        guard case .request(let oversizedID, _, _, _) = secondFrames[2] else {
+            return XCTFail("expected cap-plus-one stream request")
+        }
+        let capPlusOnePayload = Data(repeating: 0xA5, count: exactPayload.count + 1)
+        await mock.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+            id: oversizedID,
+            flags: [.response, .data],
+            payload: .data(capPlusOnePayload)
+        ))
+        do {
+            for try await _ in oversizedStream.chunks {}
+            XCTFail("cap-plus-one stream payload was retained")
+        } catch let error as BareRPCStreamBufferOverflow {
+            XCTAssertEqual(error.maximumBufferedBytes, maximumBufferedBytes)
+            XCTAssertEqual(error.attemptedBufferedBytes, maximumBufferedBytes + 1)
+        } catch {
+            XCTFail("unexpected stream admission failure: \(error)")
+        }
+        _ = try await Self.waitForFrames(5, on: mock)
+        try await Self.waitForNoInFlight(rpc)
+
+        let reuse = Task {
+            try await rpc.send(command: 103, data: Data("reuse".utf8))
+        }
+        let reuseFrames = try await Self.waitForFrames(6, on: mock)
+        guard case .request(let reuseID, _, _, _) = reuseFrames[5] else {
+            return XCTFail("expected reuse request")
+        }
+        let response = Data("healthy".utf8)
+        await mock.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+            id: reuseID,
+            stream: [],
+            payload: .success(response)
+        ))
+        let reuseResult = try await reuse.value
+        XCTAssertEqual(reuseResult, response)
+        let closeCount = await mock.closes()
+        XCTAssertEqual(closeCount, 0)
+        await rpc.close()
+    }
+
+    func test_cancelled_stream_skips_coalesced_late_data_and_errors_then_connection_survives() async throws {
+        let mock = MockTransport()
+        let rpc = try BareRPCClient(
+            transport: mock,
+            maximumWireMessageBytes: 4_096,
+            maximumBufferedStreamBytes: 128,
+            maximumRetainedErrorBytes: 8
+        )
+        let cancelledStream = try await rpc.stream(command: 104, data: Data("{}".utf8))
+        let initialFrames = try await Self.waitForFrames(2, on: mock)
+        guard case .request(let cancelledID, _, _, _) = initialFrames[0] else {
+            return XCTFail("expected cancellable stream request")
+        }
+        cancelledStream.destroy()
+        _ = try await Self.waitForFrames(3, on: mock)
+        try await Self.waitForNoInFlight(rpc)
+
+        let reuse = Task {
+            try await rpc.send(command: 105, data: Data("reuse".utf8))
+        }
+        let framesWithReuse = try await Self.waitForFrames(4, on: mock)
+        guard case .request(let reuseID, _, _, _) = framesWithReuse[3] else {
+            return XCTFail("expected reuse request")
+        }
+
+        // All three late payloads belong to the settled stream. They are
+        // validated and advanced over without materializing a chunk or error
+        // String, even though they arrive coalesced with a live response.
+        var inbound = BareRPCCodec.__testEncodeStreamFrame(
+            id: cancelledID,
+            flags: [.response, .data],
+            payload: .data(Data(repeating: 0xA5, count: 1_024))
+        )
+        inbound.append(BareRPCCodec.__testEncodeStreamFrame(
+            id: cancelledID,
+            flags: [.response, .error],
+            payload: .error(.init(
+                message: String(repeating: "m", count: 1_024),
+                code: "E_LATE",
+                errno: -4
+            ))
+        ))
+        inbound.append(BareRPCCodec.__testEncodeResponseFrame(
+            id: cancelledID,
+            stream: [],
+            payload: .failure(.init(
+                message: String(repeating: "r", count: 1_024),
+                code: "E_LATE",
+                errno: -5
+            ))
+        ))
+        let response = Data("still-open".utf8)
+        inbound.append(BareRPCCodec.__testEncodeResponseFrame(
+            id: reuseID,
+            stream: [],
+            payload: .success(response)
+        ))
+        await mock.feedInbound(inbound)
+
+        let reuseResult = try await reuse.value
+        XCTAssertEqual(reuseResult, response)
+        try await Self.waitForNoInFlight(rpc)
+        let closeCount = await mock.closes()
+        XCTAssertEqual(closeCount, 0)
+        withExtendedLifetime(cancelledStream) {}
         await rpc.close()
     }
 
@@ -2663,7 +3851,9 @@ final class BareRPCClientTests: XCTestCase {
         let mock = MockTransport()
         let rpc = BareRPCClient(transport: mock)
         await rpc.close()
-        await rpc.close() // no crash
+        await rpc.close()
+        let closeCount = await mock.closes()
+        XCTAssertEqual(closeCount, 1, "idempotent close must tear down the transport exactly once")
     }
 
     func test_concurrent_close_callers_join_one_transport_teardown() async throws {
@@ -2930,6 +4120,92 @@ final class BareRPCClientTests: XCTestCase {
         await client.close()
     }
 
+    func test_deinit_cancels_noncooperative_reconnect_and_closes_late_transport() async throws {
+        let first = MockTransport()
+        let replacement = MockTransport()
+        let factory = NonCooperativeReconnectFactory(
+            initial: first,
+            replacement: replacement
+        )
+
+        var initialization: Task<QVACClient, Error>? = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(1),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        var client: QVACClient? = try await initialization?.value
+        initialization = nil
+        weak let weakClient = client
+        let initialRPC = await client?.rpc
+        XCTAssertNotNil(initialRPC)
+
+        await first.feedError(ReconnectProbeError())
+        if let initialRPC {
+            try await Self.waitUntilClosed(initialRPC)
+        }
+
+        var reconnectCaller: Task<HeartbeatResponse, Error>? = Task { [client] in
+            guard let client else {
+                throw QVACError.transport(reason: "test released client before reconnect")
+            }
+            return try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+
+        let factoryDeadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while !(await factory.reconnectIsWaiting()), ContinuousClock.now < factoryDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let factoryIsWaiting = await factory.reconnectIsWaiting()
+        let factoryCalls = await factory.calls()
+        XCTAssertTrue(
+            factoryIsWaiting,
+            "replacement factory never reached its cancellation-oblivious suspension"
+        )
+        XCTAssertEqual(factoryCalls, 2)
+
+        reconnectCaller?.cancel()
+        do {
+            _ = try await reconnectCaller?.value
+            XCTFail("the sole reconnect caller must observe cancellation")
+        } catch is CancellationError {
+            // Expected. The shared reconnect remains owned by the client until deinit.
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+        reconnectCaller = nil
+        client = nil
+
+        let deinitDeadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while weakClient != nil, ContinuousClock.now < deinitDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertNil(weakClient, "the suspended reconnect must not retain QVACClient")
+
+        // The cancelled factory returns a resource late. `makeConnection` must
+        // close it before any handshake or application request reaches the wire.
+        await factory.releaseReconnect()
+        let closeDeadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while await replacement.closes() == 0, ContinuousClock.now < closeDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        let firstCloseCount = await first.closes()
+        let replacementCloseCount = await replacement.closes()
+        let replacementFrames = Self.frames(in: await replacement.outbound())
+        let reconnectStillWaiting = await factory.reconnectIsWaiting()
+        XCTAssertEqual(firstCloseCount, 1)
+        XCTAssertEqual(replacementCloseCount, 1)
+        XCTAssertTrue(
+            replacementFrames.isEmpty,
+            "a transport returned after deinit must close before __init_config or application I/O"
+        )
+        XCTAssertFalse(reconnectStillWaiting)
+    }
+
     func test_cancelled_sole_reconnect_waiter_preserves_failed_attempt_for_observation() async throws {
         let first = MockTransport()
         let rejected = MockTransport()
@@ -3140,6 +4416,48 @@ final class BareRPCClientTests: XCTestCase {
         await client.close()
     }
 
+    func test_nonfinite_completion_json_fails_before_reconnecting_a_dead_generation() async throws {
+        let first = MockTransport()
+        let unusedReplacement = MockTransport()
+        let factory = SequencedTransportFactory(transports: [first, unusedReplacement])
+
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { try await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(1),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        let client = try await initialization.value
+        let initialRPC = await client.rpc
+        await first.feedError(ReconnectProbeError())
+        try await Self.waitUntilClosed(initialRPC)
+
+        do {
+            _ = try await client.completion(
+                modelId: "llm",
+                history: [.user("hello")],
+                generationParams: .object(["temperature": .number(.nan)])
+            )
+            XCTFail("non-finite JSON must fail before connection lifecycle work")
+        } catch let QVACError.encoding(message) {
+            XCTAssertTrue(message.contains("could not encode request"), message)
+        } catch {
+            XCTFail("expected encoding error, got \(error)")
+        }
+
+        let finalFactoryCalls = await factory.calls()
+        let unusedOutbound = await unusedReplacement.outbound()
+        XCTAssertEqual(finalFactoryCalls, 1)
+        XCTAssertTrue(
+            unusedOutbound.isEmpty,
+            "a deterministic local encoding failure must not spawn or handshake a worker"
+        )
+        await client.close()
+    }
+
     func test_stale_isOpen_result_cannot_escape_an_installed_replacement() async throws {
         let first = MockTransport()
         let second = MockTransport()
@@ -3209,6 +4527,121 @@ final class BareRPCClientTests: XCTestCase {
         XCTAssertEqual(retryHeartbeat.number, 12)
         let finalFactoryCalls = await factory.calls()
         XCTAssertEqual(finalFactoryCalls, 2)
+        await client.close()
+    }
+
+    func test_close_while_new_request_is_reentrant_rejects_without_writing_application_frame() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let gate = FirstInvocationGate()
+        await client.__testSetAfterOpenCheckHook { await gate.pauseFirst() }
+        let waitingCall = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.waitForFirstInvocation(on: gate)
+
+        await client.close()
+        await gate.release()
+
+        do {
+            _ = try await waitingCall.value
+            XCTFail("a request racing terminal close must not be written")
+        } catch let QVACError.transport(reason, underlying) {
+            XCTAssertEqual(reason, "client is closed")
+            XCTAssertNil(underlying)
+        } catch {
+            XCTFail("expected closed-client transport error, got \(error)")
+        }
+        await client.__testSetAfterOpenCheckHook(nil)
+        let outbound = await transport.outbound()
+        let closeCount = await transport.closes()
+        XCTAssertTrue(outbound.isEmpty)
+        XCTAssertEqual(closeCount, 1)
+    }
+
+    func test_stale_open_result_joins_in_progress_reconnect_before_trusting_old_generation() async throws {
+        let first = MockTransport()
+        let replacement = MockTransport()
+        let factory = SequencedTransportFactory(transports: [first, replacement])
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { try await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(2),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        let client = try await initialization.value
+        let firstRPC = await client.rpc
+
+        let gate = FirstInvocationGate()
+        await client.__testSetAfterOpenCheckHook { await gate.pauseFirst() }
+        let staleOpenCaller = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.waitForFirstInvocation(on: gate)
+
+        await first.feedError(ReconnectProbeError())
+        try await Self.waitUntilClosed(firstRPC)
+        let reconnectOwner = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.waitForFactoryCalls(2, on: factory)
+        _ = try await Self.waitForFrames(1, on: replacement)
+
+        await gate.release()
+        try await Self.waitForReconnectWaiters(2, on: client)
+        try await Self.replyToInit(on: replacement)
+
+        for call in [staleOpenCaller, reconnectOwner] {
+            do {
+                _ = try await call.value
+                XCTFail("every caller crossing a reconnect must observe state loss")
+            } catch let error as QVACError {
+                guard case .connectionReset = error else {
+                    return XCTFail("expected connectionReset, got \(error)")
+                }
+            }
+        }
+        await client.__testSetAfterOpenCheckHook(nil)
+
+        let firstRequestTypes = Self.frames(in: await first.outbound()).compactMap { frame -> String? in
+            guard case .request(_, _, _, let payload) = frame,
+                  let payload,
+                  let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any]
+            else { return nil }
+            return object["type"] as? String
+        }
+        let replacementRequestTypes = Self.frames(
+            in: await replacement.outbound()
+        ).compactMap { frame -> String? in
+            guard case .request(_, _, _, let payload) = frame,
+                  let payload,
+                  let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any]
+            else { return nil }
+            return object["type"] as? String
+        }
+        XCTAssertEqual(firstRequestTypes, ["__init_config"])
+        XCTAssertEqual(replacementRequestTypes, ["__init_config"])
+        let factoryCalls = await factory.calls()
+        let generation = await client.__testConnectionGeneration()
+        let reconnectWaiters = await client.__testReconnectWaiterCount()
+        XCTAssertEqual(factoryCalls, 2)
+        XCTAssertEqual(generation, 2)
+        XCTAssertEqual(reconnectWaiters, 0)
+
+        let retry = Task {
+            try await client.heartbeat(rpcOptions: .init(timeout: .seconds(1)))
+        }
+        try await Self.replyToHeartbeats(
+            on: replacement,
+            expectedCount: 1,
+            minimumFrameCount: 2,
+            number: 37
+        )
+        let heartbeat = try await retry.value
+        XCTAssertEqual(heartbeat.number, 37)
         await client.close()
     }
 
@@ -3485,6 +4918,485 @@ final class BareRPCClientTests: XCTestCase {
         errno = 0
         XCTAssertEqual(Darwin.kill(workerPID, 0), -1, "reconnect worker PID still exists")
         XCTAssertEqual(errno, ESRCH, "reconnect worker must be reaped, errno=\(errno)")
+    }
+    #endif
+
+    // MARK: - Public client boundary coverage
+
+    func test_stream_and_duplex_setup_failures_are_normalized_after_generation_closes() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let rpc = await client.rpc
+        await transport.feedError(ReconnectProbeError())
+        try await Self.waitUntilClosed(rpc)
+
+        do {
+            _ = try await client.loggingStream(id: "closed-generation")
+            XCTFail("stream setup on a closed generation must fail")
+        } catch let QVACError.transport(reason, underlying) {
+            XCTAssertEqual(reason, "loggingStream RPC failed")
+            XCTAssertNotNil(underlying)
+        } catch {
+            XCTFail("expected normalized stream transport error, got \(error)")
+        }
+
+        do {
+            _ = try await client.transcribeStream(modelId: "speech")
+            XCTFail("duplex setup on a closed generation must fail")
+        } catch let QVACError.transport(reason, underlying) {
+            XCTAssertEqual(reason, "transcribeStream RPC failed")
+            XCTAssertNotNil(underlying)
+        } catch {
+            XCTFail("expected normalized duplex transport error, got \(error)")
+        }
+
+        let outbound = await transport.outbound()
+        XCTAssertTrue(outbound.isEmpty)
+        await client.close()
+    }
+
+    func test_base64_preflight_rejects_payload_that_cannot_fit_outbound_budget() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(
+            testing: transport,
+            maximumWireMessageBytes: 1_024,
+            maximumOutboundPayloadBytes: 8,
+            maximumInlineBinaryBytes: 64
+        )
+
+        do {
+            _ = try await client.ocr(
+                modelId: "ocr",
+                imageBytes: Data(repeating: 0xA5, count: 6)
+            )
+            XCTFail("base64 bytes equal to the outbound ceiling cannot leave room for JSON framing")
+        } catch let QVACError.invalidArgument(reason) {
+            XCTAssertTrue(reason.contains("at least 11 base64 and JSON-structure bytes"), reason)
+            XCTAssertTrue(reason.contains("maximumOutboundPayloadBytes 8"), reason)
+        } catch {
+            XCTFail("expected outbound preflight error, got \(error)")
+        }
+
+        let outbound = await transport.outbound()
+        XCTAssertTrue(outbound.isEmpty)
+        await client.close()
+    }
+
+    func test_reconnect_handshake_timeout_is_bounded_normalized_and_closes_replacement() async throws {
+        let first = MockTransport()
+        let silentReplacement = MockTransport()
+        let factory = SequencedTransportFactory(transports: [first, silentReplacement])
+
+        let initialization = Task {
+            try await QVACClient(
+                configuration: .testing(factory: { try await factory.make() }),
+                runtimeContext: nil,
+                initHandshakeTimeout: .milliseconds(150),
+                logger: nil
+            )
+        }
+        try await Self.replyToInit(on: first)
+        let client = try await initialization.value
+        let initialRPC = await client.rpc
+        await first.feedError(ReconnectProbeError())
+        try await Self.waitUntilClosed(initialRPC)
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        do {
+            _ = try await client.heartbeat(rpcOptions: .init(timeout: .seconds(2)))
+            XCTFail("a silent replacement handshake must time out")
+        } catch let QVACError.transport(reason, underlying) {
+            XCTAssertTrue(reason.contains("worker did not reply to __init_config"), reason)
+            XCTAssertTrue(reason.contains("0.15 seconds"), reason)
+            XCTAssertNil(underlying)
+        } catch {
+            XCTFail("expected normalized reconnect handshake timeout, got \(error)")
+        }
+        XCTAssertLessThan(
+            started.duration(to: clock.now),
+            .seconds(1),
+            "reconnect must use the init-handshake deadline, not the request deadline"
+        )
+        let factoryCalls = await factory.calls()
+        let replacementCloseCount = await silentReplacement.closes()
+        let generation = await client.__testConnectionGeneration()
+        XCTAssertEqual(factoryCalls, 2)
+        XCTAssertEqual(replacementCloseCount, 1)
+        XCTAssertEqual(generation, 1)
+        await client.close()
+    }
+
+    func test_copied_typed_stream_iterator_rejects_concurrent_reads_and_cancels_owner() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let source: QVACResponseStream<QVACResponse> = try await client.streamTyped(
+            .loggingStream(LoggingStreamRequest(id: "copied-iterator")),
+            rpcOptions: .init(timeout: nil)
+        )
+        _ = try await Self.waitForFrames(2, on: transport)
+
+        let iterator = source.makeAsyncIterator()
+        let first = ResponseIteratorBox(iterator)
+        let second = ResponseIteratorBox(iterator)
+        let outcome = await withTaskGroup(of: ConcurrentReadOutcome.self) { group in
+            for box in [first, second] {
+                group.addTask {
+                    do {
+                        _ = try await box.next()
+                        return .value
+                    } catch let QVACError.protocolViolation(message) {
+                        return .protocolViolation(message)
+                    } catch {
+                        return .unexpected(String(describing: error))
+                    }
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(1))
+                return .timedOut
+            }
+
+            let firstOutcome = await group.next() ?? .timedOut
+            source.cancel()
+            group.cancelAll()
+            while await group.next() != nil {}
+            return firstOutcome
+        }
+
+        guard case .protocolViolation(let message) = outcome else {
+            await client.close()
+            return XCTFail("expected immediate concurrent-read rejection, got \(outcome)")
+        }
+        XCTAssertEqual(message, "response stream does not support concurrent next() calls")
+        try await Self.waitForNoInFlight(await client.rpc)
+        await client.close()
+    }
+
+    func test_concrete_stream_malformed_error_envelope_fails_after_bounded_drain() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let source: QVACResponseStream<CompletionStreamResponse> = try await client.streamTyped(
+            .completionStream(.init(history: [], modelId: "model", stream: true)),
+            decoding: CompletionStreamResponse.self,
+            rpcOptions: .init(timeout: nil)
+        )
+        let frames = try await Self.waitForFrames(2, on: transport)
+        guard case .request(let id, _, _, _) = frames[0] else {
+            source.cancel()
+            await client.close()
+            return XCTFail("expected concrete stream request")
+        }
+
+        var inbound = BareRPCCodec.__testEncodeResponseFrame(
+            id: id,
+            stream: [.open],
+            payload: .success(nil)
+        )
+        var malformedRecord = Data(
+            #"{"type":"error","code":"invalid","message":"bad"}"#.utf8
+        )
+        malformedRecord.append(0x0A)
+        inbound.append(BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.response, .data],
+            payload: .data(malformedRecord)
+        ))
+        inbound.append(BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.response, .end]
+        ))
+        await transport.feedInbound(inbound)
+
+        do {
+            var iterator = source.makeAsyncIterator()
+            _ = try await iterator.next()
+            XCTFail("malformed terminal errors must fail closed")
+        } catch let QVACError.protocolViolation(message) {
+            XCTAssertTrue(message.contains("malformed error response"), message)
+        } catch {
+            XCTFail("expected malformed-error protocol violation, got \(error)")
+        }
+        try await Self.waitForNoInFlight(await client.rpc)
+        await client.close()
+    }
+
+    func test_concrete_stream_terminal_error_drain_times_out_instead_of_hanging() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let source: QVACResponseStream<CompletionStreamResponse> = try await client.streamTyped(
+            .completionStream(.init(history: [], modelId: "missing", stream: true)),
+            decoding: CompletionStreamResponse.self,
+            rpcOptions: .init(timeout: nil)
+        )
+        let frames = try await Self.waitForFrames(2, on: transport)
+        guard case .request(let id, _, _, _) = frames[0] else {
+            source.cancel()
+            await client.close()
+            return XCTFail("expected concrete stream request")
+        }
+
+        var inbound = BareRPCCodec.__testEncodeResponseFrame(
+            id: id,
+            stream: [.open],
+            payload: .success(nil)
+        )
+        var terminalErrorRecord = Data(
+            #"{"type":"error","code":52002,"message":"missing"}"#.utf8
+        )
+        terminalErrorRecord.append(0x0A)
+        inbound.append(BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.response, .data],
+            payload: .data(terminalErrorRecord)
+        ))
+        await transport.feedInbound(inbound)
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        do {
+            var iterator = source.makeAsyncIterator()
+            _ = try await iterator.next()
+            XCTFail("an absent terminal trailer/EOF must not hang indefinitely")
+        } catch let QVACError.requestTimedOut(operation, after) {
+            XCTAssertEqual(operation, "completionStream")
+            XCTAssertEqual(after, .seconds(5))
+        } catch {
+            XCTFail("expected bounded terminal-drain timeout, got \(error)")
+        }
+        let elapsed = started.duration(to: clock.now)
+        XCTAssertGreaterThanOrEqual(elapsed, .seconds(4.5))
+        XCTAssertLessThan(elapsed, .seconds(7))
+        try await Self.waitForNoInFlight(await client.rpc)
+        let teardownCount = Self.frames(in: await transport.outbound()).filter { frame in
+            guard case .stream(let frameID, let flags, _) = frame else { return false }
+            return frameID == id
+                && flags.contains(.response)
+                && flags.contains(.destroy)
+        }.count
+        XCTAssertEqual(teardownCount, 1, "terminal timeout must destroy the remote stream once")
+        await client.close()
+    }
+
+    func test_concrete_stream_terminal_drain_cancellation_destroys_remote_once() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let source: QVACResponseStream<CompletionStreamResponse> = try await client.streamTyped(
+            .completionStream(.init(history: [], modelId: "missing", stream: true)),
+            decoding: CompletionStreamResponse.self,
+            rpcOptions: .init(timeout: nil)
+        )
+        let frames = try await Self.waitForFrames(2, on: transport)
+        guard case .request(let id, _, _, _) = frames[0] else {
+            source.cancel()
+            await client.close()
+            return XCTFail("expected concrete stream request")
+        }
+
+        var terminalErrorRecord = Data(
+            #"{"type":"error","code":52002,"message":"missing"}"#.utf8
+        )
+        terminalErrorRecord.append(0x0A)
+        var inbound = BareRPCCodec.__testEncodeResponseFrame(
+            id: id,
+            stream: [.open],
+            payload: .success(nil)
+        )
+        inbound.append(BareRPCCodec.__testEncodeStreamFrame(
+            id: id,
+            flags: [.response, .data],
+            payload: .data(terminalErrorRecord)
+        ))
+        await transport.feedInbound(inbound)
+
+        let read = Task { () throws -> CompletionStreamResponse? in
+            var iterator = source.makeAsyncIterator()
+            return try await iterator.next()
+        }
+        try await Task.sleep(for: .milliseconds(25))
+        read.cancel()
+        do {
+            _ = try await read.value
+            XCTFail("cancelling a terminal drain must cancel the read")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("expected cancellation, got \(error)")
+        }
+
+        try await Self.waitForNoInFlight(await client.rpc)
+        let teardownCount = Self.frames(in: await transport.outbound()).filter { frame in
+            guard case .stream(let frameID, let flags, _) = frame else { return false }
+            return frameID == id
+                && flags.contains(.response)
+                && flags.contains(.destroy)
+        }.count
+        XCTAssertEqual(teardownCount, 1, "terminal cancellation must destroy the remote stream once")
+        await client.close()
+    }
+
+    func test_deinit_sends_bounded_shutdown_before_transport_close() async throws {
+        let transport = MockTransport()
+        await transport.setOnWrite { data in
+            for frame in Self.frames(in: data) {
+                guard case .request(let id, _, _, let payload) = frame,
+                      let payload,
+                      let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+                      object["type"] as? String == "__shutdown__" else { continue }
+                Task {
+                    await transport.feedInbound(BareRPCCodec.__testEncodeResponseFrame(
+                        id: id,
+                        stream: [],
+                        payload: .success(Data(#"{"success":true}"#.utf8))
+                    ))
+                }
+            }
+        }
+
+        var client: QVACClient? = QVACClient(
+            testing: transport,
+            shutdownBeforeClose: true,
+            shutdownTimeout: .milliseconds(250)
+        )
+        XCTAssertNotNil(client)
+        client = nil
+
+        let frames = try await Self.waitForFrames(1, on: transport)
+        let shutdownCount = frames.filter { frame in
+            guard case .request(_, _, _, let payload) = frame,
+                  let payload,
+                  let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any]
+            else { return false }
+            return object["type"] as? String == "__shutdown__"
+        }.count
+        XCTAssertEqual(shutdownCount, 1)
+
+        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while await transport.closes() == 0, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let closeCount = await transport.closes()
+        XCTAssertEqual(closeCount, 1)
+    }
+
+    #if os(macOS)
+    func test_public_macos_configuration_uses_npm_local_bare_and_completes_real_uds_handshake() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qvac-public-init-\(UUID().uuidString)", isDirectory: true)
+        let nodeModules = root.appendingPathComponent("node_modules", isDirectory: true)
+        let workerDirectory = nodeModules
+            .appendingPathComponent("@qvac/sdk/dist/server", isDirectory: true)
+        let bareDirectory = nodeModules
+            .appendingPathComponent("bare-runtime/bin", isDirectory: true)
+        let worker = workerDirectory.appendingPathComponent("worker.js")
+        let response = workerDirectory.appendingPathComponent("init.response")
+        let packageBare = bareDirectory.appendingPathComponent("bare")
+        try FileManager.default.createDirectory(
+            at: workerDirectory,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: bareDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let reply = BareRPCCodec.__testEncodeResponseFrame(
+            id: 1,
+            stream: [],
+            payload: .success(Data(#"{"success":true}"#.utf8))
+        )
+        try reply.write(to: response, options: .atomic)
+        try Data("""
+        import json
+        import pathlib
+        import socket
+        import sys
+
+        config = json.loads(sys.argv[1])
+        peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        peer.settimeout(2.0)
+        peer.connect(config["QVAC_IPC_SOCKET_PATH"])
+        if not peer.recv(65536):
+            raise RuntimeError("host closed before __init_config")
+        peer.sendall(pathlib.Path(__file__).with_name("init.response").read_bytes())
+        while peer.recv(65536):
+            pass
+        """.utf8).write(to: worker, options: .atomic)
+        try Data("#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n".utf8).write(
+            to: packageBare,
+            options: .atomic
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: packageBare.path
+        )
+
+        let configuration = try QVACClient.Configuration.macOS(
+            nodeModulesDir: nodeModules,
+            initTimeout: 2,
+            homeDirectory: root
+        )
+        let client = try await QVACClient(
+            configuration: configuration,
+            runtimeContext: nil,
+            initHandshakeTimeout: .seconds(2),
+            logger: nil
+        )
+        let activeTransport = await client.transport
+        guard let uds = activeTransport as? UnixDomainSocketTransport else {
+            await client.close()
+            return XCTFail("public macOS configuration must create a UDS transport")
+        }
+        let generation = await client.__testConnectionGeneration()
+        XCTAssertEqual(generation, 1)
+        let socketPath = uds.socketPath
+        let ownedSocketDirectory = URL(fileURLWithPath: socketPath).deletingLastPathComponent()
+        let workerPID = uds.__testWorkerPID()
+        XCTAssertGreaterThan(workerPID, 0)
+        await client.close()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: socketPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ownedSocketDirectory.path))
+        errno = 0
+        XCTAssertEqual(Darwin.kill(workerPID, 0), -1, "public close left its worker running")
+        XCTAssertEqual(errno, ESRCH, "public close must reap its worker, errno=\(errno)")
+    }
+
+    func test_public_macos_initializer_normalizes_missing_bare_error() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qvac-public-spawn-failure-\(UUID().uuidString)", isDirectory: true)
+        let nodeModules = root.appendingPathComponent("node_modules", isDirectory: true)
+        let workerDirectory = nodeModules
+            .appendingPathComponent("@qvac/sdk/dist/server", isDirectory: true)
+        let worker = workerDirectory.appendingPathComponent("worker.js")
+        let missingBare = root.appendingPathComponent("missing-bare")
+        try FileManager.default.createDirectory(
+            at: workerDirectory,
+            withIntermediateDirectories: true
+        )
+        try Data("// test worker placeholder".utf8).write(to: worker)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = try QVACClient.Configuration.macOS(
+            nodeModulesDir: nodeModules,
+            bareExecutable: missingBare,
+            initTimeout: 1,
+            homeDirectory: root
+        )
+        do {
+            _ = try await QVACClient(
+                configuration: configuration,
+                runtimeContext: nil,
+                initHandshakeTimeout: .seconds(1),
+                logger: nil
+            )
+            XCTFail("a missing Bare executable must fail initialization")
+        } catch let QVACError.transport(reason, underlying) {
+            XCTAssertTrue(reason.contains("Bare executable not found"), reason)
+            XCTAssertTrue(reason.contains(missingBare.path), reason)
+            XCTAssertTrue(underlying is UnixDomainSocketTransport.SpawnError)
+        } catch {
+            XCTFail("expected normalized subprocess transport error, got \(error)")
+        }
     }
     #endif
 }

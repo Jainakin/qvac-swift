@@ -5,14 +5,15 @@ completion.
 
 ## Add the package
 
-The 0.2 release line contains the current SDK 0.17.0 API. Add the package through
-Xcode or Swift Package Manager:
+The current hardened revision for the QVAC SDK 0.17.0 contract is an unreleased
+review candidate. To evaluate it through the public repository URL, use the
+`main` branch:
 
 ```swift
 dependencies: [
     .package(
         url: "https://github.com/Jainakin/qvac-swift.git",
-        .upToNextMinor(from: "0.2.0")
+        branch: "main"
     )
 ],
 targets: [
@@ -28,10 +29,10 @@ targets: [
 The minimum platforms are iOS 17 and macOS 14. The macOS runtime requires Apple
 silicon.
 
-> Important: If `0.2.0` is not yet available during review, evaluators can
-> temporarily replace the version requirement with `branch: "main"`. Do not ship
-> a branch-based dependency. The existing `v0.1.0` tag predates the current stream
-> types and buffering behavior.
+> Important: This branch-based declaration is for evaluation only. After the
+> maintainers publish the reviewed `0.2.0` source release, replace
+> `branch: "main"` with `.upToNextMinor(from: "0.2.0")`. The existing `v0.1.0`
+> tag predates the current stream types and buffering behavior.
 
 ## Create a client
 
@@ -59,6 +60,17 @@ let client = try await QVACClient(
 The macOS configuration prefers that directory's
 `bare-runtime/bin/bare` executable, keeping the worker and runtime in the same
 dependency graph.
+
+Batch completion accepts up to 256 prompts by default. Set
+`maximumBatchPrompts` when creating the client to match the largest batch the
+application is designed to accept. The client rejects larger batches before
+allocating per-prompt tasks, streams, or result state; use a lower limit on
+memory-constrained devices.
+
+For memory-constrained deployments, also set `maximumVLAActionBytes` for VLA
+outputs and `maximumRegistryResponseBytes` for unpaginated registry list/search
+responses. Their defaults are 8 MiB and 4 MiB, each clamped to the wire and
+aggregate-result limits.
 
 ## Load and infer
 

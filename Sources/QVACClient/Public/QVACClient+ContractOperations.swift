@@ -24,7 +24,7 @@ public extension QVACClient {
                 "expected deleteCache response, got \(response.discriminator)"
             )
         }
-        guard result.success else {
+        guard result.error == nil, result.success else {
             throw QVACError.server(.deleteCacheFailed, message: result.error)
         }
         return result
@@ -266,7 +266,8 @@ public extension QVACClient {
     ) async throws -> JSONValue {
         let response: QVACResponse = try await sendTyped(
             .getLoadedModelInfo(GetLoadedModelInfoRequest(modelId: modelId)),
-            rpcOptions: rpcOptions
+            rpcOptions: rpcOptions,
+            maximumResponseBytes: maximumMetadataResponseBytes
         )
         guard case .getLoadedModelInfo(let result) = response else {
             throw QVACError.protocolViolation(
@@ -282,7 +283,9 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> JSONValue {
         let response: QVACResponse = try await sendTyped(
-            .getModelInfo(GetModelInfoRequest(name: name)), rpcOptions: rpcOptions
+            .getModelInfo(GetModelInfoRequest(name: name)),
+            rpcOptions: rpcOptions,
+            maximumResponseBytes: maximumMetadataResponseBytes
         )
         guard case .getModelInfo(let result) = response else {
             throw QVACError.protocolViolation(
@@ -299,7 +302,8 @@ public extension QVACClient {
     ) async throws -> GetSystemResourcesResponse {
         let response: QVACResponse = try await sendTyped(
             .getSystemResources(GetSystemResourcesRequest(sample: sample)),
-            rpcOptions: rpcOptions
+            rpcOptions: rpcOptions,
+            maximumResponseBytes: maximumMetadataResponseBytes
         )
         guard case .getSystemResources(let result) = response else {
             throw QVACError.protocolViolation(
@@ -335,14 +339,16 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> [JSONValue] {
         let response: QVACResponse = try await sendTyped(
-            .modelRegistryList(ModelRegistryListRequest()), rpcOptions: rpcOptions
+            .modelRegistryList(ModelRegistryListRequest()),
+            rpcOptions: rpcOptions,
+            maximumResponseBytes: maximumRegistryResponseBytes
         )
         guard case .modelRegistryList(let result) = response else {
             throw QVACError.protocolViolation(
                 "expected modelRegistryList response, got \(response.discriminator)"
             )
         }
-        guard result.success, let models = result.models else {
+        guard result.error == nil, result.success, let models = result.models else {
             throw QVACError.server(.qvacModelRegistryQueryFailed, message: result.error)
         }
         return models
@@ -363,14 +369,16 @@ public extension QVACClient {
             quantization: quantization
         )
         let response: QVACResponse = try await sendTyped(
-            .modelRegistrySearch(request), rpcOptions: rpcOptions
+            .modelRegistrySearch(request),
+            rpcOptions: rpcOptions,
+            maximumResponseBytes: maximumRegistryResponseBytes
         )
         guard case .modelRegistrySearch(let result) = response else {
             throw QVACError.protocolViolation(
                 "expected modelRegistrySearch response, got \(response.discriminator)"
             )
         }
-        guard result.success, let models = result.models else {
+        guard result.error == nil, result.success, let models = result.models else {
             throw QVACError.server(.qvacModelRegistryQueryFailed, message: result.error)
         }
         return models
@@ -387,14 +395,16 @@ public extension QVACClient {
             registrySource: registrySource
         )
         let response: QVACResponse = try await sendTyped(
-            .modelRegistryGetModel(request), rpcOptions: rpcOptions
+            .modelRegistryGetModel(request),
+            rpcOptions: rpcOptions,
+            maximumResponseBytes: maximumMetadataResponseBytes
         )
         guard case .modelRegistryGetModel(let result) = response else {
             throw QVACError.protocolViolation(
                 "expected modelRegistryGetModel response, got \(response.discriminator)"
             )
         }
-        guard result.success, let model = result.model else {
+        guard result.error == nil, result.success, let model = result.model else {
             throw QVACError.server(.qvacModelRegistryQueryFailed, message: result.error)
         }
         return model
@@ -413,7 +423,7 @@ public extension QVACClient {
                 "expected provide response, got \(response.discriminator)"
             )
         }
-        guard result.success else {
+        guard result.error == nil, result.success else {
             throw QVACError.client(.providerStartFailed, message: result.error)
         }
         return result
@@ -432,7 +442,7 @@ public extension QVACClient {
                 "expected stopProvide response, got \(response.discriminator)"
             )
         }
-        guard result.success else {
+        guard result.error == nil, result.success else {
             throw QVACError.client(.providerStopFailed, message: result.error)
         }
         return result
@@ -472,6 +482,13 @@ public extension QVACClient {
                 "expected state response, got \(response.discriminator)"
             )
         }
-        return result.state
+        switch result.state {
+        case "active", "suspending", "suspended", "resuming":
+            return result.state
+        default:
+            throw QVACError.protocolViolation(
+                "state response must be active, suspending, suspended, or resuming; got \(result.state)"
+            )
+        }
     }
 }

@@ -45,6 +45,9 @@ public extension QVACClient {
         /// Observational snapshots retaining the newest count- and byte-bounded
         /// window if the consumer lags. Coalescing never changes `outputs` or `stats`.
         public let progressStream: QVACBufferedStream<DiffusionProgressTick>
+        /// Images accumulated across worker records. The task throws
+        /// ``QVACError/resourceLimitExceeded(operation:resource:maximumBytes:attemptedBytes:)``
+        /// before retaining data beyond `maximumAccumulatedResultBytes`.
         public let outputs: Task<[Data], Error>
         public let stats: Task<DiffusionStats?, Error>
 
@@ -94,6 +97,25 @@ public extension QVACClient {
         if let initImages, initImages.isEmpty {
             throw QVACError.invalidArgument("diffusion initImages must not be empty")
         }
+        if let initImage, initImage.isEmpty {
+            throw QVACError.invalidArgument("diffusion initImage must not be empty")
+        }
+        if let initImages, !initImages.allSatisfy({ !$0.isEmpty }) {
+            throw QVACError.invalidArgument(
+                "diffusion initImages must not contain empty data"
+            )
+        }
+        if let initImage {
+            try validateBase64InputSizes(
+                CollectionOfOne(initImage.count),
+                operation: "diffusion"
+            )
+        } else if let initImages {
+            try validateBase64InputSizes(
+                initImages.lazy.map(\.count),
+                operation: "diffusion"
+            )
+        }
         var req = DiffusionStreamRequest(modelId: modelId, prompt: prompt)
         req.negativePrompt = negativePrompt
         req.width = width
@@ -124,12 +146,27 @@ public extension QVACClient {
         return try await diffusion(req, rpcOptions: rpcOptions)
     }
 
-    /// Generate images from an exact 0.17 request while retaining the rich progress,
-    /// outputs, and stats views. This overload exposes every generated request field.
+    /// Generate images from a full 0.17 request while retaining the rich progress,
+    /// outputs, and stats views. This overload exposes every generated request field
+    /// and validates the pinned 0.17 diffusion schema before transport I/O. Use
+    /// `wireDiffusionStream` only when intentionally sending an unchecked wire request.
+    /// The accumulated-result ceiling applies to output retained across records; each
+    /// individual response record remains governed by `maximumWireMessageBytes`.
     func diffusion(
         _ req: DiffusionStreamRequest,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> DiffusionRun {
+        let (inlineItemCount, inlineItemOverflow) = (req.initImages?.count ?? 0)
+            .addingReportingOverflow(req.initImage == nil ? 0 : 1)
+        guard !inlineItemOverflow else {
+            throw QVACError.invalidArgument("diffusion binary input count overflowed")
+        }
+        try validateInlineBinaryItemCount(inlineItemCount, operation: "diffusion")
+        let inlineBinaryByteCounts = try QVACMediaRequestValidator.validate(req)
+        try validateBase64InputSizes(
+            inlineBinaryByteCounts,
+            operation: "diffusion"
+        )
         let stream: QVACResponseStream<QVACResponse> = try await streamTyped(
             .diffusionStream(req),
             rpcOptions: rpcOptions
@@ -141,8 +178,10 @@ public extension QVACClient {
             maximumBufferedBytes: maximumBufferedStreamBytes
         )
         let statsBox = ResultBox<DiffusionStats?>()
+        let initialResultBudget = makeResultByteBudget(operation: "diffusionStream")
 
         let outputsTask = Task<[Data], Error> {
+            var resultBudget = initialResultBudget
             var imgs: [Data] = []
             do {
                 let responses = QVACResponseStreamIteratorBox(stream)
@@ -162,6 +201,20 @@ public extension QVACClient {
                         try Self.rejectUnexpectedResponse(response, expected: "diffusionStream")
                     }
                     if r.done == true {
+                        let terminalOutput = Result {
+                            try Self.decodeDiffusionOutput(
+                                r.data,
+                                resultBudget: &resultBudget
+                            )
+                        }
+                        if case .failure(let error) = terminalOutput,
+                           let qvacError = error as? QVACError,
+                           case .resourceLimitExceeded = qvacError {
+                            throw qvacError
+                        }
+                        if case .success(let output?) = terminalOutput {
+                            imgs.append(output)
+                        }
                         let terminal = try await Self.resolveResponseStreamTerminal(
                             responses,
                             operation: "diffusionStream"
@@ -170,12 +223,9 @@ public extension QVACClient {
                             progress: DiffusionProgressTick?,
                             stats: DiffusionStats?
                         ) in
-                            var terminalOutputs = imgs
-                            if let output = try Self.decodeDiffusionOutput(r.data) {
-                                terminalOutputs.append(output)
-                            }
+                            _ = try terminalOutput.get()
                             return (
-                                terminalOutputs,
+                                imgs,
                                 Self.decodeDiffusionProgress(r),
                                 try r.stats.map {
                                     try Self.decodeInferenceStats(
@@ -200,6 +250,12 @@ public extension QVACClient {
                         progressCont.finish()
                         return terminal.outputs
                     }
+                    // Validate and charge the worker-controlled binary field before
+                    // publishing progress carried by the same response record.
+                    let output = try Self.decodeDiffusionOutput(
+                        r.data,
+                        resultBudget: &resultBudget
+                    )
                     if let tick = Self.decodeDiffusionProgress(r) {
                         progressCont.yield(
                             contentsOf: [tick],
@@ -210,7 +266,7 @@ public extension QVACClient {
                             )
                         )
                     }
-                    if let output = try Self.decodeDiffusionOutput(r.data) {
+                    if let output {
                         imgs.append(output)
                     }
                     if let wireStats = r.stats {
@@ -259,14 +315,17 @@ public extension QVACClient {
         )
     }
 
-    private static func decodeDiffusionOutput(_ encoded: String?) throws -> Data? {
+    private static func decodeDiffusionOutput(
+        _ encoded: String?,
+        resultBudget: inout QVACResultByteBudget
+    ) throws -> Data? {
         guard let encoded else { return nil }
         guard !encoded.isEmpty else { return nil }
-        guard let decoded = Data(base64Encoded: encoded), !decoded.isEmpty else {
-            throw QVACError.protocolViolation(
-                "diffusionStream returned empty or invalid base64 image data"
-            )
-        }
-        return decoded
+        return try decodeRetainedBase64Output(
+            encoded,
+            invalidMessage: "diffusionStream returned empty or invalid base64 image data",
+            retention: .binaryArrayElement,
+            resultBudget: &resultBudget
+        )
     }
 }

@@ -22,6 +22,15 @@ const noticesPath = join(repoRoot, 'THIRD_PARTY_NOTICES.md')
 const noticeGeneratorPath = join(repoRoot, 'tools/release/generate-third-party-notices.mjs')
 const privacyAuditPath = join(repoRoot, 'tools/release/privacy-manifest-audit.json')
 const privacyAuditVerifierPath = join(repoRoot, 'tools/release/verify-privacy-manifests.mjs')
+const bareKitPatchDirectory = join(repoRoot, 'tools/native/bare-kit')
+const bareKitPatchPath = join(bareKitPatchDirectory, 'bare-kit-2.3.0-qvac.patch')
+const bareKitPatchProvenancePath = join(bareKitPatchDirectory, 'provenance.lock.json')
+const bareKitPatchVerifierPath = join(bareKitPatchDirectory, 'verify.mjs')
+const bareKitNativeClosurePath = join(
+  bareKitPatchDirectory,
+  '.build',
+  'bare-kit-native-closure.json',
+)
 const allowedOutputRoots = [
   resolve(repoRoot, 'release-candidate'),
   generatedFrameworkRoot,
@@ -116,6 +125,26 @@ if (!lstatSync(noticesPath).isFile()) {
 execFileSync(process.execPath, [noticeGeneratorPath, '--check'], { stdio: 'inherit' })
 const noticesPathCanonical = realpathSync(noticesPath)
 canonicalInputs.push(['third-party notices input', noticesPathCanonical])
+assertExistingPathHasNoSymlinkComponents(bareKitPatchPath, repoRoot, 'BareKit patch input')
+assertExistingPathHasNoSymlinkComponents(
+  bareKitPatchProvenancePath,
+  repoRoot,
+  'BareKit patch provenance input',
+)
+execFileSync(process.execPath, [bareKitPatchVerifierPath, '--check'], { stdio: 'inherit' })
+canonicalInputs.push(['BareKit patch input', realpathSync(bareKitPatchPath)])
+canonicalInputs.push(['BareKit patch provenance input', realpathSync(bareKitPatchProvenancePath)])
+assertExistingPathHasNoSymlinkComponents(
+  bareKitNativeClosurePath,
+  repoRoot,
+  'BareKit native closure evidence input',
+)
+execFileSync(
+  process.execPath,
+  [bareKitPatchVerifierPath, '--verify-evidence', bareKitNativeClosurePath],
+  { stdio: 'inherit' },
+)
+canonicalInputs.push(['BareKit native closure evidence input', realpathSync(bareKitNativeClosurePath)])
 assertExistingPathHasNoSymlinkComponents(privacyAuditPath, repoRoot, 'privacy audit input')
 if (!lstatSync(privacyAuditPath).isFile()) {
   throw new Error('[package-artifacts] privacy-manifest-audit.json must be a regular file')
@@ -166,4 +195,7 @@ copyFileSync(noticesPathCanonical, join(outputDirCanonical, 'THIRD_PARTY_NOTICES
 copyFileSync(privacyAuditPathCanonical, join(outputDirCanonical, 'privacy-manifest-audit.json'))
 copyFileSync(join(repoRoot, 'tools/runtime/resolution-inventory.json'), join(outputDirCanonical, 'runtime-resolution-inventory.json'))
 copyFileSync(join(repoRoot, 'tools/provenance/qvac-sdk.lock.json'), join(outputDirCanonical, 'qvac-sdk-provenance.json'))
-console.log(`[package-artifacts] staged ${linkSet.targets.length} deterministic archives + notices/privacy/provenance in ${outputDirCanonical}`)
+copyFileSync(bareKitPatchPath, join(outputDirCanonical, 'bare-kit-2.3.0-qvac.patch'))
+copyFileSync(bareKitPatchProvenancePath, join(outputDirCanonical, 'bare-kit-patch-provenance.json'))
+copyFileSync(bareKitNativeClosurePath, join(outputDirCanonical, 'bare-kit-native-closure.json'))
+console.log(`[package-artifacts] staged ${linkSet.targets.length} deterministic archives + notices/privacy/native provenance in ${outputDirCanonical}`)

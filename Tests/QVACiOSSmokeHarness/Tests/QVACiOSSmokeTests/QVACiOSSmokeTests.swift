@@ -17,7 +17,9 @@ final class QVACiOSSmokeTests: XCTestCase {
         )
         XCTAssertEqual(arguments.count, 3)
         let configuration = try QVACClient.Configuration.iOSWithBundledResource(
-            arguments: arguments
+            arguments: arguments,
+            memoryLimit: 512 * 1024 * 1024,
+            assets: home.path
         )
         let client = try await QVACClient(
             configuration: configuration,

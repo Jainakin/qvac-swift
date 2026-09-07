@@ -197,8 +197,12 @@ public extension QVACClient {
 
     /// Load a model with a single-shot RPC (no progress events).
     /// The simplest entry point — good when the model is already cached locally.
+    ///
+    /// `modelSrc` may be omitted only for the canonical 0.17 AudioGen and image
+    /// classification model types. Those plugins resolve their component assets
+    /// from `modelConfig`; every other model type requires a non-empty source.
     func loadModel(
-        modelSrc: String,
+        modelSrc: String? = nil,
         modelType: String,
         modelConfig: JSONValue? = nil,
         modelName: String? = nil,
@@ -248,8 +252,12 @@ public extension QVACClient {
     /// Returns a request-id-bearing run. Iterate ``ModelLoadRun/progress`` and await
     /// ``ModelLoadRun/result`` for the resolved id. Cancelling `result` tears down the
     /// underlying server stream.
+    ///
+    /// `modelSrc` may be omitted only for the canonical 0.17 AudioGen and image
+    /// classification model types. Those plugins resolve their component assets
+    /// from `modelConfig`; every other model type requires a non-empty source.
     func loadModelStreaming(
-        modelSrc: String,
+        modelSrc: String? = nil,
         modelType: String,
         modelConfig: JSONValue? = nil,
         modelName: String? = nil,
@@ -330,8 +338,14 @@ public extension QVACClient {
             request.delegate = nil
             request.modelName = nil
         } else {
-            guard let modelSrc = request.modelSrc, !modelSrc.isEmpty else {
-                throw QVACError.invalidArgument("loadModel modelSrc must not be empty")
+            if Self.modelTypeAllowsSourceLessLoad(request.modelType) {
+                // The 0.17 client schema accepts an omitted source for AudioGen and
+                // classification, then normalizes it to the required wire string.
+                request.modelSrc = request.modelSrc ?? ""
+            } else {
+                guard let modelSrc = request.modelSrc, !modelSrc.isEmpty else {
+                    throw QVACError.invalidArgument("loadModel modelSrc must not be empty")
+                }
             }
             request.modelId = nil
             request.requestId = requestId
@@ -444,7 +458,7 @@ public extension QVACClient {
         guard case .unloadModel(let r) = response else {
             throw QVACError.protocolViolation("expected unloadModel response, got \(response.discriminator)")
         }
-        if r.success != true {
+        if r.error != nil || r.success != true {
             throw QVACError.server(.modelUnloadFailed, message: r.error)
         }
         if autoClose,
@@ -458,7 +472,7 @@ public extension QVACClient {
     // MARK: - Internal helpers (not in QVACClient.swift because it would couple it to this file)
 
     internal static func makeLoadModelRequest(
-        modelSrc: String,
+        modelSrc: String?,
         modelType: String,
         modelConfig: JSONValue?,
         modelName: String?,
@@ -478,7 +492,13 @@ public extension QVACClient {
         return request
     }
 
-    private static func resolveModelType(
+    private static func modelTypeAllowsSourceLessLoad(_ modelType: String) -> Bool {
+        modelType == "audiogen-ggml" || modelType == "ggml-classification"
+    }
+
+    /// Internal pure resolver kept visible to contract tests so descriptor precedence
+    /// remains pinned independently of the transport-facing load-model adapters.
+    static func resolveModelType(
         _ explicit: String?,
         descriptor: ModelDescriptor
     ) throws -> String {
@@ -531,7 +551,7 @@ public extension QVACClient {
     }
 
     private static func extractLoadedModelId(_ result: LoadModelResponse) throws -> String {
-        guard result.success == true else {
+        guard result.error == nil, result.success == true else {
             throw QVACError.server(.modelLoadFailed, message: result.error)
         }
         guard let id = result.modelId else {

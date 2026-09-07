@@ -87,7 +87,7 @@ public extension QVACClient {
     }
 
     private static func extractSingleEmbedding(from response: EmbedResponse) throws -> [Double] {
-        if response.success != true {
+        if response.error != nil || response.success != true {
             throw QVACError.server(.embedFailed, message: response.error)
         }
         guard case .array(let arr) = response.embedding else {
@@ -105,7 +105,7 @@ public extension QVACClient {
     }
 
     private static func extractBatchEmbedding(from response: EmbedResponse) throws -> [[Double]] {
-        if response.success != true {
+        if response.error != nil || response.success != true {
             throw QVACError.server(.embedFailed, message: response.error)
         }
         guard case .array(let outer) = response.embedding else {

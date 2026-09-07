@@ -4,7 +4,8 @@ public extension QVACClient {
     enum BciNeuralInput: Sendable, Equatable {
         /// Provider-local path to a neural `.bin` recording.
         case filePath(String)
-        /// Raw neural-signal bytes, base64-encoded by the client.
+        /// Raw neural-signal bytes, base64-encoded by the client. Empty data is
+        /// forwarded as an empty base64 string, matching QVAC 0.17.
         case data(Data)
 
         var wireValue: JSONValue {
@@ -45,6 +46,9 @@ public extension QVACClient {
         metadata: Bool = false,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> BciTranscriptionRun {
+        if case .data(let data) = neuralData {
+            try validateBase64InputSizes([data.count], operation: "bciTranscribe")
+        }
         let requestId = UUID().uuidString
         let request = BciTranscribeRequest(
             modelId: modelId,
@@ -55,10 +59,14 @@ public extension QVACClient {
         let source: QVACResponseStream<QVACResponse> = try await streamTyped(
             .bciTranscribe(request), rpcOptions: rpcOptions
         )
+        let maximumAccumulatedResultBytes = self.maximumAccumulatedResultBytes
+        let initialResultBudget = makeResultByteBudget(operation: "bciTranscribe")
         let result = Task<BciTranscriptionOutcome, Error> {
+            var resultBudget = initialResultBudget
             var text = ""
             var segments: [TranscribeSegment] = []
             var stats: JSONValue?
+            var retainedStatsBytes = 0
             let responses = QVACResponseStreamIteratorBox(source)
             while let response = try await responses.next() {
                 if case .error(let error) = response {
@@ -75,22 +83,56 @@ public extension QVACClient {
                 guard case .bciTranscribe(let frame) = response else {
                     try Self.rejectUnexpectedResponse(response, expected: "bciTranscribe")
                 }
-                if frame.done == true || frame.error != nil {
+                if let error = frame.error {
+                    return try await Self.resolveResponseStreamTerminal(
+                        responses,
+                        operation: "bciTranscribe"
+                    ) { () throws -> BciTranscriptionOutcome in
+                        throw QVACError.server(.transcriptionFailed, message: error)
+                    }
+                }
+                if frame.done == true {
+                    let terminalSegment = Result {
+                        try frame.segment.map(TranscribeSegment.init(from:))
+                    }
+                    if let responseStats = frame.stats {
+                        let nextStatsBytes = Self.conservativeBufferedJSONBytes(
+                            responseStats,
+                            elementCount: 1,
+                            fallback: maximumAccumulatedResultBytes
+                        )
+                        try resultBudget.replace(
+                            retainedStatsBytes,
+                            with: nextStatsBytes
+                        )
+                        retainedStatsBytes = nextStatsBytes
+                    }
+                    if let fragment = frame.text {
+                        try resultBudget.consumeRetainedString(fragment)
+                    }
+                    if let raw = frame.segment {
+                        try resultBudget.consume(Self.conservativeBufferedJSONBytes(
+                            raw,
+                            elementCount: 1,
+                            fallback: maximumAccumulatedResultBytes
+                        ))
+                    }
                     return try await Self.resolveResponseStreamTerminal(
                         responses,
                         operation: "bciTranscribe"
                     ) {
-                        if let error = frame.error {
-                            throw QVACError.server(.transcriptionFailed, message: error)
-                        }
                         var terminalText = text
                         var terminalSegments = segments
                         var terminalStats = stats
-                        if let fragment = frame.text { terminalText += fragment }
-                        if let raw = frame.segment {
-                            terminalSegments.append(try TranscribeSegment(from: raw))
+                        if let fragment = frame.text {
+                            terminalText += fragment
                         }
-                        if let responseStats = frame.stats { terminalStats = responseStats }
+                        if let parsed = try terminalSegment.get() {
+                            terminalSegments.append(parsed)
+                        }
+                        if let responseStats = frame.stats {
+                            terminalStats = responseStats
+                        }
                         return BciTranscriptionOutcome(
                             text: terminalText,
                             segments: terminalSegments,
@@ -98,11 +140,29 @@ public extension QVACClient {
                         )
                     }
                 }
-                if let fragment = frame.text { text += fragment }
-                if let raw = frame.segment {
-                    segments.append(try TranscribeSegment(from: raw))
+                if let responseStats = frame.stats {
+                    let nextStatsBytes = Self.conservativeBufferedJSONBytes(
+                        responseStats,
+                        elementCount: 1,
+                        fallback: maximumAccumulatedResultBytes
+                    )
+                    try resultBudget.replace(retainedStatsBytes, with: nextStatsBytes)
+                    retainedStatsBytes = nextStatsBytes
+                    stats = responseStats
                 }
-                if let responseStats = frame.stats { stats = responseStats }
+                if let fragment = frame.text {
+                    try resultBudget.consumeRetainedString(fragment)
+                    text += fragment
+                }
+                if let raw = frame.segment {
+                    let parsed = try TranscribeSegment(from: raw)
+                    try resultBudget.consume(Self.conservativeBufferedJSONBytes(
+                        raw,
+                        elementCount: 1,
+                        fallback: maximumAccumulatedResultBytes
+                    ))
+                    segments.append(parsed)
+                }
             }
             throw QVACError.client(
                 .streamEndedWithoutResponse,
@@ -185,6 +245,10 @@ public extension QVACClient {
     }
 
     /// Open a sliding-window BCI transcription session.
+    ///
+    /// Timestep counts are encoded as JSON numbers and therefore must not exceed
+    /// 2^53 - 1, the largest integer that the 0.17 JavaScript worker can represent
+    /// exactly.
     func bciTranscribeStream(
         modelId: String,
         metadata: Bool = false,
@@ -193,11 +257,24 @@ public extension QVACClient {
         emit: String? = nil,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> BciTranscribeStreamSession {
+        let maximumExactWireInteger = 9_007_199_254_740_991
         if let windowTimesteps, windowTimesteps <= 0 {
             throw QVACError.invalidArgument("windowTimesteps must be positive")
         }
+        if let windowTimesteps, windowTimesteps > maximumExactWireInteger {
+            throw QVACError.invalidArgument(
+                "windowTimesteps must not exceed 9007199254740991, "
+                    + "the largest exactly representable JSON integer"
+            )
+        }
         if let hopTimesteps, hopTimesteps <= 0 {
             throw QVACError.invalidArgument("hopTimesteps must be positive")
+        }
+        if let hopTimesteps, hopTimesteps > maximumExactWireInteger {
+            throw QVACError.invalidArgument(
+                "hopTimesteps must not exceed 9007199254740991, "
+                    + "the largest exactly representable JSON integer"
+            )
         }
         if let windowTimesteps, let hopTimesteps, hopTimesteps >= windowTimesteps {
             throw QVACError.invalidArgument("hopTimesteps must be less than windowTimesteps")

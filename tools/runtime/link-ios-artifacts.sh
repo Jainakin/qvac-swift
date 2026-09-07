@@ -47,7 +47,16 @@ node "$SCRIPT_DIR/node_modules/bare-link/bin.js" "$SCRIPT_DIR" \
     --host ios-x64-simulator \
     --out "$OUTPUT"
 
-cp -R "$SCRIPT_DIR/node_modules/react-native-bare-kit/ios/BareKit.xcframework" "$OUTPUT/BareKit.xcframework"
+if [[ -n "${QVAC_BARE_KIT_CANDIDATE:-}" ]]; then
+    node "$SCRIPT_DIR/../native/bare-kit/verify.mjs" \
+        --artifact "$QVAC_BARE_KIT_CANDIDATE"
+    cp -R "$QVAC_BARE_KIT_CANDIDATE" "$OUTPUT/BareKit.xcframework"
+    BARE_KIT_IS_PATCHED=true
+else
+    cp -R "$SCRIPT_DIR/node_modules/react-native-bare-kit/ios/BareKit.xcframework" \
+        "$OUTPUT/BareKit.xcframework"
+    BARE_KIT_IS_PATCHED=false
+fi
 
 # react-native-bare-kit's published XCFramework contains an Objective-C umbrella
 # header but no Clang module map. CocoaPods synthesizes one, whereas SwiftPM
@@ -68,6 +77,11 @@ done
 if [[ "$BARE_KIT_SLICE_COUNT" -lt 2 ]]; then
     echo "[link-ios] error: expected device and simulator BareKit slices" >&2
     exit 1
+fi
+
+if [[ "$BARE_KIT_IS_PATCHED" == true ]]; then
+    node "$SCRIPT_DIR/../native/bare-kit/verify.mjs" \
+        --artifact "$OUTPUT/BareKit.xcframework"
 fi
 
 echo "[link-ios] staged $(find "$OUTPUT" -maxdepth 1 -type d -name '*.xcframework' | wc -l | tr -d ' ') xcframeworks"

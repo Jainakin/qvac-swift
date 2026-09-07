@@ -67,11 +67,26 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         }
     }
 
-    private struct RejectingEncodableProbe: Encodable {
-        private enum ExpectedFailure: Error { case encode }
+    private final class EncodingInvocationProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var invocationCount = 0
+
+        func recordInvocation() {
+            lock.withLock { invocationCount += 1 }
+        }
+
+        func count() -> Int {
+            lock.withLock { invocationCount }
+        }
+    }
+
+    private struct ObservableEncodableProbe: Encodable {
+        let probe: EncodingInvocationProbe
 
         func encode(to encoder: Encoder) throws {
-            throw ExpectedFailure.encode
+            probe.recordInvocation()
+            var container = encoder.singleValueContainer()
+            try container.encode("must-not-be-encoded")
         }
     }
 
@@ -1352,6 +1367,94 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         }
     }
 
+    func test_tts_option_validation_is_shared_and_rejects_before_transport_io() async throws {
+        let rejectedTransport = MockTransport()
+        let rejectedClient = QVACClient(testing: rejectedTransport)
+
+        func expectInvalidArgument(
+            _ expectedDiagnostic: String,
+            operation: () async throws -> Void
+        ) async {
+            do {
+                try await operation()
+                XCTFail("invalid TTS options unexpectedly reached the transport")
+            } catch let QVACError.invalidArgument(message) {
+                XCTAssertTrue(
+                    message.contains(expectedDiagnostic),
+                    "expected diagnostic containing '\(expectedDiagnostic)', got '\(message)'"
+                )
+            } catch {
+                XCTFail("expected invalidArgument, got \(error)")
+            }
+        }
+
+        await expectInvalidArgument("description must not be empty") {
+            _ = try await rejectedClient.textToSpeech(
+                modelId: "tts",
+                text: "hello",
+                description: ""
+            )
+        }
+        await expectInvalidArgument("emotion must be one of") {
+            _ = try await rejectedClient.textToSpeech(
+                modelId: "tts",
+                text: "hello",
+                emotion: "excited"
+            )
+        }
+        await expectInvalidArgument("mutually exclusive") {
+            _ = try await rejectedClient.textToSpeech(
+                modelId: "tts",
+                text: "hello",
+                voiceDescription: "calm",
+                quality: "high"
+            )
+        }
+        await expectInvalidArgument("sentenceDelimiterPreset must be one of") {
+            _ = try await rejectedClient.textToSpeechStream(
+                modelId: "tts",
+                sentenceDelimiterPreset: "words"
+            )
+        }
+        await expectInvalidArgument("voice must not be empty") {
+            _ = try await rejectedClient.textToSpeechStream(modelId: "tts", voice: "")
+        }
+        await expectInvalidArgument("emotion must be one of") {
+            _ = try await rejectedClient.textToSpeechStream(
+                modelId: "tts",
+                emotion: "excited"
+            )
+        }
+        let rejectedOutbound = await rejectedTransport.outbound()
+        XCTAssertTrue(
+            rejectedOutbound.isEmpty,
+            "all local TTS schema validation must complete before transport I/O"
+        )
+        await rejectedClient.close()
+
+        let acceptedTransport = MockTransport()
+        let acceptedClient = QVACClient(testing: acceptedTransport)
+        let session = try await acceptedClient.textToSpeechStream(
+            modelId: "tts",
+            sentenceDelimiterPreset: "multilingual",
+            voice: "narrator",
+            emotion: "proper noun"
+        )
+        let frames = try await Self.waitForFrames(3, on: acceptedTransport)
+        let (_, request) = try Self.duplexRequest(in: frames)
+        XCTAssertEqual(
+            Set(request.keys),
+            Set(["type", "modelId", "sentenceDelimiterPreset", "voice", "emotion"])
+        )
+        XCTAssertEqual(request["type"] as? String, "textToSpeechStream")
+        XCTAssertEqual(request["modelId"] as? String, "tts")
+        XCTAssertEqual(request["sentenceDelimiterPreset"] as? String, "multilingual")
+        XCTAssertEqual(request["voice"] as? String, "narrator")
+        XCTAssertEqual(request["emotion"] as? String, "proper noun")
+        session.destroy()
+        await acceptedClient.close()
+    }
+
     func test_tts_large_single_wire_chunk_streams_every_sample_without_overflow() async throws {
         let transport = MockTransport()
         let client = QVACClient(testing: transport)
@@ -1438,7 +1541,7 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
             XCTAssertEqual(overflow.maximumBufferedBytes, maximumBufferedBytes)
             XCTAssertEqual(
                 overflow.attemptedBufferedBytes,
-                samples.count * MemoryLayout<Double>.stride
+                QVACClient.retainedTtsBufferedBatchBytes(samples.count)
             )
         }
         await client.close()
@@ -1705,6 +1808,90 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         }
     }
 
+    func test_explicit_ocr_run_cancel_releases_nonstream_views_and_raw_stream() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let run = try await client.ocr(
+            modelId: "ocr",
+            imagePath: "/tmp/long-running.png",
+            stream: false,
+            rpcOptions: .init(timeout: nil)
+        )
+        let initialFrames = try await Self.waitForFrames(2, on: transport)
+        let (id, _) = try Self.request(in: initialFrames)
+
+        run.cancel()
+
+        for task in [run.blocks, Task { _ = try await run.stats.value; return [] }] {
+            do {
+                _ = try await task.value
+                XCTFail("cancelled OCR view must not resolve successfully")
+            } catch is CancellationError {
+                // Public Swift cancellation identity is intentionally preserved.
+            } catch {
+                XCTFail("expected CancellationError, got \(error)")
+            }
+        }
+        var emptyIterator = run.blockStream.makeAsyncIterator()
+        let emptyBlock = try await emptyIterator.next()
+        XCTAssertNil(emptyBlock)
+
+        let rpc = await client.rpc
+        try await Self.waitForNoInFlight(rpc)
+        let frames = try await Self.waitForFrames(3, on: transport)
+        let destroys = frames.filter { frame in
+            guard case .stream(let frameID, let flags, .control) = frame else { return false }
+            return frameID == id && flags.contains(.response) && flags.contains(.destroy)
+        }
+        XCTAssertEqual(destroys.count, 1)
+        await client.close()
+    }
+
+    func test_explicit_ocr_run_cancel_fails_streaming_view_and_releases_raw_stream() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let run = try await client.ocr(
+            modelId: "ocr",
+            imagePath: "/tmp/long-running.png",
+            stream: true,
+            rpcOptions: .init(timeout: nil)
+        )
+        let initialFrames = try await Self.waitForFrames(2, on: transport)
+        let (id, _) = try Self.request(in: initialFrames)
+        var blockIterator = run.blockStream.makeAsyncIterator()
+
+        run.cancel()
+
+        let nonstreamBlocks = try await run.blocks.value
+        XCTAssertEqual(nonstreamBlocks, [])
+        do {
+            _ = try await run.stats.value
+            XCTFail("cancelled OCR stats must not resolve successfully")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+        do {
+            _ = try await blockIterator.next()
+            XCTFail("cancelled OCR stream must terminate with cancellation")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+
+        let rpc = await client.rpc
+        try await Self.waitForNoInFlight(rpc)
+        let frames = try await Self.waitForFrames(3, on: transport)
+        let destroys = frames.filter { frame in
+            guard case .stream(let frameID, let flags, .control) = frame else { return false }
+            return frameID == id && flags.contains(.response) && flags.contains(.destroy)
+        }
+        XCTAssertEqual(destroys.count, 1)
+        await client.close()
+    }
+
     func test_extracted_ocr_translate_and_tts_views_outlive_run_wrapper() async throws {
         do {
             let transport = MockTransport()
@@ -1965,6 +2152,50 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         XCTAssertEqual(results.map(\.id), ["first", "second"])
         XCTAssertEqual(results.map(\.final.contentText), ["one", "two"])
         await client.close()
+
+        let positionalTransport = MockTransport()
+        let positionalClient = QVACClient(testing: positionalTransport)
+        let positionalRun = try await positionalClient.batchCompletion(
+            modelId: "llm",
+            prompts: [
+                .init(history: [.user("zero")]),
+                .init(history: [.user("one")]),
+            ]
+        )
+        let positionalFrames = try await Self.waitForFrames(2, on: positionalTransport)
+        let (positionalRequestID, _) = try Self.request(in: positionalFrames)
+        await Self.feedServerStream(
+            id: positionalRequestID,
+            records: [#"{"type":"batchCompletionStream","events":[],"done":true}"#],
+            to: positionalTransport
+        )
+        let positionalIDs = try await positionalRun.ids.value
+        let positionalResultIDs = try await positionalRun.results.value.map(\.id)
+        XCTAssertEqual(positionalIDs, ["0", "1"])
+        XCTAssertEqual(positionalResultIDs, ["0", "1"])
+        await positionalClient.close()
+
+        let mixedTransport = MockTransport()
+        let mixedClient = QVACClient(testing: mixedTransport)
+        let mixedRun = try await mixedClient.batchCompletion(
+            modelId: "llm",
+            prompts: [
+                .init(id: "caller", history: [.user("explicit")]),
+                .init(history: [.user("positional")]),
+            ]
+        )
+        let mixedFrames = try await Self.waitForFrames(2, on: mixedTransport)
+        let (mixedRequestID, _) = try Self.request(in: mixedFrames)
+        await Self.feedServerStream(
+            id: mixedRequestID,
+            records: [#"{"type":"batchCompletionStream","events":[],"done":true}"#],
+            to: mixedTransport
+        )
+        let mixedIDs = try await mixedRun.ids.value
+        let mixedResultIDs = try await mixedRun.results.value.map(\.id)
+        XCTAssertEqual(mixedIDs, ["caller", "1"])
+        XCTAssertEqual(mixedResultIDs, ["caller", "1"])
+        await mixedClient.close()
     }
 
     func test_batch_single_terminal_frame_preserves_large_global_and_per_id_views() async throws {
@@ -2069,25 +2300,105 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
     }
 
     func test_batch_completion_rejects_duplicate_ids_before_transport() async {
-        let transport = MockTransport()
-        let client = QVACClient(testing: transport)
-        do {
-            _ = try await client.batchCompletion(
-                modelId: "llm",
-                prompts: [
+        let cases: [(name: String, prompts: [QVACClient.BatchPrompt])] = [
+            (
+                "two explicit ids",
+                [
                     .init(id: "duplicate", history: [.user("one")]),
                     .init(id: "duplicate", history: [.user("two")]),
                 ]
+            ),
+            (
+                "positional fallback before explicit id",
+                [
+                    .init(history: [.user("one")]),
+                    .init(id: "0", history: [.user("two")]),
+                ]
+            ),
+            (
+                "explicit id before positional fallback",
+                [
+                    .init(id: "1", history: [.user("one")]),
+                    .init(history: [.user("two")]),
+                ]
+            ),
+        ]
+
+        for testCase in cases {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            do {
+                _ = try await client.batchCompletion(
+                    modelId: "llm",
+                    prompts: testCase.prompts
+                )
+                XCTFail("\(testCase.name) must be rejected")
+            } catch let QVACError.invalidArgument(message) {
+                XCTAssertTrue(message.contains("must be unique"), testCase.name)
+            } catch {
+                XCTFail("\(testCase.name): expected invalidArgument, got \(error)")
+            }
+            let outboundFrames = Self.frames(in: await transport.outbound())
+            XCTAssertTrue(
+                outboundFrames.isEmpty,
+                "\(testCase.name) must fail before writing a transport frame"
             )
-            XCTFail("duplicate batch prompt ids must be rejected")
+            await client.close()
+        }
+    }
+
+    func test_batch_completion_enforces_prompt_cardinality_before_transport() async throws {
+        let rejectedTransport = MockTransport()
+        let rejectedClient = QVACClient(
+            testing: rejectedTransport,
+            maximumBatchPrompts: 2
+        )
+        do {
+            _ = try await rejectedClient.batchCompletion(
+                modelId: "llm",
+                prompts: (0..<3).map {
+                    .init(id: "prompt-\($0)", history: [.user("tiny")])
+                }
+            )
+            XCTFail("batch cardinality above the configured ceiling must fail")
         } catch let QVACError.invalidArgument(message) {
-            XCTAssertTrue(message.contains("must be unique"))
+            XCTAssertTrue(message.contains("3 prompts"), message)
+            XCTAssertTrue(message.contains("maximumBatchPrompts is 2"), message)
         } catch {
             XCTFail("expected invalidArgument, got \(error)")
         }
-        let outboundFrames = Self.frames(in: await transport.outbound())
-        XCTAssertTrue(outboundFrames.isEmpty)
-        await client.close()
+        let rejectedOutbound = await rejectedTransport.outbound()
+        XCTAssertTrue(Self.frames(in: rejectedOutbound).isEmpty)
+        await rejectedClient.close()
+
+        let exactTransport = MockTransport()
+        let exactClient = QVACClient(
+            testing: exactTransport,
+            maximumBatchPrompts: 2
+        )
+        let exact = try await exactClient.batchCompletion(
+            modelId: "llm",
+            prompts: [
+                .init(id: "one", history: [.user("tiny")]),
+                .init(id: "two", history: [.user("tiny")]),
+            ],
+            rpcOptions: .init(timeout: nil)
+        )
+        let frames = try await Self.waitForFrames(2, on: exactTransport)
+        let (id, request) = try Self.request(in: frames)
+        XCTAssertEqual((request["prompts"] as? [Any])?.count, 2)
+        await Self.feedServerStream(
+            id: id,
+            records: [
+                #"{"type":"batchCompletionStream","ids":["one","two"],"events":[],"done":true}"#,
+            ],
+            to: exactTransport
+        )
+        let exactIDs = try await exact.ids.value
+        let exactResultIDs = try await exact.results.value.map(\.id)
+        XCTAssertEqual(exactIDs, ["one", "two"])
+        XCTAssertEqual(exactResultIDs, ["one", "two"])
+        await exactClient.close()
     }
 
     func test_batch_completion_cancellation_preserves_partial_prompt_state() async throws {
@@ -2376,7 +2687,7 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
             emitVadEvents: true,
             endOfTurnSilenceMs: 400,
             vadRunIntervalMs: 50,
-            parakeetStreamingConfig: .object(["leftContext": .number(4)]),
+            parakeetStreamingConfig: .object(["leftContextMs": .number(4)]),
             rpcOptions: .init(timeout: nil)
         )
         let frames = try await Self.waitForFrames(3, on: transport)
@@ -2386,7 +2697,10 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         XCTAssertEqual(request["emitVadEvents"] as? Bool, true)
         XCTAssertEqual(request["endOfTurnSilenceMs"] as? Int, 400)
         XCTAssertEqual(request["vadRunIntervalMs"] as? Int, 50)
-        XCTAssertNotNil(request["parakeetStreamingConfig"] as? [String: Any])
+        XCTAssertEqual(
+            (request["parakeetStreamingConfig"] as? [String: Any])?["leftContextMs"] as? Int,
+            4
+        )
 
         try await session.end()
         await Self.feedDuplex(
@@ -2410,6 +2724,88 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
             .done,
         ])
         await client.close()
+    }
+
+    func test_parakeet_streaming_config_matches_017_schema_before_io_and_on_wire() async throws {
+        let rejectedTransport = MockTransport()
+        let rejectedClient = QVACClient(testing: rejectedTransport)
+
+        func expectInvalid(
+            _ diagnostic: String,
+            config: JSONValue
+        ) async {
+            do {
+                _ = try await rejectedClient.transcribeStream(
+                    modelId: "parakeet",
+                    parakeetStreamingConfig: config
+                )
+                XCTFail("invalid parakeet config unexpectedly reached transport I/O")
+            } catch let QVACError.invalidArgument(message) {
+                XCTAssertTrue(message.contains(diagnostic), message)
+            } catch {
+                XCTFail("expected invalidArgument, got \(error)")
+            }
+        }
+
+        await expectInvalid("must be an object", config: .array([]))
+        await expectInvalid(
+            "chunkMs must be a finite positive integer",
+            config: .object(["chunkMs": .number(0)])
+        )
+        await expectInvalid(
+            "historyMs must be a finite positive integer",
+            config: .object(["historyMs": .number(1.5)])
+        )
+        await expectInvalid(
+            "leftContextMs must be a finite nonnegative integer",
+            config: .object(["leftContextMs": .number(-1)])
+        )
+        await expectInvalid(
+            "rightLookaheadMs must be a finite nonnegative integer",
+            config: .object(["rightLookaheadMs": .number(.infinity)])
+        )
+        await expectInvalid(
+            "emitPartials must be a Boolean",
+            config: .object(["emitPartials": .string("true")])
+        )
+        let rejectedBytes = await rejectedTransport.outbound()
+        XCTAssertTrue(rejectedBytes.isEmpty, "invalid nested config must perform zero I/O")
+        await rejectedClient.close()
+
+        let acceptedConfig: [String: JSONValue] = [
+            "chunkMs": .number(160),
+            "historyMs": .number(800),
+            "leftContextMs": .number(0),
+            "rightLookaheadMs": .number(80),
+            "emitPartials": .bool(true),
+            "emitEnergyVad": .bool(false),
+            "spkCacheEnable": .bool(true),
+            "spkCacheLen": .number(8),
+            "fifoLen": .number(4),
+            "chunkLeftContextMs": .number(0),
+            "chunkRightContextMs": .number(40),
+            "spkCacheUpdatePeriod": .number(2),
+        ]
+        let acceptedTransport = MockTransport()
+        let acceptedClient = QVACClient(testing: acceptedTransport)
+        let session = try await acceptedClient.transcribeStream(
+            modelId: "parakeet",
+            parakeetStreamingConfig: .object(acceptedConfig),
+            rpcOptions: .init(timeout: nil)
+        )
+        let (_, request) = try Self.duplexRequest(
+            in: try await Self.waitForFrames(3, on: acceptedTransport)
+        )
+        let encodedConfig = try XCTUnwrap(
+            request["parakeetStreamingConfig"] as? [String: Any]
+        )
+        XCTAssertEqual(Set(encodedConfig.keys), Set(acceptedConfig.keys))
+        XCTAssertEqual(encodedConfig["chunkMs"] as? Int, 160)
+        XCTAssertEqual(encodedConfig["leftContextMs"] as? Int, 0)
+        XCTAssertEqual(encodedConfig["emitPartials"] as? Bool, true)
+        XCTAssertEqual(encodedConfig["emitEnergyVad"] as? Bool, false)
+        session.destroy()
+        await acceptedClient.close()
     }
 
     func test_completion_orchestration_request_id_callback_and_ndjson_tool_result() async throws {
@@ -2700,7 +3096,7 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         await Self.feedServerStream(
             id: id,
             records: [
-                #"{"type":"transcribe","segment":{"text":"bad","startMs":0},"done":true}"#,
+                #"{"type":"transcribe","segment":{"text":"bad","startMs":0,"endMs":1,"append":false},"done":true}"#,
                 #"{"__profilingTrailer":true,"__profiling":{"id":"transcribe-invalid-profile"}}"#,
             ],
             to: transport
@@ -2863,16 +3259,12 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         }
 
         var iterator = run.events.makeAsyncIterator()
-        let contentEvent = try await iterator.next()
-        let doneEvent = try await iterator.next()
-        XCTAssertEqual(contentEvent, .contentDelta(seq: 0, text: "ok"))
-        XCTAssertEqual(
-            doneEvent,
-            .done(seq: 1, stopReason: .eos, rawFullText: "ok")
-        )
         do {
             _ = try await iterator.next()
-            XCTFail("lossless completion events must terminate with the protocol error")
+            XCTFail(
+                "a provisional terminal record must not publish any events before "
+                    + "post-terminal validation succeeds"
+            )
         } catch {
             assertProtocolViolation(error)
         }
@@ -3694,6 +4086,118 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         for try await update in run.progress { progress.append(update) }
         XCTAssertTrue(progress.isEmpty)
         await client.close()
+    }
+
+    func test_raw_load_request_defaults_model_config_seed_and_id_and_rejects_missing_source() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let raw = LoadModelRequest(
+            modelType: "llm",
+            modelSrc: "/models/raw-input.gguf"
+        )
+
+        let run = try await client.loadModel(raw)
+        let frames = try await Self.waitForFrames(1, on: transport)
+        let (id, request) = try Self.request(in: frames)
+        XCTAssertFalse(run.requestId.isEmpty)
+        XCTAssertEqual(request["requestId"] as? String, run.requestId)
+        XCTAssertEqual(request["modelSrc"] as? String, "/models/raw-input.gguf")
+        XCTAssertEqual(request["modelType"] as? String, "llamacpp-completion")
+        XCTAssertEqual((request["modelConfig"] as? [String: Any])?.count, 0)
+        XCTAssertEqual(request["seed"] as? Bool, false)
+        XCTAssertNil(request["modelId"])
+        XCTAssertNil(request["withProgress"])
+        try await Self.feedReply(
+            id: id,
+            response: .loadModel(.init(success: true, modelId: "raw-model-17")),
+            to: transport
+        )
+        let loadedModelID = try await run.result.value
+        XCTAssertEqual(loadedModelID, "raw-model-17")
+
+        for missingSource in [String?.none, ""] {
+            do {
+                _ = try await client.loadModel(LoadModelRequest(
+                    modelType: "llamacpp-completion",
+                    modelSrc: missingSource
+                ))
+                XCTFail("a non-reload raw load requires a non-empty modelSrc")
+            } catch let QVACError.invalidArgument(message) {
+                XCTAssertEqual(message, "loadModel modelSrc must not be empty")
+            } catch {
+                XCTFail("expected invalidArgument, got \(error)")
+            }
+        }
+        let finalFrames = Self.frames(in: await transport.outbound())
+        XCTAssertEqual(finalFrames.count, 1)
+        await client.close()
+    }
+
+    func test_source_less_audio_gen_and_classification_loads_emit_canonical_017_wire_source() async throws {
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let run = try await client.loadModel(modelType: "classification")
+            let frames = try await Self.waitForFrames(1, on: transport)
+            let (id, request) = try Self.request(in: frames)
+            XCTAssertEqual(
+                Set(request.keys),
+                Set(["type", "modelSrc", "modelType", "modelConfig", "requestId", "seed"])
+            )
+            XCTAssertEqual(request["type"] as? String, "loadModel")
+            XCTAssertEqual(request["modelSrc"] as? String, "")
+            XCTAssertEqual(request["modelType"] as? String, "ggml-classification")
+            XCTAssertEqual((request["modelConfig"] as? [String: Any])?.count, 0)
+            try await Self.feedReply(
+                id: id,
+                response: .loadModel(.init(success: true, modelId: "classifier-17")),
+                to: transport
+            )
+            let loadedModelId = try await run.result.value
+            XCTAssertEqual(loadedModelId, "classifier-17")
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let config: JSONValue = .object([
+                "textEncModelSrc": .string("hf:text-encoder"),
+                "lmModelSrc": .string("hf:language-model"),
+                "ditModelSrc": .string("hf:diffusion-transformer"),
+                "vaeModelSrc": .string("hf:vae"),
+            ])
+            let run = try await client.loadModelStreaming(
+                modelType: "audiogen",
+                modelConfig: config
+            )
+            let frames = try await Self.waitForFrames(2, on: transport)
+            let (id, request) = try Self.request(in: frames)
+            XCTAssertEqual(
+                Set(request.keys),
+                Set([
+                    "type", "modelSrc", "modelType", "modelConfig", "requestId", "seed",
+                    "withProgress",
+                ])
+            )
+            XCTAssertEqual(request["type"] as? String, "loadModel")
+            XCTAssertEqual(request["modelSrc"] as? String, "")
+            XCTAssertEqual(request["modelType"] as? String, "audiogen-ggml")
+            XCTAssertEqual(request["withProgress"] as? Bool, true)
+            let encodedConfig = try XCTUnwrap(request["modelConfig"] as? [String: Any])
+            XCTAssertEqual(
+                Set(encodedConfig.keys),
+                Set(["textEncModelSrc", "lmModelSrc", "ditModelSrc", "vaeModelSrc"])
+            )
+            await Self.feedServerStream(
+                id: id,
+                records: [#"{"type":"loadModel","success":true,"modelId":"audiogen-17"}"#],
+                to: transport
+            )
+            let loadedModelId = try await run.result.value
+            XCTAssertEqual(loadedModelId, "audiogen-17")
+            await client.close()
+        }
     }
 
     func test_descriptor_load_infers_type_and_preserves_seed_delegate_and_name() async throws {
@@ -4694,15 +5198,146 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
             ),
             Int.max
         )
+        let encodingProbe = EncodingInvocationProbe()
         XCTAssertEqual(
             QVACClient.conservativeBufferedJSONBytes(
-                RejectingEncodableProbe(),
+                ObservableEncodableProbe(probe: encodingProbe),
                 elementCount: 1,
                 fallback: 4_096
             ),
             4_097,
             "an unmeasurable payload must exceed, not exactly fill, its buffer budget"
         )
+        XCTAssertEqual(
+            encodingProbe.count(),
+            0,
+            "buffer admission must not allocate by invoking Encodable"
+        )
+    }
+
+    func test_known_buffer_estimators_charge_dynamic_storage_without_encoding() throws {
+        let payload = String(repeating: "\u{001f}", count: 4_096)
+        let minimumDynamicCharge = payload.utf8.count * 2
+        let fallback = 1_024
+
+        let ids = QVACClient.conservativeBufferedJSONBytes(
+            [payload],
+            elementCount: 1,
+            fallback: fallback
+        )
+        let model = QVACClient.conservativeBufferedJSONBytes(
+            ModelProgressResponse(
+                downloadKey: payload,
+                downloaded: 1,
+                percentage: 50,
+                total: 2
+            ),
+            elementCount: 1,
+            fallback: fallback
+        )
+        let finetune = QVACClient.conservativeBufferedJSONBytes(
+            FinetuneProgressResponse(
+                accuracy: .number(1),
+                accuracyUncertainty: .number(0),
+                currentBatch: 1,
+                currentEpoch: 1,
+                elapsedMs: 1,
+                etaMs: 1,
+                globalSteps: 1,
+                isTrain: true,
+                loss: .number(1),
+                lossUncertainty: .number(0),
+                modelId: payload,
+                totalBatches: 1
+            ),
+            elementCount: 1,
+            fallback: fallback
+        )
+        let rag = QVACClient.conservativeBufferedJSONBytes(
+            RagProgressResponse(
+                current: 1,
+                operation: "reindex",
+                stage: "cluster",
+                timestamp: 1,
+                total: 2,
+                workspace: payload
+            ),
+            elementCount: 1,
+            fallback: fallback
+        )
+        let tts = QVACClient.conservativeBufferedJSONBytes(
+            TextToSpeechResponse(
+                buffer: [],
+                done: false,
+                sentenceChunk: payload
+            ),
+            elementCount: 1,
+            fallback: fallback
+        )
+        let translate = QVACClient.conservativeBufferedJSONBytes(
+            TranslateResponse(token: payload),
+            elementCount: 1,
+            fallback: fallback
+        )
+        let audio = QVACClient.conservativeBufferedJSONBytes(
+            try QVACClient.AudioGenProgress(wire: .object([
+                "stage": .string(payload),
+                "step": .number(1),
+                "total": .number(2),
+            ])),
+            elementCount: 1,
+            fallback: fallback
+        )
+
+        for (name, estimate) in [
+            ("batch ids", ids),
+            ("model progress", model),
+            ("finetune progress", finetune),
+            ("RAG progress", rag),
+            ("TTS sentence", tts),
+            ("translate token", translate),
+            ("audio progress", audio),
+        ] {
+            XCTAssertGreaterThan(
+                estimate,
+                minimumDynamicCharge,
+                "\(name) must charge its unbounded string storage, not the fail-closed fallback"
+            )
+        }
+
+        let json = QVACClient.conservativeBufferedJSONBytes(
+            JSONValue.string(payload),
+            elementCount: 1,
+            fallback: fallback
+        )
+        let jsonBatch = QVACClient.conservativeBufferedJSONBytes(
+            [JSONValue.string(payload)],
+            elementCount: 1,
+            fallback: fallback
+        )
+        XCTAssertGreaterThan(json, minimumDynamicCharge)
+        XCTAssertGreaterThan(jsonBatch, json)
+
+        let samples = Array(repeating: Double.greatestFiniteMagnitude, count: 128)
+        let sampleEstimate = QVACClient.conservativeBufferedJSONBytes(
+            TextToSpeechResponse(buffer: samples, done: false),
+            elementCount: 1,
+            fallback: fallback
+        )
+        XCTAssertGreaterThanOrEqual(sampleEstimate, samples.count * 64)
+
+        let diffusion = QVACClient.conservativeBufferedJSONBytes(
+            QVACClient.DiffusionProgressTick(step: 1, totalSteps: 2, elapsedMs: 3),
+            elementCount: 1,
+            fallback: fallback
+        )
+        let video = QVACClient.conservativeBufferedJSONBytes(
+            QVACClient.VideoProgressTick(step: 1, totalSteps: 2, elapsedMs: 3),
+            elementCount: 1,
+            fallback: fallback
+        )
+        XCTAssertGreaterThan(diffusion, MemoryLayout<QVACClient.DiffusionProgressTick>.stride)
+        XCTAssertGreaterThan(video, MemoryLayout<QVACClient.VideoProgressTick>.stride)
     }
 
     func test_model_progress_preserves_terminal_failure_after_burst() async throws {
@@ -4896,6 +5531,43 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         _ = try await run.final.value
         let rpc = await client.rpc
         try await Self.waitForNoInFlight(rpc)
+        await client.close()
+    }
+
+    func test_unknown_generated_union_stream_discriminator_fails_closed_once_without_leak() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let run = try await client.completion(
+            modelId: "llm",
+            history: [.user("hello")],
+            rpcOptions: .init(timeout: nil)
+        )
+        let initialFrames = try await Self.waitForFrames(2, on: transport)
+        let (id, _) = try Self.request(in: initialFrames)
+        await Self.feedServerStream(
+            id: id,
+            records: [#"{"type":"futureMessageType","value":42}"#],
+            to: transport,
+            end: false
+        )
+
+        do {
+            _ = try await run.final.value
+            XCTFail("an unknown response discriminator must fail the typed stream")
+        } catch let QVACError.encoding(message) {
+            XCTAssertTrue(message.contains("futureMessageType"), message)
+        } catch {
+            XCTFail("expected encoding error, got \(error)")
+        }
+
+        let rpc = await client.rpc
+        try await Self.waitForNoInFlight(rpc)
+        let finalFrames = try await Self.waitForFrames(3, on: transport)
+        let destroys = finalFrames.filter { frame in
+            guard case .stream(let frameID, let flags, .control) = frame else { return false }
+            return frameID == id && flags.contains(.response) && flags.contains(.destroy)
+        }
+        XCTAssertEqual(destroys.count, 1)
         await client.close()
     }
 
@@ -5146,7 +5818,10 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
 
     func test_vla_uses_exact_plugin_shape_and_little_endian_tensors() async throws {
         let transport = MockTransport()
-        let client = QVACClient(testing: transport)
+        let client = QVACClient(
+            testing: transport,
+            maximumVLAActionBytes: 3 * MemoryLayout<Float>.stride
+        )
         let task = Task {
             try await client.vla(.init(
                 modelId: "vla-model",
@@ -5267,7 +5942,7 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
             await Self.feedServerStream(
                 id: id,
                 records: [
-                    #"{"type":"transcribe","segment":{"id":1,"text":"unsafe","startMs":1.5,"endMs":2},"done":true}"#,
+                    #"{"type":"transcribe","segment":{"id":1,"text":"unsafe","startMs":1.5,"endMs":2,"append":false},"done":true}"#,
                 ],
                 to: transport
             )
@@ -5320,6 +5995,620 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
                 XCTFail("huge AudioGen progress step must be rejected")
             } catch { assertProtocolViolation(error) }
             await client.close()
+        }
+    }
+
+    func test_rich_media_operations_reject_every_locally_invalid_argument_before_io() async {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+
+        func expectInvalidArgument(
+            _ diagnostic: String,
+            operation: () async throws -> Void
+        ) async {
+            do {
+                try await operation()
+                XCTFail("invalid \(diagnostic) input unexpectedly reached the transport")
+            } catch let QVACError.invalidArgument(message) {
+                XCTAssertTrue(
+                    message.contains(diagnostic),
+                    "expected diagnostic containing '\(diagnostic)', got '\(message)'"
+                )
+            } catch {
+                XCTFail("expected invalid argument for \(diagnostic), got \(error)")
+            }
+        }
+
+        await expectInvalidArgument("repeats") {
+            _ = try await client.upscale(modelId: "upscale", image: Data([1]), repeats: 0)
+        }
+        await expectInvalidArgument("mode") {
+            _ = try await client.video(modelId: "video", mode: "future", prompt: "move")
+        }
+        await expectInvalidArgument("requires initImage") {
+            _ = try await client.video(modelId: "video", mode: "img2vid", prompt: "move")
+        }
+        await expectInvalidArgument("does not accept initImage") {
+            _ = try await client.video(
+                modelId: "video",
+                mode: "txt2vid",
+                prompt: "move",
+                initImage: Data([1])
+            )
+        }
+        await expectInvalidArgument("channels") {
+            _ = try await client.classify(
+                modelId: "classifier",
+                image: Data([1]),
+                channels: 4
+            )
+        }
+        await expectInvalidArgument("caption") {
+            _ = try await client.audioGen(modelId: "audio", caption: " \n ")
+        }
+        await expectInvalidArgument("bpm") {
+            _ = try await client.audioGen(modelId: "audio", caption: "rain", bpm: 0)
+        }
+        await expectInvalidArgument("duration") {
+            _ = try await client.audioGen(
+                modelId: "audio",
+                caption: "rain",
+                duration: -0.5
+            )
+        }
+        await expectInvalidArgument("duration") {
+            _ = try await client.audioGen(
+                modelId: "audio",
+                caption: "rain",
+                duration: .nan
+            )
+        }
+        await expectInvalidArgument("duration") {
+            _ = try await client.audioGen(
+                modelId: "audio",
+                caption: "rain",
+                duration: .infinity
+            )
+        }
+        await expectInvalidArgument("windowTimesteps") {
+            _ = try await client.bciTranscribeStream(modelId: "bci", windowTimesteps: 0)
+        }
+        await expectInvalidArgument("hopTimesteps must be positive") {
+            _ = try await client.bciTranscribeStream(modelId: "bci", hopTimesteps: 0)
+        }
+        await expectInvalidArgument("less than windowTimesteps") {
+            _ = try await client.bciTranscribeStream(
+                modelId: "bci",
+                windowTimesteps: 8,
+                hopTimesteps: 8
+            )
+        }
+        await expectInvalidArgument("emit") {
+            _ = try await client.bciTranscribeStream(modelId: "bci", emit: "future")
+        }
+        await expectInvalidArgument("text must not be empty") {
+            _ = try await client.textToSpeech(modelId: "tts", text: " \n")
+        }
+        await expectInvalidArgument("sentenceStream requires stream") {
+            _ = try await client.textToSpeech(
+                modelId: "tts",
+                text: "hello",
+                stream: false,
+                sentenceStream: true
+            )
+        }
+        await expectInvalidArgument("sentenceStreamMaxChunkScalars") {
+            _ = try await client.textToSpeech(
+                modelId: "tts",
+                text: "hello",
+                sentenceStream: true,
+                sentenceStreamMaxChunkScalars: 0
+            )
+        }
+        await expectInvalidArgument("sentenceStreamMaxChunkScalars") {
+            _ = try await client.textToSpeech(
+                modelId: "tts",
+                text: "hello",
+                sentenceStream: true,
+                sentenceStreamMaxChunkScalars: .nan
+            )
+        }
+        await expectInvalidArgument("sentenceStreamMaxChunkScalars") {
+            _ = try await client.textToSpeech(
+                modelId: "tts",
+                text: "hello",
+                sentenceStream: true,
+                sentenceStreamMaxChunkScalars: .infinity
+            )
+        }
+        await expectInvalidArgument("mutually exclusive") {
+            _ = try await client.textToSpeech(
+                modelId: "tts",
+                text: "hello",
+                description: "calm",
+                voiceDescription: "warm"
+            )
+        }
+        await expectInvalidArgument("voice-template") {
+            _ = try await client.textToSpeech(
+                modelId: "tts",
+                text: "hello",
+                description: "calm",
+                voice: "speaker-1"
+            )
+        }
+
+        let outbound = await transport.outbound()
+        XCTAssertTrue(outbound.isEmpty, "local validation must not write any RPC frames")
+        await client.close()
+    }
+
+    func test_every_rich_server_stream_adapter_propagates_typed_worker_errors() async throws {
+        func expectModelNotFound(
+            _ operation: String,
+            body: () async throws -> Void
+        ) async {
+            do {
+                try await body()
+                XCTFail("\(operation) unexpectedly swallowed a worker error")
+            } catch let QVACError.server(code, message) {
+                XCTAssertEqual(code, .modelNotFound, "wrong typed code for \(operation)")
+                XCTAssertEqual(message, "missing model", "wrong message for \(operation)")
+            } catch {
+                XCTFail("\(operation) returned the wrong error: \(error)")
+            }
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let run = try await client.completion(modelId: "missing", history: [.user("hello")])
+            let (id, _) = try Self.request(in: try await Self.waitForFrames(2, on: transport))
+            await Self.feedServerStream(
+                id: id,
+                records: [#"{"type":"error","code":52002,"message":"missing model"}"#],
+                to: transport
+            )
+            await expectModelNotFound("completion") { _ = try await run.final.value }
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let run = try await client.upscale(modelId: "missing", image: Data([1]))
+            let (id, _) = try Self.request(in: try await Self.waitForFrames(2, on: transport))
+            await Self.feedServerStream(
+                id: id,
+                records: [#"{"type":"error","code":52002,"message":"missing model"}"#],
+                to: transport
+            )
+            await expectModelNotFound("upscale") { _ = try await run.outputs.value }
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let run = try await client.diffusion(modelId: "missing", prompt: "image")
+            let (id, _) = try Self.request(in: try await Self.waitForFrames(2, on: transport))
+            await Self.feedServerStream(
+                id: id,
+                records: [#"{"type":"error","code":52002,"message":"missing model"}"#],
+                to: transport
+            )
+            await expectModelNotFound("diffusion") { _ = try await run.outputs.value }
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let run = try await client.video(modelId: "missing", mode: "txt2vid", prompt: "video")
+            let (id, _) = try Self.request(in: try await Self.waitForFrames(2, on: transport))
+            await Self.feedServerStream(
+                id: id,
+                records: [#"{"type":"error","code":52002,"message":"missing model"}"#],
+                to: transport
+            )
+            await expectModelNotFound("video") { _ = try await run.outputs.value }
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let task = Task { try await client.classify(modelId: "missing", image: Data([1])) }
+            let (id, _) = try Self.request(in: try await Self.waitForFrames(2, on: transport))
+            await Self.feedServerStream(
+                id: id,
+                records: [#"{"type":"error","code":52002,"message":"missing model"}"#],
+                to: transport
+            )
+            await expectModelNotFound("classify") { _ = try await task.value }
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let run = try await client.audioGen(modelId: "missing", caption: "rain")
+            let (id, _) = try Self.request(in: try await Self.waitForFrames(2, on: transport))
+            await Self.feedServerStream(
+                id: id,
+                records: [#"{"type":"error","code":52002,"message":"missing model"}"#],
+                to: transport
+            )
+            await expectModelNotFound("audioGen") { _ = try await run.audio.value }
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let run = try await client.bciTranscribe(
+                modelId: "missing",
+                neuralData: .filePath("/tmp/neural.bin")
+            )
+            let (id, _) = try Self.request(in: try await Self.waitForFrames(2, on: transport))
+            await Self.feedServerStream(
+                id: id,
+                records: [#"{"type":"error","code":52002,"message":"missing model"}"#],
+                to: transport
+            )
+            await expectModelNotFound("bciTranscribe") { _ = try await run.result.value }
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let run = try await client.transcribe(modelId: "missing", audioBytes: Data([1]))
+            let (id, _) = try Self.request(in: try await Self.waitForFrames(2, on: transport))
+            await Self.feedServerStream(
+                id: id,
+                records: [#"{"type":"error","code":52002,"message":"missing model"}"#],
+                to: transport
+            )
+            await expectModelNotFound("transcribe") { _ = try await run.result.value }
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let run = try await client.ocr(modelId: "missing", imageBytes: Data([1]))
+            let (id, _) = try Self.request(in: try await Self.waitForFrames(2, on: transport))
+            await Self.feedServerStream(
+                id: id,
+                records: [#"{"type":"error","code":52002,"message":"missing model"}"#],
+                to: transport
+            )
+            await expectModelNotFound("ocr") { _ = try await run.blocks.value }
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let run = try await client.translate(
+                modelId: "missing",
+                modelType: "llm",
+                text: "hello",
+                to: "fr"
+            )
+            let (id, _) = try Self.request(in: try await Self.waitForFrames(2, on: transport))
+            await Self.feedServerStream(
+                id: id,
+                records: [#"{"type":"error","code":52002,"message":"missing model"}"#],
+                to: transport
+            )
+            await expectModelNotFound("translate") { _ = try await run.stats.value }
+            await client.close()
+        }
+
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let run = try await client.textToSpeech(modelId: "missing", text: "hello")
+            let (id, _) = try Self.request(in: try await Self.waitForFrames(2, on: transport))
+            await Self.feedServerStream(
+                id: id,
+                records: [#"{"type":"error","code":52002,"message":"missing model"}"#],
+                to: transport
+            )
+            await expectModelNotFound("textToSpeech") { _ = try await run.done.value }
+            await client.close()
+        }
+    }
+
+    func test_vla_result_parser_rejects_corrupt_binary_shapes_dimensions_and_stats() async throws {
+        let actionBudget = 4 * 1_024 * 1_024
+        func assertRejected(
+            _ result: JSONValue,
+            diagnostic: String,
+            expectedResourceLimit: Bool = false,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async throws {
+            let transport = MockTransport()
+            let client = QVACClient(
+                testing: transport,
+                maximumAccumulatedResultBytes: actionBudget + 4,
+                maximumVLAActionBytes: actionBudget
+            )
+            let task = Task {
+                try await client.vla(.init(
+                    modelId: "vla-model",
+                    images: [[0, 0, 0]],
+                    imageWidth: 1,
+                    imageHeight: 1,
+                    state: [],
+                    tokens: [1],
+                    mask: [1]
+                ))
+            }
+            let (id, _) = try Self.request(
+                in: try await Self.waitForFrames(1, on: transport)
+            )
+            try await Self.feedReply(
+                id: id,
+                response: .pluginInvoke(.init(result: result)),
+                to: transport
+            )
+            do {
+                _ = try await task.value
+                XCTFail("invalid VLA result unexpectedly decoded", file: file, line: line)
+            } catch let error as QVACError {
+                if expectedResourceLimit {
+                    guard case .resourceLimitExceeded(
+                        operation: "vla",
+                        resource: "decoded action bytes",
+                        maximumBytes: actionBudget,
+                        attemptedBytes: actionBudget + 4
+                    ) = error else {
+                        XCTFail("expected VLA action resource limit, got \(error)")
+                        await client.close()
+                        return
+                    }
+                } else if case .protocolViolation(let message) = error {
+                    XCTAssertTrue(
+                        message.contains(diagnostic),
+                        "expected '\(diagnostic)' in '\(message)'",
+                        file: file,
+                        line: line
+                    )
+                } else {
+                    XCTFail("expected protocol violation, got \(error)", file: file, line: line)
+                }
+            } catch {
+                XCTFail("expected protocol violation, got \(error)", file: file, line: line)
+            }
+            await client.close()
+        }
+
+        let oneFloat = Data([0, 0, 128, 63]).base64EncodedString()
+        try await assertRejected(.array([]), diagnostic: "result must be an object")
+        try await assertRejected(
+            .object([
+                "actions": .string(""),
+                "actionDim": .number(1),
+                "chunkSize": .number(1),
+            ]),
+            diagnostic: "not non-empty base64"
+        )
+        try await assertRejected(
+            .object([
+                // Five decoded bytes have the same eight-character base64
+                // length as one Float32, so validation reaches byte alignment.
+                "actions": .string(Data([1, 2, 3, 4, 5]).base64EncodedString()),
+                "actionDim": .number(1),
+                "chunkSize": .number(1),
+            ]),
+            diagnostic: "not divisible by four"
+        )
+        try await assertRejected(
+            .object([
+                "actions": .string("@@@@@@=="),
+                "actionDim": .number(1),
+                "chunkSize": .number(1),
+            ]),
+            diagnostic: "not non-empty base64"
+        )
+        try await assertRejected(
+            .object([
+                "actions": .string("AAAAAA=A"),
+                "actionDim": .number(1),
+                "chunkSize": .number(1),
+            ]),
+            diagnostic: "not non-empty base64"
+        )
+        try await assertRejected(
+            .object([
+                "actions": .string(oneFloat),
+                "actionDim": .number(2),
+                "chunkSize": .number(1),
+            ]),
+            diagnostic: "expected 2 × 1"
+        )
+        try await assertRejected(
+            .object([
+                "actions": .string(oneFloat),
+                "actionDim": .number(1.5),
+                "chunkSize": .number(1),
+            ]),
+            diagnostic: "must be an integer"
+        )
+        try await assertRejected(
+            .object([
+                "actions": .string(oneFloat),
+                "actionDim": .number(9_007_199_254_740_992.0),
+                "chunkSize": .number(1),
+            ]),
+            diagnostic: "must be an integer"
+        )
+        try await assertRejected(
+            .object([
+                "actions": .number(1),
+                "actionDim": .number(1_048_577),
+                "chunkSize": .number(1),
+            ]),
+            diagnostic: "decoded action bytes",
+            expectedResourceLimit: true
+        )
+        try await assertRejected(
+            .object([
+                "actions": .number(1),
+                "actionDim": .number(9_007_199_254_740_991.0),
+                "chunkSize": .number(9_007_199_254_740_991.0),
+            ]),
+            diagnostic: "dimensions are too large"
+        )
+        for bits in [UInt32(0x7fc0_0000), 0x7f80_0000, 0xff80_0000] {
+            let bytes = [
+                UInt8(truncatingIfNeeded: bits),
+                UInt8(truncatingIfNeeded: bits >> 8),
+                UInt8(truncatingIfNeeded: bits >> 16),
+                UInt8(truncatingIfNeeded: bits >> 24),
+            ]
+            try await assertRejected(
+                .object([
+                    "actions": .string(Data(bytes).base64EncodedString()),
+                    "actionDim": .number(1),
+                    "chunkSize": .number(1),
+                ]),
+                diagnostic: "non-finite value"
+            )
+        }
+        try await assertRejected(
+            .object([
+                "actions": .string(oneFloat),
+                // Double(Int.max) rounds to 2^63 on 64-bit platforms. The
+                // decoder must reject it instead of trapping during conversion.
+                "actionDim": .number(9_223_372_036_854_775_808.0),
+                "chunkSize": .number(1),
+            ]),
+            diagnostic: "must be an integer"
+        )
+        try await assertRejected(
+            .object([
+                "actions": .string(oneFloat),
+                "actionDim": .number(1),
+                "chunkSize": .number(1),
+                "stats": .string("invalid"),
+            ]),
+            diagnostic: "stats must be an object"
+        )
+        try await assertRejected(
+            .object([
+                "actions": .string(oneFloat),
+                "actionDim": .number(1),
+                "chunkSize": .number(1),
+                "stats": .object(["vision_ms": .string("fast")]),
+            ]),
+            diagnostic: "vision_ms must be a finite number"
+        )
+    }
+
+    func test_vla_hparams_parser_handles_optional_fields_and_rejects_schema_drift() async throws {
+        let required: [String: JSONValue] = [
+            "chunkSize": .number(1),
+            "actionDim": .number(2),
+            "maxActionDim": .number(3),
+            "maxStateDim": .number(4),
+            "tokenizerMaxLength": .number(5),
+            "visionImageSize": .number(6),
+        ]
+
+        func request(
+            _ result: JSONValue
+        ) async throws -> Result<QVACClient.VLAHyperparametersResult, Error> {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let task = Task { try await client.vlaHparams(modelId: "vla-model") }
+            let (id, _) = try Self.request(
+                in: try await Self.waitForFrames(1, on: transport)
+            )
+            try await Self.feedReply(
+                id: id,
+                response: .pluginInvoke(.init(result: result)),
+                to: transport
+            )
+            do {
+                let value = try await task.value
+                await client.close()
+                return .success(value)
+            } catch {
+                await client.close()
+                return .failure(error)
+            }
+        }
+
+        var withOptionalFields = required
+        withOptionalFields["imagePatchElems"] = .number(768)
+        let optionalResult = try await request(.object([
+            "hparams": .object(withOptionalFields),
+            "backendName": .null,
+        ]))
+        switch optionalResult {
+        case .success(let value):
+            XCTAssertNil(value.backendName)
+            XCTAssertNil(value.hyperparameters.numberOfCameras)
+            XCTAssertNil(value.hyperparameters.stateInputMode)
+            XCTAssertNil(value.hyperparameters.imageInputMode)
+            XCTAssertEqual(value.hyperparameters.imagePatchElements, 768)
+        case .failure(let error):
+            XCTFail("valid optional VLA hparams failed: \(error)")
+        }
+
+        var invalidStateMode = required
+        invalidStateMode["stateInputMode"] = .string("future")
+        var invalidImageMode = required
+        invalidImageMode["imageInputMode"] = .string("future")
+        var invalidInteger = required
+        invalidInteger["chunkSize"] = .number(-1)
+        var unsafeInteger = required
+        unsafeInteger["chunkSize"] = .number(9_007_199_254_740_992.0)
+        let malformed: [(JSONValue, String)] = [
+            (.object(["hparams": .object(required)]), "backendName is missing"),
+            (
+                .object(["hparams": .object(required), "backendName": .number(1)]),
+                "backendName must be string or null"
+            ),
+            (
+                .object(["hparams": .object(invalidStateMode), "backendName": .null]),
+                "stateInputMode is not a 0.17 value"
+            ),
+            (
+                .object(["hparams": .object(invalidImageMode), "backendName": .null]),
+                "imageInputMode is not a 0.17 value"
+            ),
+            (
+                .object(["hparams": .object(invalidInteger), "backendName": .null]),
+                "chunkSize must be an integer"
+            ),
+            (
+                .object(["hparams": .object(unsafeInteger), "backendName": .null]),
+                "chunkSize must be an integer"
+            ),
+            (
+                .object(["hparams": .array([]), "backendName": .null]),
+                "hparams must be an object"
+            ),
+        ]
+
+        for (wire, diagnostic) in malformed {
+            let result = try await request(wire)
+            switch result {
+            case .success:
+                XCTFail("malformed VLA hparams unexpectedly decoded")
+            case .failure(let error):
+                if case .protocolViolation(let message) = error as? QVACError {
+                    XCTAssertTrue(message.contains(diagnostic), "unexpected diagnostic: \(message)")
+                } else {
+                    XCTFail("expected protocol violation, got \(error)")
+                }
+            }
         }
     }
 }

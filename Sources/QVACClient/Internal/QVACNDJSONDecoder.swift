@@ -24,6 +24,10 @@ struct QVACNDJSONDecoder: Sendable {
     private var bytes: [UInt8] = []
     private var recordStart = 0
     private var scanIndex = 0
+    /// Length of the final unterminated record across every accepted transport
+    /// chunk. Keeping this independent of `scanIndex` lets `receive` reject an
+    /// oversized continuation before appending it to retained storage.
+    private var trailingRecordBytes = 0
     private let maximumRecordBytes: Int
 
     init(maximumRecordBytes: Int = Self.defaultMaximumRecordBytes) {
@@ -32,7 +36,7 @@ struct QVACNDJSONDecoder: Sendable {
     }
 
     mutating func append(_ chunk: Data) throws -> [Data] {
-        receive(chunk)
+        try receive(chunk)
         var records: [Data] = []
         while let record = try nextRecord() {
             records.append(record)
@@ -43,8 +47,62 @@ struct QVACNDJSONDecoder: Sendable {
     /// Retain a transport chunk without eagerly materializing every line it contains.
     /// Demand-driven consumers pair this with `nextRecord()` so one coalesced wire frame
     /// cannot expand into an unbounded array of decoded Swift response values.
-    mutating func receive(_ chunk: Data) {
+    ///
+    /// Validation is transactional: a continuation that would exceed the record
+    /// ceiling is rejected before `Array.append(contentsOf:)` can transiently retain
+    /// both the already-buffered prefix and an entire additional media-sized frame.
+    mutating func receive(_ chunk: Data) throws {
+        var candidateTrailingBytes = trailingRecordBytes
+
+        if chunk.count <= maximumRecordBytes {
+            // No record wholly contained in this chunk can be too large. Only the
+            // leading segment can extend a record retained from an earlier chunk.
+            if candidateTrailingBytes == 0 {
+                if let lastNewline = chunk.lastIndex(of: 0x0A) {
+                    candidateTrailingBytes = chunk.distance(
+                        from: chunk.index(after: lastNewline),
+                        to: chunk.endIndex
+                    )
+                } else {
+                    candidateTrailingBytes = chunk.count
+                }
+            } else if let firstNewline = chunk.firstIndex(of: 0x0A) {
+                let leadingBytes = chunk.distance(from: chunk.startIndex, to: firstNewline)
+                try Self.checkRecordLength(
+                    prefixBytes: candidateTrailingBytes,
+                    appending: leadingBytes,
+                    maximumRecordBytes: maximumRecordBytes
+                )
+                let lastNewline = chunk.lastIndex(of: 0x0A) ?? firstNewline
+                candidateTrailingBytes = chunk.distance(
+                    from: chunk.index(after: lastNewline),
+                    to: chunk.endIndex
+                )
+            } else {
+                candidateTrailingBytes = try Self.checkedRecordLength(
+                    prefixBytes: candidateTrailingBytes,
+                    appending: chunk.count,
+                    maximumRecordBytes: maximumRecordBytes
+                )
+            }
+        } else {
+            // Test seams and future transports may deliver a coalesced chunk larger
+            // than one record. Validate every contained segment without retaining it.
+            for byte in chunk {
+                if byte == 0x0A {
+                    candidateTrailingBytes = 0
+                    continue
+                }
+                candidateTrailingBytes = try Self.checkedRecordLength(
+                    prefixBytes: candidateTrailingBytes,
+                    appending: 1,
+                    maximumRecordBytes: maximumRecordBytes
+                )
+            }
+        }
+
         bytes.append(contentsOf: chunk)
+        trailingRecordBytes = candidateTrailingBytes
     }
 
     /// Return at most one non-blank record. With `finalizing` set, an unterminated
@@ -97,6 +155,7 @@ struct QVACNDJSONDecoder: Sendable {
         bytes.removeAll(keepingCapacity: false)
         recordStart = 0
         scanIndex = 0
+        trailingRecordBytes = 0
     }
 
     /// Profiling-enabled workers may append a metadata-only record that is not a
@@ -122,6 +181,30 @@ struct QVACNDJSONDecoder: Sendable {
         if bytes.count - recordStart > maximumRecordBytes {
             throw QVACNDJSONError.recordTooLarge(limit: maximumRecordBytes)
         }
+    }
+
+    private static func checkRecordLength(
+        prefixBytes: Int,
+        appending appendedBytes: Int,
+        maximumRecordBytes: Int
+    ) throws {
+        _ = try checkedRecordLength(
+            prefixBytes: prefixBytes,
+            appending: appendedBytes,
+            maximumRecordBytes: maximumRecordBytes
+        )
+    }
+
+    private static func checkedRecordLength(
+        prefixBytes: Int,
+        appending appendedBytes: Int,
+        maximumRecordBytes: Int
+    ) throws -> Int {
+        let (length, overflowed) = prefixBytes.addingReportingOverflow(appendedBytes)
+        guard !overflowed, length <= maximumRecordBytes else {
+            throw QVACNDJSONError.recordTooLarge(limit: maximumRecordBytes)
+        }
+        return length
     }
 
     private mutating func compactIfNeeded() {

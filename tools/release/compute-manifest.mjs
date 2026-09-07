@@ -248,6 +248,14 @@ if (mode === 'link-set' || mode === 'development') {
 
   const inventoryPath = join(repoRoot, 'tools/runtime/resolution-inventory.json')
   const provenancePath = join(repoRoot, 'tools/provenance/qvac-sdk.lock.json')
+  const bareKitDirectory = join(repoRoot, 'tools/native/bare-kit')
+  const bareKitPatchSourcePath = join(bareKitDirectory, 'bare-kit-2.3.0-qvac.patch')
+  const bareKitProvenanceSourcePath = join(bareKitDirectory, 'provenance.lock.json')
+  const bareKitClosureSourcePath = join(
+    bareKitDirectory,
+    '.build',
+    'bare-kit-native-closure.json',
+  )
   const runtimeResolutionInventoryAssetName = 'runtime-resolution-inventory.json'
   const runtimeResolutionInventoryPath = join(assetsDir, runtimeResolutionInventoryAssetName)
   const runtimeResolutionInventoryMetadata = requireRegularAsset(
@@ -265,6 +273,34 @@ if (mode === 'link-set' || mode === 'development') {
   if (sdkProvenanceSHA256 !== sha256(provenancePath)) {
     fail(`staged ${sdkProvenanceAssetName} changed`)
   }
+  const bareKitAssets = [
+    {
+      field: 'bareKitPatch',
+      assetName: 'bare-kit-2.3.0-qvac.patch',
+      sourcePath: bareKitPatchSourcePath,
+    },
+    {
+      field: 'bareKitProvenance',
+      assetName: 'bare-kit-patch-provenance.json',
+      sourcePath: bareKitProvenanceSourcePath,
+    },
+    {
+      field: 'bareKitNativeClosure',
+      assetName: 'bare-kit-native-closure.json',
+      sourcePath: bareKitClosureSourcePath,
+    },
+  ].map(entry => {
+    const path = join(assetsDir, entry.assetName)
+    const metadata = requireRegularAsset(path, `staged ${entry.assetName}`)
+    const digest = sha256(path)
+    if (digest !== sha256(entry.sourcePath)) fail(`staged ${entry.assetName} changed`)
+    return { ...entry, path, size: metadata.size, sha256: digest }
+  })
+  execFileSync(
+    process.execPath,
+    [join(bareKitDirectory, 'verify.mjs'), '--verify-evidence', join(assetsDir, 'bare-kit-native-closure.json')],
+    { stdio: 'inherit' },
+  )
   const artifacts = linkSet.targets.map(target => {
     if (!/^[A-Za-z0-9._@-]+$/.test(target)) fail(`unsafe target: ${target}`)
     const assetName = `${target}.xcframework.zip`
@@ -338,6 +374,12 @@ if (mode === 'link-set' || mode === 'development') {
       size: sdkProvenanceMetadata.size,
       sha256: sdkProvenanceSHA256,
     },
+    ...Object.fromEntries(bareKitAssets.map(asset => [asset.field, {
+      assetName: asset.assetName,
+      url: `https://github.com/${repository}/releases/download/${artifactTag}/${asset.assetName}`,
+      size: asset.size,
+      sha256: asset.sha256,
+    }])),
     artifacts,
   }
   writeFileSync(outPath, JSON.stringify(manifest, null, 2) + '\n')

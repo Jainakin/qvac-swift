@@ -48,10 +48,29 @@ the worker from its locked runtime dependency graph.
 
 ## Resource limits
 
-The default maximum wire message is 256 MiB to support 0.17 media operations that
-return one complete base64 output per JSON record. Configure
-`maximumWireMessageBytes` and `maximumBufferedStreamBytes` on initialization for
-the application's model set and memory budget.
+The default maximum inbound wire-message size is 256 MiB to support 0.17 media
+operations that return one complete base64 output per JSON record. Encoded
+requests and duplex chunks default to 48 MiB, and convenience APIs that inline
+base64 data accept at most 24 MiB of aggregate raw input and 1,024 separate binary
+values. Eager results assembled across records default to the wire ceiling. Configure
+`maximumWireMessageBytes`, `maximumOutboundPayloadBytes`,
+`maximumInlineBinaryBytes`, `maximumInlineBinaryItems`,
+`maximumBatchPrompts`, `maximumAccumulatedResultBytes`,
+`maximumVLAActionBytes`, `maximumMetadataResponseBytes`,
+`maximumRegistryResponseBytes`, and `maximumBufferedStreamBytes` on initialization
+for the application's model set and physical-device memory budget.
+`maximumBatchPrompts` defaults to 256 and rejects larger batch-completion requests
+before allocating per-prompt tasks, streams, or result state. Set it to the
+largest batch the application intentionally supports, with a lower value on
+memory-constrained devices. Metadata/control responses default to the smallest
+of 256 KiB, the wire ceiling, and the accumulated-result ceiling. Registry
+list/search uses a separate 4 MiB default because it returns an unpaginated
+catalog. VLA actions use a separate 8 MiB default to bound the simultaneous
+base64, decoded-data, and Float32-array representations.
+
+The outbound ceiling applies to initial and replacement `__init_config`
+handshakes before transport I/O. Accumulated-result limits report
+``QVACError/resourceLimitExceeded(operation:resource:maximumBytes:attemptedBytes:)``.
 
 Per-operation public streams are bounded. ``QVACBufferedStream`` retains up to 64
 indivisible worker batches within `maximumBufferedStreamBytes` and lazily flattens

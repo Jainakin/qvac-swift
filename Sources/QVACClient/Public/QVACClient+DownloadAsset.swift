@@ -180,7 +180,7 @@ public extension QVACClient {
     private static func extractDownloadedAssetId(
         _ result: DownloadAssetResponse
     ) throws -> String {
-        guard result.success == true else {
+        guard result.error == nil, result.success == true else {
             throw QVACError.server(.downloadAssetFailed, message: result.error)
         }
         guard let id = result.assetId else {

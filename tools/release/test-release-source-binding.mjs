@@ -78,6 +78,9 @@ const manifest = {
   privacyAudit: boundAsset('privacy-manifest-audit.json'),
   runtimeResolutionInventory: boundAsset('runtime-resolution-inventory.json'),
   sdkProvenance: boundAsset('qvac-sdk-provenance.json'),
+  bareKitPatch: boundAsset('bare-kit-2.3.0-qvac.patch'),
+  bareKitProvenance: boundAsset('bare-kit-patch-provenance.json'),
+  bareKitNativeClosure: boundAsset('bare-kit-native-closure.json'),
   artifacts: auditedTargets.map(artifact),
 }
 
@@ -97,6 +100,15 @@ assert.throws(() => validateReleaseManifest(missingProvenance), /SDK provenance/
 const missingPrivacyAudit = structuredClone(manifest)
 delete missingPrivacyAudit.privacyAudit
 assert.throws(() => validateReleaseManifest(missingPrivacyAudit), /privacy manifest audit/)
+const missingBareKitPatch = structuredClone(manifest)
+delete missingBareKitPatch.bareKitPatch
+assert.throws(() => validateReleaseManifest(missingBareKitPatch), /BareKit patch/)
+const missingBareKitProvenance = structuredClone(manifest)
+delete missingBareKitProvenance.bareKitProvenance
+assert.throws(() => validateReleaseManifest(missingBareKitProvenance), /BareKit provenance/)
+const missingBareKitClosure = structuredClone(manifest)
+delete missingBareKitClosure.bareKitNativeClosure
+assert.throws(() => validateReleaseManifest(missingBareKitClosure), /BareKit native closure/)
 const mismatchedInventoryChecksum = structuredClone(manifest)
 mismatchedInventoryChecksum.runtimeResolutionInventory.sha256 = 'b'.repeat(64)
 assert.throws(() => validateReleaseManifest(mismatchedInventoryChecksum), /does not match sdk\.runtimeInventorySHA256/)
@@ -110,6 +122,9 @@ legacyManifest.sourceCommit = legacySourceCommit
 delete legacyManifest.runtimeResolutionInventory
 delete legacyManifest.sdkProvenance
 delete legacyManifest.privacyAudit
+delete legacyManifest.bareKitPatch
+delete legacyManifest.bareKitProvenance
+delete legacyManifest.bareKitNativeClosure
 assert.doesNotThrow(() => validateReleaseManifest(legacyManifest))
 const foreignLegacyManifest = JSON.parse(
   JSON.stringify(legacyManifest).replaceAll('github.com/Jainakin/qvac-swift', 'github.com/attacker/fork'),
@@ -126,6 +141,13 @@ legacyClaimingHardenedSchema.schemaVersion = 3
 assert.throws(() => validateReleaseManifest(legacyClaimingHardenedSchema), /schema v3 requires an r2-or-later/)
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex')
+const stableJSON = value => {
+  if (Array.isArray(value)) return `[${value.map(stableJSON).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJSON(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
 const writeAsset = (directory, name, bytes) => {
   writeFileSync(join(directory, name), bytes)
   return {
@@ -147,6 +169,29 @@ const runLocalVerification = (manifestPath, assetsDirectory, extraArguments = []
   { encoding: 'utf8' },
 )
 const cleanWorktreeVerifierPath = fileURLToPath(new URL('./require-clean-worktree.mjs', import.meta.url))
+const bareKitPatchBytes = readFileSync(
+  fileURLToPath(new URL('../native/bare-kit/bare-kit-2.3.0-qvac.patch', import.meta.url)),
+)
+const bareKitProvenanceBytes = readFileSync(
+  fileURLToPath(new URL('../native/bare-kit/provenance.lock.json', import.meta.url)),
+)
+const bareKitProvenance = JSON.parse(bareKitProvenanceBytes.toString('utf8'))
+const bareKitMirror = bareKitProvenance.nativeClosure.prebuiltArchiveMirror
+const bareKitNativeClosureBytes = Buffer.from(`${JSON.stringify({
+  schemaVersion: 1,
+  component: 'BareKit native dependency closure',
+  upstreamCommit: bareKitProvenance.upstream.commit,
+  provenanceLockSHA256: digest(bareKitProvenanceBytes),
+  nativeClosureSHA256: digest(Buffer.from(stableJSON(bareKitProvenance.nativeClosure))),
+  sources: bareKitProvenance.nativeClosure.sources,
+  targets: Object.fromEntries(
+    Object.keys(bareKitMirror.targets).sort().map(target => [target, {
+      driveKey: bareKitMirror.driveKey,
+      checkout: bareKitMirror.checkout,
+      files: bareKitMirror.targets[target],
+    }]),
+  ),
+}, null, 2)}\n`)
 
 const temporaryDirectory = mkdtempSync(join(tmpdir(), 'qvac-release-binding-'))
 try {
@@ -209,6 +254,21 @@ try {
     'qvac-sdk-provenance.json',
     sdkProvenanceBytes,
   )
+  localManifest.bareKitPatch = writeAsset(
+    temporaryDirectory,
+    'bare-kit-2.3.0-qvac.patch',
+    bareKitPatchBytes,
+  )
+  localManifest.bareKitProvenance = writeAsset(
+    temporaryDirectory,
+    'bare-kit-patch-provenance.json',
+    bareKitProvenanceBytes,
+  )
+  localManifest.bareKitNativeClosure = writeAsset(
+    temporaryDirectory,
+    'bare-kit-native-closure.json',
+    bareKitNativeClosureBytes,
+  )
   localManifest.artifacts = auditedTargets.map(target => {
     const bytes = Buffer.from(`archive-${target}`)
     const asset = writeAsset(temporaryDirectory, `${target}.xcframework.zip`, bytes)
@@ -234,6 +294,9 @@ try {
   delete localLegacyManifest.runtimeResolutionInventory
   delete localLegacyManifest.sdkProvenance
   delete localLegacyManifest.privacyAudit
+  delete localLegacyManifest.bareKitPatch
+  delete localLegacyManifest.bareKitProvenance
+  delete localLegacyManifest.bareKitNativeClosure
   const legacyManifestPath = join(temporaryDirectory, 'artifact-manifest-v2-legacy.json')
   writeFileSync(legacyManifestPath, `${JSON.stringify(localLegacyManifest, null, 2)}\n`)
   const acceptedLegacy = runLocalVerification(legacyManifestPath, temporaryDirectory)
@@ -263,6 +326,52 @@ try {
   assert.notEqual(tamperedInventory.status, 0)
   assert.match(tamperedInventory.stderr, /SHA-256 mismatch/)
   writeFileSync(join(temporaryDirectory, localManifest.runtimeResolutionInventory.assetName), runtimeInventoryBytes)
+
+  writeFileSync(
+    join(temporaryDirectory, localManifest.bareKitPatch.assetName),
+    Buffer.from(bareKitPatchBytes.toString('utf8').replace('diff --git', 'dxff --git')),
+  )
+  const tamperedBareKitPatch = runLocalVerification(manifestPath, temporaryDirectory)
+  assert.notEqual(tamperedBareKitPatch.status, 0)
+  assert.match(tamperedBareKitPatch.stderr, /SHA-256 mismatch/)
+  writeFileSync(join(temporaryDirectory, localManifest.bareKitPatch.assetName), bareKitPatchBytes)
+
+  writeFileSync(
+    join(temporaryDirectory, localManifest.bareKitProvenance.assetName),
+    Buffer.from(bareKitProvenanceBytes.toString('utf8').replace('"schemaVersion": 2', '"schemaVersion": 3')),
+  )
+  const tamperedBareKitProvenance = runLocalVerification(manifestPath, temporaryDirectory)
+  assert.notEqual(tamperedBareKitProvenance.status, 0)
+  assert.match(tamperedBareKitProvenance.stderr, /SHA-256 mismatch/)
+  writeFileSync(
+    join(temporaryDirectory, localManifest.bareKitProvenance.assetName),
+    bareKitProvenanceBytes,
+  )
+
+  const alteredClosure = Buffer.from(
+    bareKitNativeClosureBytes.toString('utf8').replace('BareKit native dependency closure', 'BareKit native dependency clozure'),
+  )
+  writeFileSync(join(temporaryDirectory, localManifest.bareKitNativeClosure.assetName), alteredClosure)
+  const tamperedBareKitClosure = runLocalVerification(manifestPath, temporaryDirectory)
+  assert.notEqual(tamperedBareKitClosure.status, 0)
+  assert.match(tamperedBareKitClosure.stderr, /SHA-256 mismatch/)
+
+  const reviewedClosureAsset = localManifest.bareKitNativeClosure
+  localManifest.bareKitNativeClosure = writeAsset(
+    temporaryDirectory,
+    'bare-kit-native-closure.json',
+    alteredClosure,
+  )
+  writeFileSync(manifestPath, `${JSON.stringify(localManifest, null, 2)}\n`)
+  const selfConsistentWrongClosure = runLocalVerification(manifestPath, temporaryDirectory)
+  assert.notEqual(selfConsistentWrongClosure.status, 0)
+  assert.match(selfConsistentWrongClosure.stderr, /native closure does not match/)
+  localManifest.bareKitNativeClosure = reviewedClosureAsset
+  writeFileSync(
+    join(temporaryDirectory, localManifest.bareKitNativeClosure.assetName),
+    bareKitNativeClosureBytes,
+  )
+  writeFileSync(manifestPath, `${JSON.stringify(localManifest, null, 2)}\n`)
 
   writeFileSync(
     join(temporaryDirectory, localManifest.sdkProvenance.assetName),
@@ -304,4 +413,4 @@ try {
   rmSync(temporaryDirectory, { recursive: true, force: true })
 }
 
-console.log('[release-binding] immutable v2/r1 compatibility and hardened v3 evidence/clean-tree gates enforced')
+console.log('[release-binding] immutable v2/r1 verification and hardened v3 SDK/native evidence gates enforced')

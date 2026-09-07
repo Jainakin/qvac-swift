@@ -85,10 +85,17 @@ enum QVACHandshake {
         on rpc: BareRPCClient,
         config: JSONValue? = nil,
         runtimeContext: QVACRuntimeContext? = .current,
-        timeout: Duration? = .seconds(60)
+        timeout: Duration? = .seconds(60),
+        maximumOutboundPayloadBytes: Int = QVACClient.defaultMaximumOutboundPayloadBytes
     ) async throws {
         let envelope = InitConfigEnvelope(config: config, runtimeContext: runtimeContext)
         let payload = try JSONEncoder.qvac.encode(envelope)
+        guard payload.count <= maximumOutboundPayloadBytes else {
+            throw QVACError.invalidArgument(
+                "__init_config outbound payload is \(payload.count) bytes; "
+                    + "maximumOutboundPayloadBytes is \(maximumOutboundPayloadBytes)"
+            )
+        }
         guard let respData = try await rpc.send(command: 1, data: payload, timeout: timeout) else {
             throw QVACInitConfigFailed(message: "empty reply")
         }

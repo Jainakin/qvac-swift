@@ -34,6 +34,12 @@ public extension QVACClient {
     }
 
     /// Open a bidirectional TTS session.
+    ///
+    /// When supplied, `maxBufferScalars` and `flushAfterMs` must be finite
+    /// numbers greater than zero, matching the QVAC SDK 0.17 request schema.
+    /// `sentenceDelimiterPreset` accepts only `latin`, `cjk`, or `multilingual`.
+    /// `emotion` accepts the exact Parler values documented by the unary
+    /// text-to-speech operation.
     func textToSpeechStream(
         modelId: String,
         accumulateSentences: Bool? = nil,
@@ -53,6 +59,32 @@ public extension QVACClient {
         quality: String? = nil,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> TextToSpeechStreamSession {
+        if let maxBufferScalars,
+           !maxBufferScalars.isFinite || maxBufferScalars <= 0 {
+            throw QVACError.invalidArgument(
+                "textToSpeechStream maxBufferScalars must be a finite positive number"
+            )
+        }
+        if let flushAfterMs,
+           !flushAfterMs.isFinite || flushAfterMs <= 0 {
+            throw QVACError.invalidArgument(
+                "textToSpeechStream flushAfterMs must be a finite positive number"
+            )
+        }
+        try QVACTextToSpeechValidation.validateOptions(
+            operation: "textToSpeechStream",
+            sentenceDelimiterPreset: sentenceDelimiterPreset,
+            description: description,
+            voiceDescription: voiceDescription,
+            voice: voice,
+            emotion: emotion,
+            pitch: pitch,
+            pace: pace,
+            expressivity: expressivity,
+            noise: noise,
+            reverb: reverb,
+            quality: quality
+        )
         let req = TextToSpeechStreamRequest(
             modelId: modelId,
             accumulateSentences: accumulateSentences,

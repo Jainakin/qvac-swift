@@ -36,14 +36,61 @@ struct BareTransportInboundBufferOverflow: Error, Sendable, Equatable, CustomStr
     }
 }
 
-/// Single-consumer, byte-bounded channel shared by both concrete transports.
-/// Overflow is terminal and explicit: queued bytes are discarded and the caller
-/// closes the connection, so protocol bytes are never silently dropped.
+/// Single-consumer, retained-memory-bounded channel shared by both concrete
+/// transports. Overflow is terminal and explicit: queued bytes are discarded and
+/// the caller closes the connection, so protocol bytes are never silently dropped.
 final class BoundedTransportInboundChannel: @unchecked Sendable {
     /// Keep transport delivery granular even when an adapter (notably BareIPC)
     /// returns one very large read. This bounds per-yield decoder work and prevents
     /// a coalesced message from expanding into a huge pending-frame array at once.
     static let maximumDeliveryChunkBytes = 64 * 1024
+
+    /// Conservative allowance for each `Data` value, queue slot, spare `Array`
+    /// capacity, and allocator bookkeeping. Charging this independently of payload
+    /// bytes prevents empty or tiny transport reads from bypassing the memory bound.
+    static let retainedValueOverheadBytes = 64
+
+    /// Returns the retained-memory budget required to admit one complete bare-rpc
+    /// frame at the configured body limit regardless of nonempty transport callback
+    /// fragmentation. The channel adds the four-byte wire prefix, coalesces queued
+    /// bytes into bounded delivery chunks, and allows one additional logical value
+    /// to be leased to the active consumer. All arithmetic is checked so
+    /// configuration cannot wrap into an undersized memory budget.
+    static func retainedCapacity(maximumWireMessageBytes: Int) -> Int? {
+        guard maximumWireMessageBytes > 0 else { return nil }
+
+        let (wireBytes, prefixOverflowed) = maximumWireMessageBytes
+            .addingReportingOverflow(MemoryLayout<UInt32>.size)
+        guard !prefixOverflowed else { return nil }
+
+        let fullChunks = wireBytes / maximumDeliveryChunkBytes
+        let partialChunk = wireBytes.isMultiple(of: maximumDeliveryChunkBytes) ? 0 : 1
+        let (chunkCount, chunkCountOverflowed) = fullChunks.addingReportingOverflow(partialChunk)
+        guard !chunkCountOverflowed else { return nil }
+
+        let (retainedValueCount, retainedValueCountOverflowed) = chunkCount
+            .addingReportingOverflow(1)
+        guard !retainedValueCountOverflowed else { return nil }
+
+        let (structuralBytes, structuralOverflowed) = retainedValueCount
+            .multipliedReportingOverflow(by: retainedValueOverheadBytes)
+        guard !structuralOverflowed else { return nil }
+
+        let (capacity, capacityOverflowed) = wireBytes.addingReportingOverflow(structuralBytes)
+        return capacityOverflowed ? nil : capacity
+    }
+
+    /// Fail-closed default used by low-level transports. The configured frame size
+    /// is a small UInt32-bounded constant, so zero can only surface if that invariant
+    /// is changed without updating the checked capacity calculation.
+    static let defaultMaximumBufferedBytes = retainedCapacity(
+        maximumWireMessageBytes: BareRPCFrameReader.defaultMaxFrameSize
+    ) ?? 0
+
+    private struct RetainedValue {
+        var data: Data
+        var chargedBytes: Int
+    }
 
     private enum Terminal {
         case finished
@@ -52,9 +99,14 @@ final class BoundedTransportInboundChannel: @unchecked Sendable {
 
     private let maximumBufferedBytes: Int
     private let lock = NSLock()
-    private var queue: [Data] = []
+    /// Consumed slots are cleared immediately so periodic prefix compaction does not
+    /// retain their `Data` storage.
+    private var queue: [RetainedValue?] = []
     private var queueIndex = 0
+    /// Includes queued values and the value leased to the active consumer. The lease
+    /// is acknowledged when that consumer asks for its next value.
     private var bufferedBytes = 0
+    private var inFlightBytes = 0
     private var waiter: CheckedContinuation<Data?, Error>?
     private var terminal: Terminal?
     private var claimed = false
@@ -111,26 +163,69 @@ final class BoundedTransportInboundChannel: @unchecked Sendable {
             lock.unlock()
             return nil
         }
-        let (attempted, arithmeticOverflow) = bufferedBytes.addingReportingOverflow(value.count)
-        if value.count > maximumBufferedBytes || arithmeticOverflow || attempted > maximumBufferedBytes {
+        // Callback boundaries are not semantic boundaries. When no consumer is
+        // waiting, merge nonempty bytes into the active queue tail until it reaches
+        // the delivery limit. This keeps retained-value overhead proportional to
+        // logical 64 KiB deliveries rather than to arbitrary native read sizes.
+        // Empty values remain distinct and fully charged so they cannot bypass the
+        // retained-memory bound or be reordered across nonempty data.
+        var mergeCount = 0
+        var mergeIndex: Int?
+        if waiter == nil, !value.isEmpty,
+           let lastIndex = queue.indices.last,
+           lastIndex >= queueIndex,
+           queue[lastIndex]?.data.isEmpty == false {
+            let tailCount = queue[lastIndex]!.data.count
+            if tailCount < Self.maximumDeliveryChunkBytes {
+                mergeIndex = lastIndex
+                mergeCount = min(
+                    value.count,
+                    Self.maximumDeliveryChunkBytes - tailCount
+                )
+            }
+        }
+        let createsRetainedValue = mergeCount < value.count || value.isEmpty
+        let structuralCharge = createsRetainedValue ? Self.retainedValueOverheadBytes : 0
+        let (chargedBytes, chargeOverflowed) = value.count.addingReportingOverflow(
+            structuralCharge
+        )
+        let (attempted, totalOverflowed) = bufferedBytes.addingReportingOverflow(chargedBytes)
+        if chargeOverflowed || totalOverflowed || attempted > maximumBufferedBytes {
             let error = BareTransportInboundBufferOverflow(
                 maximumBufferedBytes: maximumBufferedBytes,
-                attemptedBufferedBytes: arithmeticOverflow ? Int.max : attempted
+                attemptedBufferedBytes: chargeOverflowed || totalOverflowed ? Int.max : attempted
             )
             failure = error
             terminal = .failed(error)
             queue.removeAll(keepingCapacity: false)
             queueIndex = 0
+            inFlightBytes = 0
             bufferedBytes = 0
             waiting = waiter
             waiter = nil
         } else if let current = waiter {
             waiter = nil
             waiting = current
+            inFlightBytes = chargedBytes
         } else {
-            queue.append(value)
-            bufferedBytes = attempted
+            if let mergeIndex, mergeCount > 0 {
+                // Mutate through Array's modify accessor. Copying the tail to a
+                // temporary first would keep the old Data storage alive and force
+                // copy-on-write for every tiny callback.
+                queue[mergeIndex]!.data.append(contentsOf: value.prefix(mergeCount))
+                queue[mergeIndex]!.chargedBytes += mergeCount
+            }
+            if createsRetainedValue {
+                let remainder = mergeCount == 0
+                    ? value
+                    : Data(value.dropFirst(mergeCount))
+                queue.append(RetainedValue(
+                    data: remainder,
+                    chargedBytes: remainder.count + Self.retainedValueOverheadBytes
+                ))
+            }
         }
+        if failure == nil { bufferedBytes = attempted }
         lock.unlock()
 
         if let failure {
@@ -154,6 +249,7 @@ final class BoundedTransportInboundChannel: @unchecked Sendable {
         if discardingBuffered {
             queue.removeAll(keepingCapacity: false)
             queueIndex = 0
+            inFlightBytes = 0
             bufferedBytes = 0
         }
         if queueIndex >= queue.count {
@@ -167,21 +263,24 @@ final class BoundedTransportInboundChannel: @unchecked Sendable {
     }
 
     private func next() async throws -> Data? {
-        try Task.checkCancellation()
         return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
+            try Task.checkCancellation()
+            let value: Data? = try await withCheckedThrowingContinuation { continuation in
                 var immediate: Data?
                 var completed: Terminal?
                 var registered = false
                 lock.lock()
+                acknowledgeInFlightLocked()
                 if queueIndex < queue.count {
-                    immediate = queue[queueIndex]
-                    bufferedBytes -= immediate?.count ?? 0
+                    let retainedValue = queue[queueIndex]
+                    queue[queueIndex] = nil
                     queueIndex += 1
                     if queueIndex >= 64, queueIndex >= queue.count / 2 {
                         queue.removeFirst(queueIndex)
                         queueIndex = 0
                     }
+                    immediate = retainedValue?.data
+                    inFlightBytes = retainedValue?.chargedBytes ?? 0
                 } else if let terminal {
                     completed = terminal
                 } else if waiter != nil {
@@ -192,12 +291,11 @@ final class BoundedTransportInboundChannel: @unchecked Sendable {
                     waiter = continuation
                     registered = true
                 }
-                let cancelled = Task.isCancelled
+                let cancelledAfterRegistration = registered && Task.isCancelled
                 lock.unlock()
 
-                if cancelled {
-                    if registered { cancelPendingNext() }
-                    else { continuation.resume(throwing: CancellationError()) }
+                if cancelledAfterRegistration {
+                    cancelPendingNext()
                 } else if let immediate {
                     continuation.resume(returning: immediate)
                 } else if let completed {
@@ -207,6 +305,8 @@ final class BoundedTransportInboundChannel: @unchecked Sendable {
                     }
                 }
             }
+            try Task.checkCancellation()
+            return value
         } onCancel: {
             self.cancelPendingNext()
         }
@@ -218,15 +318,44 @@ final class BoundedTransportInboundChannel: @unchecked Sendable {
             (@Sendable () -> Void)?
         ) = lock.withLock {
             defer { waiter = nil }
-            guard !cancellationReported, terminal == nil else { return (waiter, nil) }
-            cancellationReported = true
-            terminal = .failed(CancellationError())
+            let wasActive = terminal == nil
+            if wasActive { terminal = .failed(CancellationError()) }
             queue.removeAll(keepingCapacity: false)
             queueIndex = 0
+            inFlightBytes = 0
             bufferedBytes = 0
-            return (waiter, cancellationHandler)
+            let shouldReport = !cancellationReported && wasActive
+            cancellationReported = true
+            return (waiter, shouldReport ? cancellationHandler : nil)
         }
         result.0?.resume(throwing: CancellationError())
         result.1?()
+    }
+
+    /// Release the accounting lease for the value returned by the preceding
+    /// `next()` call. The channel no longer retains that value after dequeue, but
+    /// keeping its charge until the consumer advances bounds producer lead.
+    private func acknowledgeInFlightLocked() {
+        guard inFlightBytes > 0 else { return }
+        if inFlightBytes <= bufferedBytes {
+            bufferedBytes -= inFlightBytes
+        } else {
+            // Fail closed to coherent accounting rather than trapping if internal
+            // state is ever corrupted.
+            bufferedBytes = 0
+        }
+        inFlightBytes = 0
+    }
+
+    /// Deterministic visibility for retained-memory and cancellation regressions.
+    func __testState() -> (
+        queuedValues: Int,
+        bufferedBytes: Int,
+        inFlightBytes: Int,
+        hasPendingWaiter: Bool
+    ) {
+        lock.withLock {
+            (queue.count - queueIndex, bufferedBytes, inFlightBytes, waiter != nil)
+        }
     }
 }

@@ -277,7 +277,8 @@ final class UnixDomainSocketTransport: BareTransport, @unchecked Sendable {
     /// fully connected and ready to ferry bytes both ways.
     static func connect(
         _ config: UDSTransportConfiguration,
-        maximumInboundBufferedBytes: Int = BareRPCFrameReader.defaultMaxFrameSize + 4
+        maximumInboundBufferedBytes: Int = BoundedTransportInboundChannel
+            .defaultMaximumBufferedBytes
     ) async throws -> UnixDomainSocketTransport {
         guard config.initTimeout.isFinite,
               config.initTimeout > 0,
@@ -369,16 +370,7 @@ final class UnixDomainSocketTransport: BareTransport, @unchecked Sendable {
                 process: proc,
                 diagnostics: { outputCapture.diagnosticSuffix() }
             )
-            do {
-                // Cancellation can race with the successful accept linearization.
-                // Do not publish an otherwise valid descriptor to a canceled caller.
-                try Task.checkCancellation()
-                try configureConnectedSocket(acceptedFD)
-                clientFD = acceptedFD
-            } catch {
-                _ = Darwin.close(acceptedFD)
-                throw error
-            }
+            clientFD = try adoptAcceptedFD(acceptedFD)
         } catch {
             await terminateProcess(
                 proc,
@@ -803,6 +795,28 @@ final class UnixDomainSocketTransport: BareTransport, @unchecked Sendable {
         }
     }
 
+    /// Adopt a descriptor returned by `accept(2)` without leaking it when task
+    /// cancellation wins immediately after the accept continuation resolves.
+    /// Keeping ownership transfer in one helper also makes the otherwise tiny
+    /// race window deterministic under unit test.
+    private static func adoptAcceptedFD(
+        _ acceptedFD: Int32,
+        beforeCancellationCheck: () -> Void = {},
+        configure: (Int32) throws -> Void = configureConnectedSocket
+    ) throws -> Int32 {
+        beforeCancellationCheck()
+        do {
+            // Do not configure or publish an otherwise valid descriptor to a
+            // caller that stopped waiting as accept completed.
+            try Task.checkCancellation()
+            try configure(acceptedFD)
+            return acceptedFD
+        } catch {
+            _ = Darwin.close(acceptedFD)
+            throw error
+        }
+    }
+
     private static func acceptWithTimeout(
         listenFD: Int32,
         timeout: TimeInterval,
@@ -947,12 +961,24 @@ final class UnixDomainSocketTransport: BareTransport, @unchecked Sendable {
     static func __testConfigureConnectedSocket(_ fd: Int32) throws {
         try configureConnectedSocket(fd)
     }
+    static func __testAdoptAcceptedFD(
+        _ fd: Int32,
+        beforeCancellationCheck: () -> Void,
+        configure: (Int32) throws -> Void
+    ) throws -> Int32 {
+        try adoptAcceptedFD(
+            fd,
+            beforeCancellationCheck: beforeCancellationCheck,
+            configure: configure
+        )
+    }
     static func __testCloseAcceptedFDWhenResolutionLoses(_ fd: Int32) {
         deliverAcceptedFD(fd) { _ in false }
     }
     static func __testConnectedTransport(
         clientFD: Int32,
-        maximumInboundBufferedBytes: Int = 1024 * 1024
+        maximumInboundBufferedBytes: Int = BoundedTransportInboundChannel
+            .defaultMaximumBufferedBytes
     ) throws -> UnixDomainSocketTransport {
         let allocation = try allocateOwnedSocketPath()
         do {

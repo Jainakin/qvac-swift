@@ -13,6 +13,73 @@
 
 import Foundation
 
+internal enum QVACTextToSpeechValidation {
+    private static let parlerEmotions: Set<String> = [
+        "command", "anger", "narration", "conversation", "disgust", "fear",
+        "happy", "neutral", "proper noun", "news", "sad", "surprise",
+    ]
+
+    private static let sentenceDelimiterPresets: Set<String> = [
+        "latin", "cjk", "multilingual",
+    ]
+
+    static func validateOptions(
+        operation: String,
+        sentenceDelimiterPreset: String? = nil,
+        description: String?,
+        voiceDescription: String?,
+        voice: String?,
+        emotion: String?,
+        pitch: String?,
+        pace: String?,
+        expressivity: String?,
+        noise: String?,
+        reverb: String?,
+        quality: String?
+    ) throws {
+        let nonEmptyFields: [(name: String, value: String?)] = [
+            ("description", description),
+            ("voiceDescription", voiceDescription),
+            ("voice", voice),
+            ("pitch", pitch),
+            ("pace", pace),
+            ("expressivity", expressivity),
+            ("noise", noise),
+            ("reverb", reverb),
+            ("quality", quality),
+        ]
+        if let emptyField = nonEmptyFields.first(where: { $0.value?.isEmpty == true }) {
+            throw QVACError.invalidArgument(
+                "\(operation) \(emptyField.name) must not be empty"
+            )
+        }
+        if let emotion, !parlerEmotions.contains(emotion) {
+            throw QVACError.invalidArgument(
+                "\(operation) emotion must be one of: \(parlerEmotions.sorted().joined(separator: ", "))"
+            )
+        }
+        if let sentenceDelimiterPreset,
+           !sentenceDelimiterPresets.contains(sentenceDelimiterPreset) {
+            throw QVACError.invalidArgument(
+                "\(operation) sentenceDelimiterPreset must be one of: latin, cjk, multilingual"
+            )
+        }
+        if description != nil, voiceDescription != nil {
+            throw QVACError.invalidArgument(
+                "\(operation) description and voiceDescription are mutually exclusive"
+            )
+        }
+        let hasDescription = description != nil || voiceDescription != nil
+        if hasDescription,
+           [voice, emotion, pitch, pace, expressivity, noise, reverb, quality]
+            .contains(where: { $0 != nil }) {
+            throw QVACError.invalidArgument(
+                "\(operation) description fields and voice-template fields are mutually exclusive"
+            )
+        }
+    }
+}
+
 public extension QVACClient {
     /// Per-sentence update emitted when `sentenceStream: true` is requested.
     /// Contains the chunk index and the text being synthesized in that chunk.
@@ -29,6 +96,8 @@ public extension QVACClient {
         public let bufferStream: QVACBufferedStream<Double>
         /// Byte-bounded sentence updates, one atomic batch per worker frame.
         public let chunkUpdates: QVACBufferedStream<TtsSentenceChunkUpdate>?
+        /// Full non-streaming sample aggregation. Array capacity is conservatively
+        /// charged against `maximumAccumulatedResultBytes` before each append.
         public let buffer: Task<[Double], Error>
         public let done: Task<Bool, Error>
         private let processing: Task<Bool, Error>
@@ -60,7 +129,9 @@ public extension QVACClient {
     ///
     /// `sentenceStream: true` emits sentence-boundary updates and lets the worker chunk
     /// long input into manageable pieces. `inputType` (default `"text"`) can be `"phonemes"`
-    /// to bypass G2P.
+    /// to bypass G2P. `emotion`, when provided, must be one of the exact Parler values
+    /// defined by QVAC SDK 0.17: `command`, `anger`, `narration`, `conversation`,
+    /// `disgust`, `fear`, `happy`, `neutral`, `proper noun`, `news`, `sad`, or `surprise`.
     func textToSpeech(
         modelId: String,
         text: String,
@@ -89,24 +160,25 @@ public extension QVACClient {
                 "textToSpeech sentenceStream requires stream"
             )
         }
-        if let maximum = sentenceStreamMaxChunkScalars, maximum <= 0 {
+        if let maximum = sentenceStreamMaxChunkScalars,
+           !maximum.isFinite || maximum <= 0 {
             throw QVACError.invalidArgument(
-                "textToSpeech sentenceStreamMaxChunkScalars must be positive"
+                "textToSpeech sentenceStreamMaxChunkScalars must be a finite positive number"
             )
         }
-        if description != nil, voiceDescription != nil {
-            throw QVACError.invalidArgument(
-                "textToSpeech description and voiceDescription are mutually exclusive"
-            )
-        }
-        let hasDescription = description != nil || voiceDescription != nil
-        if hasDescription,
-           [voice, emotion, pitch, pace, expressivity, noise, reverb, quality]
-            .contains(where: { $0 != nil }) {
-            throw QVACError.invalidArgument(
-                "textToSpeech description fields and voice-template fields are mutually exclusive"
-            )
-        }
+        try QVACTextToSpeechValidation.validateOptions(
+            operation: "textToSpeech",
+            description: description,
+            voiceDescription: voiceDescription,
+            voice: voice,
+            emotion: emotion,
+            pitch: pitch,
+            pace: pace,
+            expressivity: expressivity,
+            noise: noise,
+            reverb: reverb,
+            quality: quality
+        )
         var req = TextToSpeechRequest(modelId: modelId, text: text)
         req.stream = stream
         req.sentenceStream = sentenceStream
@@ -152,10 +224,11 @@ public extension QVACClient {
             chunkSink = nil
         }
         let collectedBuffer = ResultBox<[Double]>()
+        let initialResultBudget = makeResultByteBudget(operation: "textToSpeech")
 
         let done = Task<Bool, Error> {
+            var resultBudget = initialResultBudget
             var full: [Double] = []
-            var receivedTerminalFrame = false
             do {
                 let responses = QVACResponseStreamIteratorBox(responseStream)
                 while let response = try await responses.next() {
@@ -173,18 +246,28 @@ public extension QVACClient {
                     guard case .textToSpeech(let r) = response else {
                         try Self.rejectUnexpectedResponse(response, expected: "textToSpeech")
                     }
+                    let isTerminal = r.done == true
+                    let hasChunkUpdate = !r.buffer.isEmpty
+                        || r.chunkIndex != nil
+                        || r.sentenceChunk?.isEmpty == false
                     if !r.buffer.isEmpty {
                         if stream {
-                            bufferSink.yield(
-                                contentsOf: r.buffer,
-                                estimatedBytes: Self.retainedTtsSampleBytes(r.buffer.count)
-                            )
+                            if !isTerminal {
+                                bufferSink.yield(
+                                    contentsOf: r.buffer,
+                                    estimatedBytes: Self.retainedTtsBufferedBatchBytes(
+                                        r.buffer.count
+                                    )
+                                )
+                            }
                         } else {
+                            try resultBudget.consume(
+                                Self.retainedTtsAggregateAppendBytes(r.buffer.count)
+                            )
                             full.append(contentsOf: r.buffer)
                         }
                     }
-                    if sentenceStream,
-                       !r.buffer.isEmpty || r.chunkIndex != nil || r.sentenceChunk?.isEmpty == false {
+                    if sentenceStream, hasChunkUpdate, !isTerminal {
                         chunkSink?.yield(
                             contentsOf: [.init(
                                 buffer: r.buffer,
@@ -201,26 +284,52 @@ public extension QVACClient {
                             )
                         )
                     }
-                    if r.done == true {
-                        receivedTerminalFrame = true
-                        break
+                    if isTerminal {
+                        // Treat the logical terminal record as provisional until
+                        // profiling metadata and transport EOF have been consumed.
+                        // Otherwise a following domain record could fail the task
+                        // after terminal audio had already escaped through a public
+                        // stream.
+                        try await Self.drainResponseStreamAfterTerminal(
+                            responses,
+                            operation: "textToSpeech"
+                        )
+                        if stream, !r.buffer.isEmpty {
+                            bufferSink.yield(
+                                contentsOf: r.buffer,
+                                estimatedBytes: Self.retainedTtsBufferedBatchBytes(
+                                    r.buffer.count
+                                )
+                            )
+                        }
+                        if sentenceStream, hasChunkUpdate {
+                            chunkSink?.yield(
+                                contentsOf: [.init(
+                                    buffer: r.buffer,
+                                    chunkIndex: r.chunkIndex,
+                                    sentenceChunk: r.sentenceChunk
+                                )],
+                                estimatedBytes: max(
+                                    Self.retainedTtsSampleBytes(r.buffer.count),
+                                    Self.conservativeBufferedJSONBytes(
+                                        r,
+                                        elementCount: 1,
+                                        fallback: maximumBufferedStreamBytes
+                                    )
+                                )
+                            )
+                        }
+                        collectedBuffer.set(stream ? [] : full)
+                        bufferSink.finish()
+                        chunkSink?.finish()
+                        return true
                     }
                 }
                 try Task.checkCancellation()
-                guard receivedTerminalFrame else {
-                    throw QVACError.client(
-                        .streamEndedWithoutResponse,
-                        message: "textToSpeech ended without a terminal done frame"
-                    )
-                }
-                try await Self.drainResponseStreamAfterTerminal(
-                    responses,
-                    operation: "textToSpeech"
+                throw QVACError.client(
+                    .streamEndedWithoutResponse,
+                    message: "textToSpeech ended without a terminal done frame"
                 )
-                collectedBuffer.set(stream ? [] : full)
-                bufferSink.finish()
-                chunkSink?.finish()
-                return true
             } catch {
                 bufferSink.finish(throwing: error)
                 chunkSink?.finish(throwing: error)
@@ -245,5 +354,23 @@ public extension QVACClient {
             by: MemoryLayout<Double>.stride
         )
         return overflowed ? Int.max : bytes
+    }
+
+    /// Conservative allocation-free charge for one public PCM batch. The doubled
+    /// payload covers ordinary geometric spare capacity in `[Double]`; the fixed
+    /// charge covers the array value, channel entry, lease, and allocator metadata.
+    internal static func retainedTtsBufferedBatchBytes(_ sampleCount: Int) -> Int {
+        let capacityBytes = QVACBufferedJSONRetainedSizeEstimator.saturatingMultiply(
+            retainedTtsSampleBytes(sampleCount),
+            2
+        )
+        return QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(capacityBytes, 512)
+    }
+
+    /// A growing Swift array can retain spare capacity after an append. Charging
+    /// twice the fixed-width sample bytes conservatively bounds that allocation.
+    private static func retainedTtsAggregateAppendBytes(_ sampleCount: Int) -> Int {
+        let exactBytes = retainedTtsSampleBytes(sampleCount)
+        return QVACBufferedJSONRetainedSizeEstimator.saturatingMultiply(exactBytes, 2)
     }
 }

@@ -202,6 +202,171 @@ function sha256File(path) {
   return sha256Bytes(readFileSync(path))
 }
 
+// Release workflows are security-sensitive inputs, but this repository does not
+// otherwise need a YAML runtime dependency. Extract only the named `run: |`
+// steps used by the checked-in workflows and reject syntax outside that narrow
+// shape. Indentation determines both the step boundary and the literal block.
+function extractLiteralRunSteps(workflow, label) {
+  if (typeof workflow !== 'string' || workflow.length === 0) {
+    fail(`${label} must be non-empty workflow text`)
+  }
+  if (workflow.includes('\t')) fail(`${label} must not use tab indentation`)
+
+  const lines = workflow.replaceAll('\r\n', '\n').split('\n')
+  const jobsLines = lines.flatMap((line, index) => line === 'jobs:' ? [index] : [])
+  if (jobsLines.length !== 1) fail(`${label} must declare one top-level jobs mapping`)
+  const jobsStart = jobsLines[0]
+  let jobsEnd = lines.length
+  for (let index = jobsStart + 1; index < lines.length; index += 1) {
+    if (/^\S/.test(lines[index]) && !lines[index].startsWith('#')) {
+      jobsEnd = index
+      break
+    }
+  }
+
+  const jobStarts = []
+  for (let index = jobsStart + 1; index < jobsEnd; index += 1) {
+    if (/^  [A-Za-z0-9_-]+:\s*(?:#.*)?$/.test(lines[index])) jobStarts.push(index)
+  }
+  if (jobStarts.length === 0) fail(`${label} must declare at least one job`)
+
+  const steps = []
+  for (let jobIndex = 0; jobIndex < jobStarts.length; jobIndex += 1) {
+    const jobStart = jobStarts[jobIndex]
+    const jobEnd = jobStarts[jobIndex + 1] ?? jobsEnd
+    const stepsLines = []
+    for (let index = jobStart + 1; index < jobEnd; index += 1) {
+      if (lines[index] === '    steps:') stepsLines.push(index)
+    }
+    if (stepsLines.length > 1) fail(`${label} job at line ${jobStart + 1} declares steps more than once`)
+    if (stepsLines.length === 0) continue
+
+    const stepsStart = stepsLines[0]
+    let stepsEnd = jobEnd
+    for (let index = stepsStart + 1; index < jobEnd; index += 1) {
+      if (lines[index].trim().length === 0 || lines[index].startsWith('      ')) continue
+      stepsEnd = index
+      break
+    }
+    for (let index = stepsStart + 1; index < stepsEnd; index += 1) {
+      const nameMatch = /^      - name:\s*(\S(?:.*\S)?)\s*$/.exec(lines[index])
+      if (!nameMatch) continue
+
+      const stepIndent = 6
+      const fieldIndent = 8
+      const step = {
+        name: nameMatch[1],
+        condition: undefined,
+        continueOnError: undefined,
+        shell: undefined,
+        commands: undefined,
+      }
+      let cursor = index + 1
+      for (; cursor < stepsEnd; cursor += 1) {
+        const line = lines[cursor]
+        if (line.trim().length === 0) continue
+        const indentation = /^( *)/.exec(line)[1].length
+        if (indentation <= stepIndent) break
+        if (indentation !== fieldIndent) continue
+
+        const conditionMatch = /^        if:\s*(\S(?:.*\S)?)\s*$/.exec(line)
+        if (conditionMatch) {
+          if (step.condition !== undefined) fail(`${label} step ${step.name} declares if more than once`)
+          step.condition = conditionMatch[1]
+          continue
+        }
+        const continueMatch = /^        continue-on-error:\s*(\S(?:.*\S)?)\s*$/.exec(line)
+        if (continueMatch) {
+          if (step.continueOnError !== undefined) {
+            fail(`${label} step ${step.name} declares continue-on-error more than once`)
+          }
+          step.continueOnError = continueMatch[1]
+          continue
+        }
+        const shellMatch = /^        shell:\s*(\S(?:.*\S)?)\s*$/.exec(line)
+        if (shellMatch) {
+          if (step.shell !== undefined) fail(`${label} step ${step.name} declares shell more than once`)
+          step.shell = shellMatch[1]
+          continue
+        }
+        if (!/^        run:\s*\|\s*$/.test(line)) continue
+        if (step.commands !== undefined) fail(`${label} step ${step.name} declares run more than once`)
+
+        const block = []
+        let blockIndent
+        cursor += 1
+        for (; cursor < stepsEnd; cursor += 1) {
+          const blockLine = lines[cursor]
+          if (blockLine.trim().length === 0) {
+            block.push('')
+            continue
+          }
+          const blockLineIndent = /^( *)/.exec(blockLine)[1].length
+          if (blockLineIndent <= fieldIndent) {
+            cursor -= 1
+            break
+          }
+          blockIndent = blockIndent === undefined ? blockLineIndent : Math.min(blockIndent, blockLineIndent)
+          block.push(blockLine)
+        }
+        if (blockIndent === undefined) fail(`${label} step ${step.name} has an empty run block`)
+        step.commands = extractActiveShellCommands(
+          block.map(blockLine => blockLine.length === 0 ? '' : blockLine.slice(blockIndent)).join('\n'),
+          `${label} step ${step.name}`,
+        )
+      }
+      steps.push(step)
+      index = cursor - 1
+    }
+  }
+  return steps
+}
+
+function extractActiveShellCommands(script, label) {
+  const commands = []
+  let continued = ''
+  for (const sourceLine of script.split('\n')) {
+    const line = sourceLine.trim()
+    if (continued.length === 0 && (line.length === 0 || line.startsWith('#'))) continue
+    if (line.endsWith('\\')) {
+      continued += `${line.slice(0, -1).trimEnd()} `
+      continue
+    }
+    const command = `${continued}${line}`.trim()
+    continued = ''
+    if (command.length !== 0) commands.push(command)
+  }
+  if (continued.length !== 0) fail(`${label} ends with an unterminated shell continuation`)
+  return commands
+}
+
+const noticePublicationCommand = 'node tools/release/generate-third-party-notices.mjs --check-publication'
+const privacyPublicationCommand = 'node tools/release/verify-privacy-manifests.mjs --check-publication'
+const artifactPrivacyPublicationCommand = [
+  privacyPublicationCommand,
+  '--frameworks tools/runtime/.build/artifacts',
+  '--link-set tools/runtime/.build/link-set.json',
+  '--assets-dir tools/runtime/.build/release-assets',
+].join(' ')
+
+function assertPublicationWorkflowGate(workflow, label, condition, privacyCommand) {
+  const candidates = extractLiteralRunSteps(workflow, label).filter(step => {
+    if (step.commands === undefined
+        || step.condition !== condition
+        || step.continueOnError !== undefined
+        || step.shell !== undefined) return false
+    const noticeIndex = step.commands.indexOf(noticePublicationCommand)
+    const privacyIndex = step.commands.indexOf(privacyCommand)
+    return noticeIndex === 0 && privacyIndex === 1
+  })
+  if (candidates.length !== 1) {
+    fail(
+      `${label} must contain exactly one ${condition ?? 'unconditional'} literal run step `
+      + 'with consecutive active notice and privacy publication checks',
+    )
+  }
+}
+
 function loadJSONFile(path, label) {
   requireRegularFile(path, label, maximumManifestBytes)
   try {
@@ -1141,14 +1306,97 @@ function selfTest(audit, development) {
   )
 
   const artifactWorkflow = readFileSync(buildArtifactsWorkflowPath, 'utf8')
-  assert.match(
+  assertPublicationWorkflowGate(
     artifactWorkflow,
-    /if: inputs\.publish[\s\S]{0,500}verify-privacy-manifests\.mjs --check-publication[\s\S]{0,500}--frameworks tools\/runtime\/\.build\/artifacts[\s\S]{0,500}--assets-dir tools\/runtime\/\.build\/release-assets/,
+    'artifact publication workflow',
+    'inputs.publish',
+    artifactPrivacyPublicationCommand,
   )
   const sourceWorkflow = readFileSync(sourceReleaseWorkflowPath, 'utf8')
-  assert.match(
+  assertPublicationWorkflowGate(
     sourceWorkflow,
-    /generate-third-party-notices\.mjs --check-publication[\s\S]{0,500}verify-privacy-manifests\.mjs --check-publication/,
+    'source publication workflow',
+    undefined,
+    privacyPublicationCommand,
+  )
+
+  const replaceExactlyOnce = (workflow, original, replacement, label) => {
+    const first = workflow.indexOf(original)
+    if (first < 0 || workflow.indexOf(original, first + original.length) >= 0) {
+      fail(`workflow self-test mutation ${label} did not match exactly once`)
+    }
+    return `${workflow.slice(0, first)}${replacement}${workflow.slice(first + original.length)}`
+  }
+  const expectGateMutationFailure = (workflow, label, condition, privacyCommand) => {
+    assert.throws(
+      () => assertPublicationWorkflowGate(workflow, label, condition, privacyCommand),
+      /must contain exactly one/,
+    )
+  }
+
+  const commentedSourceCheck = replaceExactlyOnce(
+    sourceWorkflow,
+    `          ${noticePublicationCommand}\n`,
+    `          # ${noticePublicationCommand}\n`,
+    'commented source notice check',
+  )
+  expectGateMutationFailure(
+    commentedSourceCheck,
+    'source workflow with commented notice check',
+    undefined,
+    privacyPublicationCommand,
+  )
+
+  const splitSourceChecks = replaceExactlyOnce(
+    sourceWorkflow,
+    `          ${noticePublicationCommand}\n          ${privacyPublicationCommand}`,
+    `          ${noticePublicationCommand}\n      - name: Split privacy publication check\n        run: |\n          ${privacyPublicationCommand}`,
+    'split source publication checks',
+  )
+  expectGateMutationFailure(
+    splitSourceChecks,
+    'source workflow with split publication checks',
+    undefined,
+    privacyPublicationCommand,
+  )
+
+  const nonExecutableSourceChecks = replaceExactlyOnce(
+    sourceWorkflow,
+    `      - name: Verify publication prerequisites\n        run: |\n          ${noticePublicationCommand}\n          ${privacyPublicationCommand}`,
+    `      - name: Verify publication prerequisites\n        env:\n          DOCUMENTED_GATES: |\n            ${noticePublicationCommand}\n            ${privacyPublicationCommand}\n        run: |\n          echo "publication checks are not active"`,
+    'source checks in non-executing YAML',
+  )
+  expectGateMutationFailure(
+    nonExecutableSourceChecks,
+    'source workflow with publication checks only in an environment value',
+    undefined,
+    privacyPublicationCommand,
+  )
+
+  const nonPublishingArtifactCheck = replaceExactlyOnce(
+    artifactWorkflow,
+    '      - name: Verify publication prerequisites\n        if: inputs.publish\n',
+    '      - name: Verify publication prerequisites\n        if: inputs.publish == false\n',
+    'non-publishing artifact condition',
+  )
+  expectGateMutationFailure(
+    nonPublishingArtifactCheck,
+    'artifact workflow with non-publishing condition',
+    'inputs.publish',
+    artifactPrivacyPublicationCommand,
+  )
+
+  const conditionalSourceCheck = replaceExactlyOnce(
+    sourceWorkflow,
+    '      - name: Verify publication prerequisites\n        run: |\n',
+    '      - name: Verify publication prerequisites\n        if: false\n        run: |\n',
+    'disabled source publication condition',
+  )
+  expectGateMutationFailure(
+    conditionalSourceCheck,
+    'source workflow with disabled publication checks',
+    undefined,
+    privacyPublicationCommand,
   )
   console.log('[privacy-manifest-audit-test] target drift, Apple schema/value allowlists, collection/tracking consistency, byte-bound declarations, closure, and both publication gates enforced')
 }

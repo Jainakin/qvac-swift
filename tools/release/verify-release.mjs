@@ -43,7 +43,27 @@ function parseJSONEvidence(bytes, label) {
   }
 }
 
-function verifyEvidenceContents(manifest, runtimeInventoryBytes, sdkProvenanceBytes, privacyAuditBytes) {
+function stableJSON(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJSON).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJSON(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+function digestBytes(bytes) {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+function verifyEvidenceContents(
+  manifest,
+  runtimeInventoryBytes,
+  sdkProvenanceBytes,
+  privacyAuditBytes,
+  bareKitPatchBytes,
+  bareKitProvenanceBytes,
+  bareKitNativeClosureBytes,
+) {
   const inventory = parseJSONEvidence(runtimeInventoryBytes, 'runtime resolution inventory')
   if (inventory?.schemaVersion !== 1
       || inventory?.sdkVersion !== manifest.sdk.version
@@ -69,6 +89,37 @@ function verifyEvidenceContents(manifest, runtimeInventoryBytes, sdkProvenanceBy
       || JSON.stringify(privacyAudit.scanEvidence.map(entry => entry.target))
         !== JSON.stringify(manifest.artifacts.map(entry => entry.target))) {
     fail('privacy manifest audit does not describe the manifest SDK and artifact closure')
+  }
+
+  const bareKitProvenance = parseJSONEvidence(bareKitProvenanceBytes, 'BareKit provenance')
+  if (bareKitProvenance?.schemaVersion !== 2
+      || bareKitProvenance?.component !== 'BareKit'
+      || bareKitProvenance?.upstreamVersion !== '2.3.0'
+      || bareKitProvenance?.patch?.file !== manifest.bareKitPatch.assetName
+      || bareKitProvenance?.patch?.sha256 !== digestBytes(bareKitPatchBytes)
+      || bareKitProvenance?.candidate?.revisionFloor !== 2
+      || bareKitProvenance?.nativeClosure === null
+      || typeof bareKitProvenance?.nativeClosure !== 'object') {
+    fail('BareKit provenance does not describe the manifest patch and r2 native closure')
+  }
+
+  const closure = parseJSONEvidence(bareKitNativeClosureBytes, 'BareKit native closure')
+  const mirror = bareKitProvenance.nativeClosure.prebuiltArchiveMirror
+  const expectedTargets = Object.fromEntries(
+    Object.keys(mirror?.targets ?? {}).sort().map(target => [target, {
+      driveKey: mirror.driveKey,
+      checkout: mirror.checkout,
+      files: mirror.targets[target],
+    }]),
+  )
+  if (closure?.schemaVersion !== 1
+      || closure?.component !== 'BareKit native dependency closure'
+      || closure?.upstreamCommit !== bareKitProvenance.upstream?.commit
+      || closure?.provenanceLockSHA256 !== digestBytes(bareKitProvenanceBytes)
+      || closure?.nativeClosureSHA256 !== digestBytes(Buffer.from(stableJSON(bareKitProvenance.nativeClosure)))
+      || stableJSON(closure?.sources) !== stableJSON(bareKitProvenance.nativeClosure.sources)
+      || stableJSON(closure?.targets) !== stableJSON(expectedTargets)) {
+    fail('BareKit native closure does not match the bound provenance lock')
   }
 }
 
@@ -110,6 +161,9 @@ if (assetsDir) {
     const privacyAuditPath = join(root, manifest.privacyAudit.assetName)
     const runtimeInventoryPath = join(root, manifest.runtimeResolutionInventory.assetName)
     const sdkProvenancePath = join(root, manifest.sdkProvenance.assetName)
+    const bareKitPatchPath = join(root, manifest.bareKitPatch.assetName)
+    const bareKitProvenancePath = join(root, manifest.bareKitProvenance.assetName)
+    const bareKitNativeClosurePath = join(root, manifest.bareKitNativeClosure.assetName)
     verifyFile(privacyAuditPath, manifest.privacyAudit.size, manifest.privacyAudit.sha256)
     verifyFile(
       runtimeInventoryPath,
@@ -117,11 +171,25 @@ if (assetsDir) {
       manifest.runtimeResolutionInventory.sha256,
     )
     verifyFile(sdkProvenancePath, manifest.sdkProvenance.size, manifest.sdkProvenance.sha256)
+    verifyFile(bareKitPatchPath, manifest.bareKitPatch.size, manifest.bareKitPatch.sha256)
+    verifyFile(
+      bareKitProvenancePath,
+      manifest.bareKitProvenance.size,
+      manifest.bareKitProvenance.sha256,
+    )
+    verifyFile(
+      bareKitNativeClosurePath,
+      manifest.bareKitNativeClosure.size,
+      manifest.bareKitNativeClosure.sha256,
+    )
     verifyEvidenceContents(
       manifest,
       readFileSync(runtimeInventoryPath),
       readFileSync(sdkProvenancePath),
       readFileSync(privacyAuditPath),
+      readFileSync(bareKitPatchPath),
+      readFileSync(bareKitProvenancePath),
+      readFileSync(bareKitNativeClosurePath),
     )
   }
   for (const artifact of manifest.artifacts) verifyFile(join(root, artifact.assetName), artifact.size, artifact.sha256)
@@ -174,7 +242,33 @@ if (process.argv.includes('--remote')) {
       manifest.sdkProvenance.sha256,
       true,
     )
-    verifyEvidenceContents(manifest, runtimeInventoryBytes, sdkProvenanceBytes, privacyAuditBytes)
+    const bareKitPatchBytes = await verifyRemote(
+      manifest.bareKitPatch.url,
+      manifest.bareKitPatch.size,
+      manifest.bareKitPatch.sha256,
+      true,
+    )
+    const bareKitProvenanceBytes = await verifyRemote(
+      manifest.bareKitProvenance.url,
+      manifest.bareKitProvenance.size,
+      manifest.bareKitProvenance.sha256,
+      true,
+    )
+    const bareKitNativeClosureBytes = await verifyRemote(
+      manifest.bareKitNativeClosure.url,
+      manifest.bareKitNativeClosure.size,
+      manifest.bareKitNativeClosure.sha256,
+      true,
+    )
+    verifyEvidenceContents(
+      manifest,
+      runtimeInventoryBytes,
+      sdkProvenanceBytes,
+      privacyAuditBytes,
+      bareKitPatchBytes,
+      bareKitProvenanceBytes,
+      bareKitNativeClosureBytes,
+    )
   }
   for (const artifact of manifest.artifacts) await verifyRemote(artifact.url, artifact.size, artifact.sha256)
 }

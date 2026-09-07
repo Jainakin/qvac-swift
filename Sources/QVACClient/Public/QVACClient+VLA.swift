@@ -3,6 +3,14 @@ import Foundation
 /// Default vision-tower image size exported by the published QVAC 0.17 SDK.
 public let VLA_DEFAULT_IMAGE_SIZE = 512
 
+// Defaults used by standalone footprint tests. The client-bound VLA operation
+// supplies its configured inline byte, item, and outbound ceilings explicitly.
+let vlaMaximumClientRequestTensorBytes = QVACClient.defaultMaximumInlineBinaryBytes
+let vlaMaximumClientEncodedRequestBytes =
+    (qvacBase64EncodedByteCount(QVACClient.defaultMaximumInlineBinaryBytes) ?? 0)
+    + QVACClient.defaultMaximumInlineBinaryItems * 4
+let vlaMaximumSafeJSONInteger = 9_007_199_254_740_991
+
 /// Memory layout of a three-channel VLA source image.
 public enum VLAImageLayout: String, Sendable, Equatable {
     case hwc
@@ -11,8 +19,14 @@ public enum VLAImageLayout: String, Sendable, Equatable {
 
 /// Client-side image preprocessing options for VLA inference.
 public struct VLAImagePreprocessingOptions: Sendable, Equatable {
+    /// Output width and height.
     public var size: Int
     public var layout: VLAImageLayout
+
+    /// Finite ceiling for the resulting CHW Float32 tensor. The default matches
+    /// the client's inline-binary byte budget and can be raised deliberately for
+    /// a client configured with a larger budget.
+    public var maximumOutputBytes: Int
 
     /// Input scaling override. Use `1` for `[0, 1]`, `1 / 255` for `[0, 255]`,
     /// or `nil` to reproduce the upstream auto-detection heuristic. Any other
@@ -22,17 +36,20 @@ public struct VLAImagePreprocessingOptions: Sendable, Equatable {
     public init(
         size: Int = VLA_DEFAULT_IMAGE_SIZE,
         layout: VLAImageLayout = .hwc,
-        scale: Double? = nil
+        scale: Double? = nil,
+        maximumOutputBytes: Int = QVACClient.defaultMaximumInlineBinaryBytes
     ) {
         self.size = size
         self.layout = layout
         self.scale = scale
+        self.maximumOutputBytes = maximumOutputBytes
     }
 }
 
 /// Resize, bottom-right letterbox, convert to CHW, and normalize byte pixels to
 /// `[-1, 1]`. This is a byte-exact port of `vlaPreprocessImage` from npm
-/// `@qvac/sdk@0.17.0` for finite inputs.
+/// `@qvac/sdk@0.17.0` for inputs whose normalized values are finite Float32.
+/// Output is bounded by `options.maximumOutputBytes` before allocation.
 public func vlaPreprocessImage(
     _ pixels: [UInt8],
     width: Int,
@@ -83,20 +100,45 @@ public func vlaPreprocessImage(
     )
 }
 
-/// Zero-pad a VLA state vector to `targetDimension` (32 by default).
+/// Zero-pad a finite VLA state vector to `targetDimension` (32 by default).
+/// The resulting tensor is bounded by `maximumOutputBytes` before allocation.
 public func vlaPadState(
     _ state: [Float],
-    targetDimension: Int = 32
+    targetDimension: Int = 32,
+    maximumOutputBytes: Int = QVACClient.defaultMaximumInlineBinaryBytes
 ) throws -> [Float] {
-    try _vlaPadState(state, targetDimension: targetDimension)
+    try _vlaPadState(
+        state,
+        targetDimension: targetDimension,
+        maximumOutputBytes: maximumOutputBytes
+    )
 }
 
 /// Double-input overload matching JavaScript's plain `number[]` input.
 public func vlaPadState(
     _ state: [Double],
-    targetDimension: Int = 32
+    targetDimension: Int = 32,
+    maximumOutputBytes: Int = QVACClient.defaultMaximumInlineBinaryBytes
 ) throws -> [Float] {
-    try _vlaPadState(state.map(Float.init), targetDimension: targetDimension)
+    try _vlaValidatePaddedStateSize(
+        inputCount: state.count,
+        targetDimension: targetDimension,
+        maximumOutputBytes: maximumOutputBytes
+    )
+    for value in state {
+        guard value.isFinite, Float(value).isFinite else {
+            throw QVACError.invalidArgument(
+                "vlaPadState input must contain finite Float32 values"
+            )
+        }
+    }
+    var output: [Float] = []
+    output.reserveCapacity(targetDimension)
+    for value in state {
+        output.append(Float(value))
+    }
+    output.append(contentsOf: repeatElement(0, count: targetDimension - state.count))
+    return output
 }
 
 public extension QVACClient {
@@ -144,6 +186,7 @@ public extension QVACClient {
     }
 
     struct VLAResult: Sendable, Equatable {
+        /// Finite action values bounded by the client's dedicated VLA action budget.
         public let actions: [Float]
         public let actionDimension: Int
         public let chunkSize: Int
@@ -181,17 +224,35 @@ public extension QVACClient {
 
     /// Run VLA inference through the 0.17 `vlaRun` plugin handler. Float32 and
     /// Int32 arrays are encoded explicitly in little-endian order, independent of
-    /// the host architecture.
+    /// the host architecture. Tokens and mask entries must have matching counts.
+    /// Camera count and raw tensor bytes are bounded by the client's configured
+    /// inline-binary item and byte ceilings. Returned action bytes are bounded by
+    /// `maximumVLAActionBytes` before the encoded response is copied and again
+    /// before decoded Float32 storage is allocated.
     func vla(
         _ parameters: VLAParameters,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> VLAResult {
-        guard parameters.imageWidth > 0, parameters.imageHeight > 0 else {
-            throw QVACError.invalidArgument("vla image dimensions must be positive")
+        guard parameters.imageWidth > 0,
+              parameters.imageHeight > 0,
+              parameters.imageWidth <= vlaMaximumSafeJSONInteger,
+              parameters.imageHeight <= vlaMaximumSafeJSONInteger else {
+            throw QVACError.invalidArgument(
+                "vla image dimensions must be positive JSON-safe integers"
+            )
         }
         guard !parameters.images.isEmpty,
               parameters.images.allSatisfy({ !$0.isEmpty }) else {
             throw QVACError.invalidArgument("vla requires at least one non-empty image tensor")
+        }
+        let fixedTensorCount = parameters.noise == nil ? 3 : 4
+        let (tensorCount, tensorCountOverflow) = parameters.images.count
+            .addingReportingOverflow(fixedTensorCount)
+        guard !tensorCountOverflow, tensorCount <= maximumInlineBinaryItems else {
+            throw QVACError.invalidArgument(
+                "vla has more than maximumInlineBinaryItems "
+                    + "\(maximumInlineBinaryItems) binary tensors"
+            )
         }
         guard !parameters.tokens.isEmpty else {
             throw QVACError.invalidArgument("vla tokens must not be empty")
@@ -199,28 +260,97 @@ public extension QVACClient {
         guard !parameters.mask.isEmpty else {
             throw QVACError.invalidArgument("vla mask must not be empty")
         }
+        guard parameters.mask.count == parameters.tokens.count else {
+            throw QVACError.invalidArgument("vla tokens and mask must have the same length")
+        }
         if let noise = parameters.noise, noise.isEmpty {
             throw QVACError.invalidArgument("vla noise must not be empty when supplied")
+        }
+
+        var tensorShapes = parameters.images.map {
+            (elementCount: $0.count, elementStride: MemoryLayout<Float>.stride)
+        }
+        tensorShapes.append(
+            (elementCount: parameters.state.count, elementStride: MemoryLayout<Float>.stride)
+        )
+        tensorShapes.append(
+            (elementCount: parameters.tokens.count, elementStride: MemoryLayout<Int32>.stride)
+        )
+        tensorShapes.append(
+            (elementCount: parameters.mask.count, elementStride: MemoryLayout<UInt8>.stride)
+        )
+        if let noise = parameters.noise {
+            tensorShapes.append(
+                (elementCount: noise.count, elementStride: MemoryLayout<Float>.stride)
+            )
+        }
+        let footprint = try vlaValidateRequestTensorFootprint(
+            tensorShapes,
+            rawByteLimit: maximumInlineBinaryBytes,
+            encodedByteLimit: maximumOutboundPayloadBytes
+        )
+        try validateBase64InputSizes(footprint.byteCounts, operation: "vla")
+
+        guard parameters.images.allSatisfy({ image in image.allSatisfy(\.isFinite) }) else {
+            throw QVACError.invalidArgument("vla image tensors must contain only finite values")
+        }
+        guard parameters.state.allSatisfy(\.isFinite) else {
+            throw QVACError.invalidArgument("vla state must contain only finite values")
+        }
+        if let noise = parameters.noise, !noise.allSatisfy(\.isFinite) {
+            throw QVACError.invalidArgument("vla noise must contain only finite values")
+        }
+
+        var encodedImages: [String] = []
+        encodedImages.reserveCapacity(parameters.images.count)
+        for (index, image) in parameters.images.enumerated() {
+            encodedImages.append(
+                vlaFloat32Data(image, byteCount: footprint.byteCounts[index])
+                    .base64EncodedString()
+            )
+        }
+        var byteCountIndex = parameters.images.count
+        let stateByteCount = footprint.byteCounts[byteCountIndex]
+        byteCountIndex += 1
+        let tokenByteCount = footprint.byteCounts[byteCountIndex]
+        byteCountIndex += 1
+        let maskByteCount = footprint.byteCounts[byteCountIndex]
+        byteCountIndex += 1
+        let encodedNoise: String?
+        if let noise = parameters.noise {
+            encodedNoise = vlaFloat32Data(
+                noise,
+                byteCount: footprint.byteCounts[byteCountIndex]
+            ).base64EncodedString()
+        } else {
+            encodedNoise = nil
         }
 
         let request = VLARunWireRequest(
             type: "vlaRun",
             modelId: parameters.modelId,
-            images: parameters.images.map { vlaFloat32Data($0).base64EncodedString() },
+            images: encodedImages,
             imgWidth: parameters.imageWidth,
             imgHeight: parameters.imageHeight,
-            state: vlaFloat32Data(parameters.state).base64EncodedString(),
-            tokens: vlaInt32Data(parameters.tokens).base64EncodedString(),
-            mask: Data(parameters.mask).base64EncodedString(),
-            noise: parameters.noise.map { vlaFloat32Data($0).base64EncodedString() }
+            state: vlaFloat32Data(parameters.state, byteCount: stateByteCount)
+                .base64EncodedString(),
+            tokens: vlaInt32Data(parameters.tokens, byteCount: tokenByteCount)
+                .base64EncodedString(),
+            mask: vlaUInt8Data(parameters.mask, byteCount: maskByteCount)
+                .base64EncodedString(),
+            noise: encodedNoise
         )
-        let response: JSONValue = try await invokePlugin(
+        let response: JSONValue = try await invokePluginWithResponseLimit(
             modelId: parameters.modelId,
             handler: "vlaRun",
             params: request,
-            rpcOptions: rpcOptions
+            rpcOptions: rpcOptions,
+            maximumResponseBytes: vlaMaximumEncodedResponseBytes
         )
-        return try Self.parseVLAResult(response)
+        return try Self.parseVLAResult(
+            response,
+            maximumActionBytes: maximumVLAActionBytes
+        )
     }
 
     /// Fetch hyperparameters from the 0.17 `vlaHparams` plugin handler.
@@ -229,22 +359,35 @@ public extension QVACClient {
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> VLAHyperparametersResult {
         let request = VLAHparamsWireRequest(type: "vlaHparams", modelId: modelId)
-        let response: JSONValue = try await invokePlugin(
+        let response: JSONValue = try await invokePluginWithResponseLimit(
             modelId: modelId,
             handler: "vlaHparams",
             params: request,
-            rpcOptions: rpcOptions
+            rpcOptions: rpcOptions,
+            maximumResponseBytes: maximumMetadataResponseBytes
         )
         return try Self.parseVLAHyperparametersResult(response)
     }
 
-    private static func parseVLAResult(_ wire: JSONValue) throws -> VLAResult {
-        let object = try vlaObject(wire, path: "vla result")
-        let encoded = try vlaString(object["actions"], path: "vla result.actions")
-        guard !encoded.isEmpty, let data = Data(base64Encoded: encoded) else {
-            throw QVACError.protocolViolation("vla result.actions is not non-empty base64")
+    private var vlaMaximumEncodedResponseBytes: Int {
+        guard let encodedActionBytes = qvacBase64EncodedByteCount(
+            maximumVLAActionBytes
+        ) else {
+            return maximumWireMessageBytes
         }
-        let actions = try vlaDecodeFloat32(data, path: "vla result.actions")
+        let (withEnvelopeAllowance, overflow) = encodedActionBytes
+            .addingReportingOverflow(64 * 1_024)
+        return min(
+            maximumWireMessageBytes,
+            overflow ? maximumWireMessageBytes : withEnvelopeAllowance
+        )
+    }
+
+    private static func parseVLAResult(
+        _ wire: JSONValue,
+        maximumActionBytes: Int
+    ) throws -> VLAResult {
+        let object = try vlaObject(wire, path: "vla result")
         let actionDimension = try vlaInteger(
             object["actionDim"], path: "vla result.actionDim", minimum: 1
         )
@@ -252,11 +395,56 @@ public extension QVACClient {
             object["chunkSize"], path: "vla result.chunkSize", minimum: 1
         )
         let (expectedCount, overflow) = actionDimension.multipliedReportingOverflow(by: chunkSize)
-        guard !overflow, actions.count == expectedCount else {
+        guard !overflow else {
             throw QVACError.protocolViolation(
-                "vla result.actions contains \(actions.count) values; expected \(actionDimension) × \(chunkSize)"
+                "vla result action dimensions are too large"
             )
         }
+        let (expectedByteCount, byteOverflow) = expectedCount.multipliedReportingOverflow(
+            by: MemoryLayout<Float>.stride
+        )
+        guard !byteOverflow, expectedByteCount <= maximumActionBytes else {
+            throw QVACError.resourceLimitExceeded(
+                operation: "vla",
+                resource: "decoded action bytes",
+                maximumBytes: maximumActionBytes,
+                attemptedBytes: byteOverflow ? Int.max : expectedByteCount
+            )
+        }
+
+        let encoded = try vlaString(object["actions"], path: "vla result.actions")
+        guard !encoded.isEmpty else {
+            throw QVACError.protocolViolation("vla result.actions is not non-empty base64")
+        }
+        guard let expectedEncodedByteCount = qvacBase64EncodedByteCount(expectedByteCount),
+              encoded.utf8.count == expectedEncodedByteCount else {
+            throw QVACError.protocolViolation(
+                "vla result.actions encoded length is inconsistent with expected "
+                    + "\(actionDimension) × \(chunkSize) Float32 values"
+            )
+        }
+        guard let decodedByteCount = qvacStrictBase64DecodedByteCount(encoded) else {
+            throw QVACError.protocolViolation("vla result.actions is not non-empty base64")
+        }
+        guard decodedByteCount.isMultiple(of: MemoryLayout<UInt32>.size) else {
+            throw QVACError.protocolViolation(
+                "vla result.actions byte length is not divisible by four"
+            )
+        }
+        guard decodedByteCount == expectedByteCount else {
+            throw QVACError.protocolViolation(
+                "vla result.actions contains "
+                    + "\(decodedByteCount / MemoryLayout<Float>.stride) values; "
+                    + "expected \(actionDimension) × \(chunkSize)"
+            )
+        }
+        // Syntax, exact decoded size, and the client result limit are all
+        // established before allocating worker-controlled decoded storage.
+        guard let data = Data(base64Encoded: encoded),
+              data.count == decodedByteCount else {
+            throw QVACError.protocolViolation("vla result.actions is not non-empty base64")
+        }
+        let actions = try vlaDecodeFloat32(data, path: "vla result.actions")
         let stats = try object["stats"].map(Self.parseVLAStats)
         return .init(
             actions: actions,
@@ -380,12 +568,46 @@ private func _vlaPreprocessImage(
     guard options.size > 0 else {
         throw QVACError.invalidArgument("vlaPreprocessImage size must be positive")
     }
+    guard options.maximumOutputBytes > 0,
+          options.maximumOutputBytes <= Int(UInt32.max) else {
+        throw QVACError.invalidArgument(
+            "vlaPreprocessImage maximumOutputBytes must be between 1 and UInt32.max"
+        )
+    }
     let (pixelCount, pixelsOverflow) = width.multipliedReportingOverflow(by: height)
     let (expected, channelsOverflow) = pixelCount.multipliedReportingOverflow(by: 3)
     guard !pixelsOverflow, !channelsOverflow, count == expected else {
         throw QVACError.invalidArgument(
             "vlaPreprocessImage expected \(pixelsOverflow || channelsOverflow ? -1 : expected) pixel values, got \(count)"
         )
+    }
+
+    let size = options.size
+    // Preflight the output shape before inspecting input values, converting
+    // resize intermediates to Int, or allocating output storage.
+    let (planeStride, planeOverflow) = size.multipliedReportingOverflow(by: size)
+    let (outputCount, outputOverflow) = planeStride.multipliedReportingOverflow(by: 3)
+    let (outputBytes, byteOverflow) = outputCount.multipliedReportingOverflow(
+        by: MemoryLayout<Float>.stride
+    )
+    guard !planeOverflow, !outputOverflow, !byteOverflow else {
+        throw QVACError.invalidArgument("vlaPreprocessImage size is too large")
+    }
+    guard outputBytes <= options.maximumOutputBytes else {
+        throw QVACError.resourceLimitExceeded(
+            operation: "vlaPreprocessImage",
+            resource: "output tensor bytes",
+            maximumBytes: options.maximumOutputBytes,
+            attemptedBytes: outputBytes
+        )
+    }
+
+    if !byteInput {
+        for index in 0..<count where !valueAt(index).isFinite {
+            throw QVACError.invalidArgument(
+                "vlaPreprocessImage input must contain only finite values"
+            )
+        }
     }
 
     let detectedScale: Double
@@ -405,7 +627,6 @@ private func _vlaPreprocessImage(
     } else {
         scale = detectedScale
     }
-    let size = options.size
     let ratio = max(Double(width) / Double(size), Double(height) / Double(size))
     let newWidth = max(1, Int(floor(Double(width) / ratio)))
     let newHeight = max(1, Int(floor(Double(height) / ratio)))
@@ -413,11 +634,6 @@ private func _vlaPreprocessImage(
     let padTop = size - newHeight
     let xScale = Double(width) / Double(newWidth)
     let yScale = Double(height) / Double(newHeight)
-    let (planeStride, planeOverflow) = size.multipliedReportingOverflow(by: size)
-    let (outputCount, outputOverflow) = planeStride.multipliedReportingOverflow(by: 3)
-    guard !planeOverflow, !outputOverflow else {
-        throw QVACError.invalidArgument("vlaPreprocessImage size is too large")
-    }
     var output = [Float](repeating: -1, count: outputCount)
 
     for yy in 0..<newHeight {
@@ -460,7 +676,13 @@ private func _vlaPreprocessImage(
                     + valueAt(i10) * w10
                     + valueAt(i01) * w01
                     + valueAt(i11) * w11
-                output[channel * planeStride + outputIndex] = Float(value * scale * 2 - 1)
+                let normalized = Float(value * scale * 2 - 1)
+                guard normalized.isFinite else {
+                    throw QVACError.invalidArgument(
+                        "vlaPreprocessImage normalization produced a non-finite Float32 value"
+                    )
+                }
+                output[channel * planeStride + outputIndex] = normalized
             }
         }
     }
@@ -469,34 +691,148 @@ private func _vlaPreprocessImage(
 
 private func _vlaPadState(
     _ state: [Float],
-    targetDimension: Int
+    targetDimension: Int,
+    maximumOutputBytes: Int
 ) throws -> [Float] {
+    try _vlaValidatePaddedStateSize(
+        inputCount: state.count,
+        targetDimension: targetDimension,
+        maximumOutputBytes: maximumOutputBytes
+    )
+    guard state.allSatisfy(\.isFinite) else {
+        throw QVACError.invalidArgument("vlaPadState input must contain only finite values")
+    }
+    guard state.count != targetDimension else { return state }
+    var output = state
+    output.reserveCapacity(targetDimension)
+    output.append(contentsOf: repeatElement(0, count: targetDimension - state.count))
+    return output
+}
+
+private func _vlaValidatePaddedStateSize(
+    inputCount: Int,
+    targetDimension: Int,
+    maximumOutputBytes: Int
+) throws {
     guard targetDimension > 0 else {
         throw QVACError.invalidArgument("vlaPadState targetDimension must be positive")
     }
-    guard state.count <= targetDimension else {
+    guard inputCount <= targetDimension else {
         throw QVACError.invalidArgument(
-            "vlaPadState input length \(state.count) exceeds targetDimension \(targetDimension)"
+            "vlaPadState input length \(inputCount) exceeds targetDimension \(targetDimension)"
         )
     }
-    return state + [Float](repeating: 0, count: targetDimension - state.count)
+    guard maximumOutputBytes > 0,
+          maximumOutputBytes <= Int(UInt32.max) else {
+        throw QVACError.invalidArgument(
+            "vlaPadState maximumOutputBytes must be between 1 and UInt32.max"
+        )
+    }
+    let (outputBytes, overflow) = targetDimension.multipliedReportingOverflow(
+        by: MemoryLayout<Float>.stride
+    )
+    guard !overflow, outputBytes <= maximumOutputBytes else {
+        throw QVACError.resourceLimitExceeded(
+            operation: "vlaPadState",
+            resource: "output tensor bytes",
+            maximumBytes: maximumOutputBytes,
+            attemptedBytes: overflow ? Int.max : outputBytes
+        )
+    }
 }
 
-private func vlaFloat32Data(_ values: [Float]) -> Data {
-    var data = Data(capacity: values.count * MemoryLayout<UInt32>.size)
+struct VLATensorFootprint: Equatable {
+    let byteCounts: [Int]
+    let rawByteCount: Int
+    let base64ByteCount: Int
+}
+
+func vlaTensorFootprint(
+    _ shapes: [(elementCount: Int, elementStride: Int)]
+) -> VLATensorFootprint? {
+    var byteCounts: [Int] = []
+    byteCounts.reserveCapacity(shapes.count)
+    var rawByteCount = 0
+    var base64ByteCount = 0
+
+    for shape in shapes {
+        guard shape.elementCount >= 0, shape.elementStride > 0 else { return nil }
+        let (byteCount, byteOverflow) = shape.elementCount.multipliedReportingOverflow(
+            by: shape.elementStride
+        )
+        guard !byteOverflow,
+              let encodedByteCount = qvacBase64EncodedByteCount(byteCount) else {
+            return nil
+        }
+        let (nextRawByteCount, rawOverflow) = rawByteCount.addingReportingOverflow(byteCount)
+        let (nextBase64ByteCount, base64Overflow) = base64ByteCount.addingReportingOverflow(
+            encodedByteCount
+        )
+        guard !rawOverflow, !base64Overflow else { return nil }
+        byteCounts.append(byteCount)
+        rawByteCount = nextRawByteCount
+        base64ByteCount = nextBase64ByteCount
+    }
+
+    return .init(
+        byteCounts: byteCounts,
+        rawByteCount: rawByteCount,
+        base64ByteCount: base64ByteCount
+    )
+}
+
+func vlaValidateRequestTensorFootprint(
+    _ shapes: [(elementCount: Int, elementStride: Int)],
+    rawByteLimit: Int = vlaMaximumClientRequestTensorBytes,
+    encodedByteLimit: Int = vlaMaximumClientEncodedRequestBytes
+) throws -> VLATensorFootprint {
+    guard let footprint = vlaTensorFootprint(shapes) else {
+        throw QVACError.invalidArgument("vla request tensor size arithmetic overflowed")
+    }
+    guard footprint.byteCounts.allSatisfy({ $0 <= rawByteLimit }) else {
+        throw QVACError.invalidArgument(
+            "an individual vla request tensor exceeds the raw-data limit "
+                + "maximumInlineBinaryBytes \(rawByteLimit)"
+        )
+    }
+    guard footprint.rawByteCount <= rawByteLimit else {
+        throw QVACError.invalidArgument(
+            "vla request tensors total \(footprint.rawByteCount) raw bytes, exceeding "
+                + "the raw-data limit maximumInlineBinaryBytes \(rawByteLimit)"
+        )
+    }
+    guard footprint.base64ByteCount <= encodedByteLimit else {
+        throw QVACError.invalidArgument(
+            "vla request tensors require \(footprint.base64ByteCount) base64 bytes, "
+                + "exceeding maximumOutboundPayloadBytes \(encodedByteLimit)"
+        )
+    }
+    return footprint
+}
+
+private func vlaFloat32Data(_ values: [Float], byteCount: Int) -> Data {
+    var data = Data(capacity: byteCount)
     for value in values {
         var littleEndian = value.bitPattern.littleEndian
         withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
     }
+    assert(data.count == byteCount)
     return data
 }
 
-private func vlaInt32Data(_ values: [Int32]) -> Data {
-    var data = Data(capacity: values.count * MemoryLayout<Int32>.size)
+private func vlaInt32Data(_ values: [Int32], byteCount: Int) -> Data {
+    var data = Data(capacity: byteCount)
     for value in values {
         var littleEndian = value.littleEndian
         withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
     }
+    assert(data.count == byteCount)
+    return data
+}
+
+private func vlaUInt8Data(_ values: [UInt8], byteCount: Int) -> Data {
+    let data = Data(values)
+    assert(data.count == byteCount)
     return data
 }
 
@@ -504,13 +840,25 @@ private func vlaDecodeFloat32(_ data: Data, path: String) throws -> [Float] {
     guard data.count.isMultiple(of: MemoryLayout<UInt32>.size) else {
         throw QVACError.protocolViolation("\(path) byte length is not divisible by four")
     }
-    let bytes = [UInt8](data)
-    return stride(from: 0, to: bytes.count, by: 4).map { offset in
-        let bits = UInt32(bytes[offset])
-            | UInt32(bytes[offset + 1]) << 8
-            | UInt32(bytes[offset + 2]) << 16
-            | UInt32(bytes[offset + 3]) << 24
-        return Float(bitPattern: bits)
+    return try data.withUnsafeBytes { rawBuffer throws -> [Float] in
+        let bytes = rawBuffer.bindMemory(to: UInt8.self)
+        func value(at offset: Int) -> Float {
+            let bits = UInt32(bytes[offset])
+                | UInt32(bytes[offset + 1]) << 8
+                | UInt32(bytes[offset + 2]) << 16
+                | UInt32(bytes[offset + 3]) << 24
+            return Float(bitPattern: bits)
+        }
+        for offset in stride(from: 0, to: bytes.count, by: 4)
+        where !value(at: offset).isFinite {
+            throw QVACError.protocolViolation("\(path) contains a non-finite value")
+        }
+        var values: [Float] = []
+        values.reserveCapacity(bytes.count / MemoryLayout<UInt32>.size)
+        for offset in stride(from: 0, to: bytes.count, by: 4) {
+            values.append(value(at: offset))
+        }
+        return values
     }
 }
 
@@ -539,9 +887,13 @@ private func vlaInteger(
     guard case .number(let number) = value,
           number.isFinite,
           number.rounded() == number,
-          number >= Double(minimum),
-          number <= Double(Int.max) else {
-        throw QVACError.protocolViolation("\(path) must be an integer greater than or equal to \(minimum)")
+          number <= Double(vlaMaximumSafeJSONInteger),
+          let integer = Int(exactly: number),
+          integer >= minimum else {
+        throw QVACError.protocolViolation(
+            "\(path) must be an integer from \(minimum) through "
+                + "\(vlaMaximumSafeJSONInteger)"
+        )
     }
-    return Int(number)
+    return integer
 }

@@ -22,6 +22,7 @@ import Foundation
 ///   • `.transport(_)`            — connection/transport failure
 ///   • `.connectionReset`         — a fresh worker is ready but in-memory state was lost
 ///   • `.requestTimedOut(...)`     — a local per-call RPC deadline elapsed
+///   • `.resourceLimitExceeded(...)` — a finite local memory/resource ceiling was crossed
 ///   • `.invalidArgument(_)`       — the caller supplied an invalid local option
 ///   • `.protocolViolation(_)`    — server returned an unexpected shape
 ///   • `.encoding(_)`             — wire-level decode failed
@@ -47,6 +48,15 @@ public enum QVACError: Error, CustomStringConvertible, Sendable {
     case connectionReset
     case requestTimedOut(operation: String, after: Duration)
     case streamBufferOverflow(operation: String, maximumBytes: Int, attemptedBytes: Int)
+    /// A locally enforced finite resource ceiling was crossed. `attemptedBytes`
+    /// is the total that would have been retained or decoded, not merely the
+    /// size of the record that crossed the boundary.
+    case resourceLimitExceeded(
+        operation: String,
+        resource: String,
+        maximumBytes: Int,
+        attemptedBytes: Int
+    )
     case invalidArgument(String)
     case protocolViolation(String)
     case encoding(String)
@@ -74,6 +84,14 @@ public enum QVACError: Error, CustomStringConvertible, Sendable {
         case .streamBufferOverflow(let operation, let maximumBytes, let attemptedBytes):
             return "QVAC stream '\(operation)' exceeded its \(maximumBytes)-byte buffer "
                 + "(attempted \(attemptedBytes) bytes)"
+        case .resourceLimitExceeded(
+            let operation,
+            let resource,
+            let maximumBytes,
+            let attemptedBytes
+        ):
+            return "QVAC operation '\(operation)' exceeded its \(maximumBytes)-byte "
+                + "\(resource) limit (attempted \(attemptedBytes) bytes)"
         case .invalidArgument(let reason):
             return "QVAC invalid argument: \(reason)"
         case .protocolViolation(let r):

@@ -1,0 +1,154 @@
+{
+  "schemaVersion": 2,
+  "component": "BareKit",
+  "upstreamVersion": "2.3.0",
+  "upstream": {
+    "repository": "https://github.com/holepunchto/bare-kit.git",
+    "tag": "v2.3.0",
+    "tagObject": "afa4a27a345627dadb542f651d71501c1e290347",
+    "commit": "264ebb068d23ca5c5168ed92ea1a0ce85b12259d",
+    "tree": "671900a0af3d1ab8f3542c0f785904a3aa6aa97b",
+    "contentSHA256": "6924a86b5512a96b02908bc953da5226677e68855e525b25846ecac00997cac1",
+    "license": "Apache-2.0",
+    "inputs": {
+      "CMakeLists.txt": "9785fa256b519c23941bdda262c969a7f2b36c03b7883de4ec4990bc8b3c3928",
+      "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "NOTICE": "7c0de08a5fc5fdb3df3e6445f11756e9df22e542187c2e2062eff1f99111bbf4",
+      "apple/BareKit/BareKit.h": "244f4fe322f3397c4e94ef3ea0cae9a2b059326bb60398e1cce3e1a7687ccb16",
+      "apple/BareKit/BareKit.m": "99302230cfcfd47da384405322f6df2e4b3226b384843abd77b16f389a19b7a5",
+      "package-lock.json": "404588073b0389065b621db35242764937028c1ec8832f4cc8122eb7382f2ff2",
+      "shared/posix/ipc.c": "14e4a7b40130f38cc2627c4cf4993345cff60fefd9f99609d6a38ea4c6bdf9b4"
+    }
+  },
+  "runtime": {
+    "version": "1.29.4",
+    "commit": "5cf8db08c17a433a2f05b25e397a7ebcdcf5a158"
+  },
+  "nativeClosure": {
+    "sources": {
+      "github+google+boringssl-src": {
+        "repository": "https://github.com/google/boringssl.git",
+        "commit": "617634bc015344093f5ea0b0a5b653c924cfa20d",
+        "tree": "011ced994dcbf512906b568f02c7f2c22d960d2f"
+      },
+      "github+holepunchto+bare-src": {
+        "repository": "https://github.com/holepunchto/bare.git",
+        "commit": "5cf8db08c17a433a2f05b25e397a7ebcdcf5a158",
+        "tree": "cbbb5f394f9634b1cffa46db4f2a148040249976"
+      },
+      "github+holepunchto+libbase64-src": {
+        "repository": "https://github.com/holepunchto/libbase64.git",
+        "commit": "078ad06fd7edf45d4d5719b44d5af07941e96c1e",
+        "tree": "c94a19e59bc11148ed96efb37ce1ed5e16a143f3"
+      },
+      "github+holepunchto+libhex-src": {
+        "repository": "https://github.com/holepunchto/libhex.git",
+        "commit": "a4a2c8437788bf1fb384257a016d252a954b5bed",
+        "tree": "2c7eb488e8998953a93c2103a72441f5fbff498d"
+      },
+      "github+holepunchto+libjs-src": {
+        "repository": "https://github.com/holepunchto/libjs.git",
+        "commit": "36e73e6c00ffbc97e0a9d47fea37fc267bdb1c8d",
+        "tree": "7517e2e3c792fa8c82741bf65c4f341b2ccbd3d0"
+      },
+      "github+holepunchto+liblog-src": {
+        "repository": "https://github.com/holepunchto/liblog.git",
+        "commit": "edcfd8f4294819953c323838e903ad19d51a2ac5",
+        "tree": "2328a70b8209046f4e2a4cef3fa638461b7ede1a"
+      },
+      "github+holepunchto+libnapi-src": {
+        "repository": "https://github.com/holepunchto/libnapi.git",
+        "commit": "83aa500acbec43c6de8b654c8e78e5177717b9d8",
+        "tree": "fa84cb27df5f4626b74036a9b7bb873f3724f7e8"
+      },
+      "github+holepunchto+librlimit-src": {
+        "repository": "https://github.com/holepunchto/librlimit.git",
+        "commit": "6e4b390cdf157f48e460c2cf551bbcaa7ea0042c",
+        "tree": "d399214c27750232dda4c501a3691b94ce24383f"
+      },
+      "github+holepunchto+liburl-src": {
+        "repository": "https://github.com/holepunchto/liburl.git",
+        "commit": "c00e0d7c090a5773aaf6562c12063baa927f8e5a",
+        "tree": "6fd86f75fd70f7e57523314fbf2d223868c6c735"
+      },
+      "github+holepunchto+libutf-src": {
+        "repository": "https://github.com/holepunchto/libutf.git",
+        "commit": "7a4e608e92fef4b9ca6017bfdd599217a8c4745d",
+        "tree": "200376cf6db35d93661c2da660504345e368573c"
+      },
+      "github+libuv+libuv-src": {
+        "repository": "https://github.com/libuv/libuv.git",
+        "commit": "1cfa32ff59c076ffb6ed735bbc8c18361558661f",
+        "tree": "f2e0db3c16b3cdf6883f91d7b4889b4a926e7c71"
+      }
+    },
+    "prebuiltArchiveMirror": {
+      "driveKey": "krmguqnh75rud4iieqgmzyqoza415cbu68payoww65ii9fzt5n4o",
+      "checkout": 133,
+      "targets": {
+        "ios-arm64": {
+          "libc++.a": "821dd89197ea46ed9388827629a2b4f116b1e4137c5a3fde29bc1c342b461d5f",
+          "libjs.a": "1f4edaa3ce353737a02b7be85f703ba196a551924e72d03f75b5f95dccb73293",
+          "libv8.a": "d61e0b1107c332d6e581a51809404ce74462675ace137782dcc8195ebe8ac5c0"
+        },
+        "ios-arm64-simulator": {
+          "libc++.a": "9a4b92a912e166782b30afb7a5e4568aeb41ff420588494f651e652cd89bdb08",
+          "libjs.a": "804c001637defa264d0df5935060f5905f2acec55a323431c20f5400a9ed5a67",
+          "libv8.a": "990b490bc4b9431d30d89b1154ddd87345ab130d32cfd1b04eae07b6a93b4a09"
+        },
+        "ios-x64-simulator": {
+          "libc++.a": "0da651ccea3a45adcd3cafd1cfbb37caf90a718eff277e1a04ee59cb81039bac",
+          "libjs.a": "b3efffc03b09327949ab4d41ecba87567ed59664758a7dc02d717e4007068979",
+          "libv8.a": "d7863f49426dfbf664cf1df73bbfec1d8df302d34c7d33859085535c7ad428b6"
+        }
+      }
+    }
+  },
+  "patch": {
+    "file": "bare-kit-2.3.0-qvac.patch",
+    "sha256": "d8513ef4b411767719a6f10997408c6075a85bd7d171efd25d8076ea0e4683d2",
+    "patchedTreeSHA256": "b4eb3c53ddfb09545bfdd0dbc126f259581bdfd1a36268bc1b2fa29ff7e46d5a",
+    "patchedInputs": {
+      "CMakeLists.txt": "9328a3c1e9286bd49260adfd658aaa80ee64d9bf0aeba3d36047f3ae8eb4d33e",
+      "apple/BareKit/BareKit.h": "316d203c4d1b54a942f7f5e7d9f0e299a755dcddecdf8c8a54af287d0d479ba2",
+      "apple/BareKit/BareKit.m": "e231b9a37f0de87637817c2d8ca48bf3c63524a118647707ffa94bea622975e6",
+      "shared/posix/ipc.c": "efa3f9a4272c9fef334ae4687d0435e4816a7352f1f80027fb9e94deaa6c69ab"
+    },
+    "claims": [
+      "Retry interrupted POSIX IPC reads and writes before exposing an error.",
+      "Expose non-would-block read failures as NSError without consuming uninitialized data.",
+      "Return read NSData with conventional non-owning Objective-C method semantics.",
+      "Report synchronous and callback-based write failures without constructing invalid byte ranges.",
+      "Own callback-based write state until completion or callback teardown under manual reference counting.",
+      "Copy callbacks before invocation and release replaced or closed callbacks under manual reference counting.",
+      "Make close idempotent and prevent callback or descriptor use after close begins.",
+      "Resolve the Bare runtime by its exact 1.29.4 commit rather than a movable tag."
+    ]
+  },
+  "buildToolchain": {
+    "node": "22.22.0",
+    "xcode": "16.4",
+    "developerDirectory": "/Applications/Xcode_16.4.app/Contents/Developer",
+    "compiler": "apple-clang-from-xcode",
+    "bareMake": {
+      "version": "1.8.0",
+      "integrity": "sha512-IUBNn2B2YIebhXE6Slw9bSmOYItS2cJBy1cVNqWs1yrzuxXbCbPS43NoV/gUEVOy+2KYfPIAmsuv4f+GZ5MR/A=="
+    },
+    "packageLockSHA256": "1cde446d0351b7547f6dce7adf70e69470b253b12e155db8bce221400b7bd09c"
+  },
+  "candidate": {
+    "revisionFloor": 2,
+    "architectures": {
+      "device": ["arm64"],
+      "simulator": ["arm64", "x86_64"]
+    },
+    "activationStatus": "blocked",
+    "activationRequirements": [
+      "Build and verify this byte-bound candidate twice from clean locked-toolchain roots; require byte-identical output or record and review every nondeterministic field.",
+      "Run the complete iOS lifecycle, backpressure, memory, and real-worker suite against the candidate on simulator and physical device.",
+      "Include the exact patch, provenance lock, and generated dependency-closure evidence in candidate evidence and bind them by SHA-256 in the release manifest.",
+      "Resolve the repository's separate privacy and native-license publication blockers.",
+      "Generate and commit the URL-backed Package.swift from the verified dry-run r2-or-later candidate, require complete CI on that exact source commit, then have the publishing maintainer publish the rebuilt byte-identical assets under the reserved immutable tag only after a separately reviewed removal of the publication kill switch."
+    ]
+  }
+}

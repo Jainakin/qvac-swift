@@ -8,7 +8,7 @@ on:
         required: true
         type: number
       publish:
-        description: Publish the artifact release after all checks pass
+        description: Reserved; rejected until the reviewed BareKit activation gate is unlocked
         required: true
         default: false
         type: boolean
@@ -36,7 +36,7 @@ concurrency:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
@@ -48,7 +48,18 @@ jobs:
         with:
           node-version: 22.22.0
           cache: npm
-          cache-dependency-path: tools/runtime/package-lock.json
+          cache-dependency-path: |
+            tools/runtime/package-lock.json
+            tools/native/bare-kit/package-lock.json
+      # This is an intentional publication kill switch, not a transient failed
+      # prerequisite. Remove it only in a separately reviewed commit after every
+      # requirement in the pinned BareKit activation ledger is complete.
+      - name: Enforce the reviewed BareKit publication kill switch
+        if: inputs.publish
+        run: |
+          echo "::error::Publication is intentionally disabled until every BareKit r2 activation requirement is complete and this kill switch is removed in a separate review"
+          echo "Build with publish=false to produce candidate evidence for release review."
+          exit 1
       - name: Require main and lock the artifact revision
         env:
           GH_TOKEN: ${{ github.token }}
@@ -129,11 +140,105 @@ jobs:
             Sources/QVACClient/Resources/worker.mobile.bundle
       - name: Build the native dependency closure
         run: |
-          tools/runtime/link-ios-artifacts.sh
+          tools/native/bare-kit/build-candidate.sh
+          QVAC_BARE_KIT_CANDIDATE="$GITHUB_WORKSPACE/tools/native/bare-kit/.build/BareKit.xcframework" \
+            tools/runtime/link-ios-artifacts.sh
           node tools/release/compute-manifest.mjs link-set \
             tools/runtime/.build/artifacts \
             tools/runtime/.build/worker.repro-a.bundle \
             tools/runtime/.build/link-set.json
+      - name: Install checksum-pinned XcodeGen
+        run: |
+          XCODEGEN_VERSION=2.46.0
+          XCODEGEN_SHA256=4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
+          XCODEGEN_ARCHIVE="$RUNNER_TEMP/xcodegen-$XCODEGEN_VERSION.zip"
+          XCODEGEN_ROOT="$RUNNER_TEMP/xcodegen-$XCODEGEN_VERSION"
+          curl --fail --location --silent --show-error \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --max-time 300 \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/$XCODEGEN_VERSION/xcodegen.zip" \
+            --output "$XCODEGEN_ARCHIVE"
+          printf '%s  %s\n' "$XCODEGEN_SHA256" "$XCODEGEN_ARCHIVE" | shasum -a 256 -c -
+          mkdir -p "$XCODEGEN_ROOT"
+          ditto -x -k "$XCODEGEN_ARCHIVE" "$XCODEGEN_ROOT"
+          QVAC_XCODEGEN="$XCODEGEN_ROOT/xcodegen/bin/xcodegen"
+          test -x "$QVAC_XCODEGEN"
+          test "$("$QVAC_XCODEGEN" --version)" = "Version: $XCODEGEN_VERSION"
+          echo "QVAC_XCODEGEN=$QVAC_XCODEGEN" >> "$GITHUB_ENV"
+      - name: Validate the patched candidate through the consuming package
+        run: |
+          cp Package.swift "$RUNNER_TEMP/Package.swift.canonical"
+          restore_package_manifest() {
+            cp "$RUNNER_TEMP/Package.swift.canonical" Package.swift
+          }
+          trap restore_package_manifest EXIT
+          node tools/ci/package-manifest-mode.mjs --activate-development
+          swift package dump-package >/dev/null
+
+          xcodebuild -scheme QVACClient \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/qvac-candidate-device-dd" \
+            CODE_SIGNING_ALLOWED=NO \
+            SWIFT_SUPPRESS_WARNINGS=NO \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
+            build 2>&1 | tee "$RUNNER_TEMP/qvac-candidate-device.log"
+
+          tools/coverage/run-ios-transport.sh --self-test
+          (
+            cd Tests/QVACiOSSmokeHarness
+            xcodebuild -scheme QVACiOSSmokeHarness-Package \
+              -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
+              -derivedDataPath "$RUNNER_TEMP/qvac-candidate-ios-dd" \
+              CODE_SIGNING_ALLOWED=NO \
+              -parallel-testing-enabled NO \
+              -enableCodeCoverage YES \
+              SWIFT_SUPPRESS_WARNINGS=NO \
+              SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+              OTHER_SWIFT_FLAGS='-strict-concurrency=complete -profile-generate -profile-coverage-mapping' \
+              -resultBundlePath "$RUNNER_TEMP/qvac-candidate-ios.xcresult" \
+              -only-testing:QVACiOSSmokeTests \
+              test
+          ) 2>&1 | tee "$RUNNER_TEMP/qvac-candidate-ios.log"
+          tools/coverage/run-ios-transport.sh \
+            "$RUNNER_TEMP/qvac-candidate-ios-dd" \
+            "$RUNNER_TEMP/qvac-candidate-ios.log" \
+            "$RUNNER_TEMP/qvac-candidate-ios-coverage"
+
+          (
+            cd Examples/QVACChat
+            "$QVAC_XCODEGEN" generate
+            xcodebuild -project QVACChat.xcodeproj -scheme QVACChat-iOS \
+              -destination 'generic/platform=iOS Simulator' \
+              -derivedDataPath "$RUNNER_TEMP/qvac-candidate-example-dd" \
+              SWIFT_SUPPRESS_WARNINGS=NO \
+              SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+              OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
+              build
+          ) 2>&1 | tee "$RUNNER_TEMP/qvac-candidate-example.log"
+
+          restore_package_manifest
+          trap - EXIT
+          git diff --exit-code -- Package.swift
+      - name: Upload patched-candidate validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bare-kit-candidate-validation-${{ github.sha }}
+          path: |
+            tools/native/bare-kit/.build/BareKit.xcframework
+            tools/native/bare-kit/.build/bare-kit-native-closure.json
+            tools/native/bare-kit/bare-kit-2.3.0-qvac.patch
+            tools/native/bare-kit/provenance.lock.json
+            ${{ runner.temp }}/qvac-candidate-device.log
+            ${{ runner.temp }}/qvac-candidate-ios.log
+            ${{ runner.temp }}/qvac-candidate-ios.xcresult
+            ${{ runner.temp }}/qvac-candidate-ios-coverage
+            ${{ runner.temp }}/qvac-candidate-example.log
+          if-no-files-found: error
+          retention-days: 30
       - name: Verify third-party notices
         run: node tools/release/generate-third-party-notices.mjs --check
       - name: Package artifacts and evidence
@@ -244,7 +349,7 @@ jobs:
               --target "$GITHUB_SHA" \
               --latest=false \
               --title "QVAC SDK 0.17.0 binary artifacts (${ARTIFACT_TAG##*-})" \
-              --notes "Binary dependencies for QVACClient. This release contains the iOS XCFrameworks and worker bundle referenced by Package.swift, together with checksums, third-party notices, privacy-audit results, and provenance records. Most users should install the source package rather than download these files directly."
+              --notes "Binary dependencies for QVACClient. This release contains the iOS XCFrameworks and worker bundle referenced by Package.swift. It also includes checksums, third-party notices, privacy-audit results, and provenance records. Most users should install the source package rather than download these files directly."
           fi
 
           # With repository release immutability enabled, current gh creates a

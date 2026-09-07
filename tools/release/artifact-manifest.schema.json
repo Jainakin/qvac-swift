@@ -4,7 +4,7 @@
   "title": "QVAC Swift hardened immutable release artifact manifest (schema v3)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "mode", "artifactTag", "sourceCommit", "sdk", "bundle", "notices", "privacyAudit", "runtimeResolutionInventory", "sdkProvenance", "artifacts"],
+  "required": ["schemaVersion", "mode", "artifactTag", "sourceCommit", "sdk", "bundle", "notices", "privacyAudit", "runtimeResolutionInventory", "sdkProvenance", "bareKitPatch", "bareKitProvenance", "bareKitNativeClosure", "artifacts"],
   "properties": {
     "schemaVersion": { "const": 3 },
     "mode": { "const": "release" },
@@ -76,6 +76,39 @@
       "properties": {
         "assetName": { "const": "qvac-sdk-provenance.json" },
         "url": { "type": "string", "pattern": "^https://github\\.com/[^/]+/[^/]+/releases/download/artifacts-sdk-0\\.17\\.0-r([2-9]|[1-9][0-9]+)/qvac-sdk-provenance\\.json$" },
+        "size": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "bareKitPatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assetName", "url", "size", "sha256"],
+      "properties": {
+        "assetName": { "const": "bare-kit-2.3.0-qvac.patch" },
+        "url": { "type": "string", "pattern": "^https://github\\.com/[^/]+/[^/]+/releases/download/artifacts-sdk-0\\.17\\.0-r([2-9]|[1-9][0-9]+)/bare-kit-2\\.3\\.0-qvac\\.patch$" },
+        "size": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "bareKitProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assetName", "url", "size", "sha256"],
+      "properties": {
+        "assetName": { "const": "bare-kit-patch-provenance.json" },
+        "url": { "type": "string", "pattern": "^https://github\\.com/[^/]+/[^/]+/releases/download/artifacts-sdk-0\\.17\\.0-r([2-9]|[1-9][0-9]+)/bare-kit-patch-provenance\\.json$" },
+        "size": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "bareKitNativeClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assetName", "url", "size", "sha256"],
+      "properties": {
+        "assetName": { "const": "bare-kit-native-closure.json" },
+        "url": { "type": "string", "pattern": "^https://github\\.com/[^/]+/[^/]+/releases/download/artifacts-sdk-0\\.17\\.0-r([2-9]|[1-9][0-9]+)/bare-kit-native-closure\\.json$" },
         "size": { "type": "integer", "minimum": 1, "maximum": 16777216 },
         "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
       }

@@ -23,6 +23,8 @@ public extension QVACClient {
     }
 
     final class UpscaleRun: @unchecked Sendable {
+        /// Images accumulated across worker records, with conservative retained-memory
+        /// accounting against `maximumAccumulatedResultBytes`.
         public let outputs: Task<[Data], Error>
         public let stats: Task<UpscaleStats?, Error>
 
@@ -43,6 +45,10 @@ public extension QVACClient {
         if let repeats, repeats <= 0 {
             throw QVACError.invalidArgument("upscale repeats must be greater than zero")
         }
+        guard !image.isEmpty else {
+            throw QVACError.invalidArgument("upscale image must not be empty")
+        }
+        try validateBase64InputSizes([image.count], operation: "upscale")
         let request = UpscaleStreamRequest(
             image: image.base64EncodedString(),
             modelId: modelId,
@@ -52,7 +58,9 @@ public extension QVACClient {
             .upscaleStream(request), rpcOptions: rpcOptions
         )
         let statsBox = ResultBox<UpscaleStats?>()
+        let initialResultBudget = makeResultByteBudget(operation: "upscaleStream")
         let outputs = Task<[Data], Error> {
+            var resultBudget = initialResultBudget
             var outputs: [Data] = []
             let iterator = QVACResponseStreamIteratorBox(source)
             while let response = try await iterator.next() {
@@ -71,19 +79,25 @@ public extension QVACClient {
                     try Self.rejectUnexpectedResponse(response, expected: "upscaleStream")
                 }
                 if frame.done == true {
+                    let terminalOutput = Result {
+                        try Self.decodeUpscaleOutput(
+                            frame.data,
+                            resultBudget: &resultBudget
+                        )
+                    }
+                    if case .failure(let error) = terminalOutput,
+                       let qvacError = error as? QVACError,
+                       case .resourceLimitExceeded = qvacError {
+                        throw qvacError
+                    }
+                    if case .success(let decoded?) = terminalOutput {
+                        outputs.append(decoded)
+                    }
                     let terminal = try await Self.resolveResponseStreamTerminal(
                         iterator,
                         operation: "upscaleStream"
                     ) { () throws -> (outputs: [Data], stats: UpscaleStats?) in
-                        var terminalOutputs = outputs
-                        if let encoded = frame.data, !encoded.isEmpty {
-                            guard let decoded = Data(base64Encoded: encoded), !decoded.isEmpty else {
-                                throw QVACError.protocolViolation(
-                                    "upscaleStream returned empty or invalid base64 image data"
-                                )
-                            }
-                            terminalOutputs.append(decoded)
-                        }
+                        _ = try terminalOutput.get()
                         let stats = try frame.stats.map {
                             try Self.decodeInferenceStats(
                                 $0,
@@ -91,17 +105,15 @@ public extension QVACClient {
                                 operation: "upscale"
                             )
                         }
-                        return (terminalOutputs, stats)
+                        return (outputs, stats)
                     }
                     statsBox.set(terminal.stats)
                     return terminal.outputs
                 }
-                if let encoded = frame.data, !encoded.isEmpty {
-                    guard let decoded = Data(base64Encoded: encoded), !decoded.isEmpty else {
-                        throw QVACError.protocolViolation(
-                            "upscaleStream returned empty or invalid base64 image data"
-                        )
-                    }
+                if let decoded = try Self.decodeUpscaleOutput(
+                    frame.data,
+                    resultBudget: &resultBudget
+                ) {
                     outputs.append(decoded)
                 }
             }
@@ -115,6 +127,19 @@ public extension QVACClient {
             return statsBox.get() ?? nil
         }
         return UpscaleRun(outputs: outputs, stats: stats)
+    }
+
+    private static func decodeUpscaleOutput(
+        _ encoded: String?,
+        resultBudget: inout QVACResultByteBudget
+    ) throws -> Data? {
+        guard let encoded, !encoded.isEmpty else { return nil }
+        return try decodeRetainedBase64Output(
+            encoded,
+            invalidMessage: "upscaleStream returned empty or invalid base64 image data",
+            retention: .binaryArrayElement,
+            resultBudget: &resultBudget
+        )
     }
 
     // MARK: - Video diffusion
@@ -156,6 +181,8 @@ public extension QVACClient {
         /// Observational snapshots in a count- and byte-bounded coalescing window.
         /// A lagging observer never fails `outputs` or `stats`.
         public let progressStream: QVACBufferedStream<VideoProgressTick>
+        /// Videos accumulated across worker records, with conservative retained-memory
+        /// accounting against `maximumAccumulatedResultBytes`.
         public let outputs: Task<[Data], Error>
         public let stats: Task<VideoStats?, Error>
 
@@ -172,12 +199,25 @@ public extension QVACClient {
         }
     }
 
-    /// Generate video from an exact wire-level 0.17 request. For ergonomic binary
-    /// conversion use the overload taking `initImage` and `controlFrames`.
+    /// Generate video from a full wire-level 0.17 request. The pinned 0.17 video
+    /// schema is validated before transport I/O. For ergonomic binary conversion use
+    /// the overload taking `initImage` and `controlFrames`; use `wireVideoStream` only
+    /// when intentionally sending an unchecked wire request.
     func video(
         _ input: VideoStreamRequest,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> VideoRun {
+        let (inlineItemCount, inlineItemOverflow) = (input.controlFrames?.count ?? 0)
+            .addingReportingOverflow(input.initImage == nil ? 0 : 1)
+        guard !inlineItemOverflow else {
+            throw QVACError.invalidArgument("video binary input count overflowed")
+        }
+        try validateInlineBinaryItemCount(inlineItemCount, operation: "video")
+        let inlineBinaryByteCounts = try QVACMediaRequestValidator.validate(input)
+        try validateBase64InputSizes(
+            inlineBinaryByteCounts,
+            operation: "video"
+        )
         var request = input
         let requestId = request.requestId ?? UUID().uuidString
         request.requestId = requestId
@@ -191,7 +231,9 @@ public extension QVACClient {
             maximumBufferedBytes: maximumBufferedStreamBytes
         )
         let statsBox = ResultBox<VideoStats?>()
+        let initialResultBudget = makeResultByteBudget(operation: "videoStream")
         let outputs = Task<[Data], Error> {
+            var resultBudget = initialResultBudget
             var outputs: [Data] = []
             let iterator = QVACResponseStreamIteratorBox(source)
             do {
@@ -211,6 +253,20 @@ public extension QVACClient {
                         try Self.rejectUnexpectedResponse(response, expected: "videoStream")
                     }
                     if frame.done == true {
+                        let terminalOutput = Result {
+                            try Self.decodeVideoOutput(
+                                frame.data,
+                                resultBudget: &resultBudget
+                            )
+                        }
+                        if case .failure(let error) = terminalOutput,
+                           let qvacError = error as? QVACError,
+                           case .resourceLimitExceeded = qvacError {
+                            throw qvacError
+                        }
+                        if case .success(let output?) = terminalOutput {
+                            outputs.append(output)
+                        }
                         let terminal = try await Self.resolveResponseStreamTerminal(
                             iterator,
                             operation: "videoStream"
@@ -219,12 +275,9 @@ public extension QVACClient {
                             progress: VideoProgressTick?,
                             stats: VideoStats?
                         ) in
-                            var terminalOutputs = outputs
-                            if let output = try Self.decodeVideoOutput(frame.data) {
-                                terminalOutputs.append(output)
-                            }
+                            _ = try terminalOutput.get()
                             return (
-                                terminalOutputs,
+                                outputs,
                                 Self.decodeVideoProgress(frame),
                                 try frame.stats.map {
                                     try Self.decodeInferenceStats(
@@ -249,6 +302,10 @@ public extension QVACClient {
                         continuation.finish()
                         return terminal.outputs
                     }
+                    let output = try Self.decodeVideoOutput(
+                        frame.data,
+                        resultBudget: &resultBudget
+                    )
                     if let tick = Self.decodeVideoProgress(frame) {
                         continuation.yield(
                             contentsOf: [tick],
@@ -259,7 +316,7 @@ public extension QVACClient {
                             )
                         )
                     }
-                    if let output = try Self.decodeVideoOutput(frame.data) {
+                    if let output {
                         outputs.append(output)
                     }
                 }
@@ -307,6 +364,31 @@ public extension QVACClient {
         if mode == "txt2vid", initImage != nil {
             throw QVACError.invalidArgument("txt2vid does not accept initImage")
         }
+        if let initImage, initImage.isEmpty {
+            throw QVACError.invalidArgument("video initImage must not be empty")
+        }
+        if let controlFrames {
+            guard !controlFrames.isEmpty else {
+                throw QVACError.invalidArgument("video controlFrames must not be empty")
+            }
+            guard controlFrames.allSatisfy({ !$0.isEmpty }) else {
+                throw QVACError.invalidArgument(
+                    "video controlFrames must not contain empty data"
+                )
+            }
+        }
+        if let controlFrames {
+            try validateBase64InputSizes(
+                controlFrames.lazy.map(\.count),
+                appending: initImage?.count,
+                operation: "video"
+            )
+        } else if let initImage {
+            try validateBase64InputSizes(
+                CollectionOfOne(initImage.count),
+                operation: "video"
+            )
+        }
         var request = VideoStreamRequest(mode: mode, modelId: modelId, prompt: prompt)
         request.initImage = initImage?.base64EncodedString()
         request.controlFrames = controlFrames?.map { $0.base64EncodedString() }
@@ -327,15 +409,18 @@ public extension QVACClient {
         )
     }
 
-    private static func decodeVideoOutput(_ encoded: String?) throws -> Data? {
+    private static func decodeVideoOutput(
+        _ encoded: String?,
+        resultBudget: inout QVACResultByteBudget
+    ) throws -> Data? {
         guard let encoded else { return nil }
         guard !encoded.isEmpty else { return nil }
-        guard let decoded = Data(base64Encoded: encoded), !decoded.isEmpty else {
-            throw QVACError.protocolViolation(
-                "videoStream returned empty or invalid base64 video data"
-            )
-        }
-        return decoded
+        return try decodeRetainedBase64Output(
+            encoded,
+            invalidMessage: "videoStream returned empty or invalid base64 video data",
+            retention: .binaryArrayElement,
+            resultBudget: &resultBudget
+        )
     }
 
     // MARK: - Image classification
@@ -355,8 +440,9 @@ public extension QVACClient {
         }
     }
 
-    /// Classify encoded JPEG/PNG bytes, or raw RGB bytes when dimensions and three
-    /// channels are provided. The stream is aggregated until its terminal done frame.
+    /// Classify encoded JPEG/PNG bytes, or raw RGB bytes when
+    /// dimensions and three channels are provided. The stream is aggregated until its
+    /// terminal done frame.
     func classify(
         modelId: String,
         image: Data,
@@ -369,6 +455,7 @@ public extension QVACClient {
         if let channels, channels != 3 {
             throw QVACError.invalidArgument("classify raw RGB channels must equal 3")
         }
+        try validateBase64InputSizes([image.count], operation: "classify")
         var request = ClassifyRequest(image: image.base64EncodedString(), modelId: modelId)
         request.topK = topK
         request.width = width
@@ -492,6 +579,8 @@ public extension QVACClient {
         /// Observational snapshots in a count- and byte-bounded coalescing window.
         /// A lagging observer never fails `audio` or `stats`.
         public let progressStream: QVACBufferedStream<AudioGenProgress>
+        /// PCM accumulated across worker records. Capacity overhead is charged against
+        /// `maximumAccumulatedResultBytes` before each append.
         public let audio: Task<AudioGenAudio, Error>
         public let stats: Task<AudioGenStats?, Error>
 
@@ -525,8 +614,8 @@ public extension QVACClient {
             throw QVACError.invalidArgument("audioGen caption must not be empty")
         }
         if let bpm, bpm <= 0 { throw QVACError.invalidArgument("audioGen bpm must be positive") }
-        if let duration, duration <= 0 {
-            throw QVACError.invalidArgument("audioGen duration must be positive")
+        if let duration, !duration.isFinite || duration <= 0 {
+            throw QVACError.invalidArgument("audioGen duration must be a finite positive number")
         }
         let requestId = UUID().uuidString
         let request = AudioGenStreamRequest(
@@ -551,7 +640,9 @@ public extension QVACClient {
             maximumBufferedBytes: maximumBufferedStreamBytes
         )
         let statsBox = ResultBox<AudioGenStats?>()
+        let initialResultBudget = makeResultByteBudget(operation: "audioGenStream")
         let audio = Task<AudioGenAudio, Error> {
+            var resultBudget = initialResultBudget
             var pcm = Data()
             var metadata: AudioGenPCMMetadata?
             let iterator = QVACResponseStreamIteratorBox(source)
@@ -573,6 +664,17 @@ public extension QVACClient {
                     }
 
                     if frame.done == true {
+                        let terminalPCMFrame = Result {
+                            try Self.decodeAudioGenPCMFrame(
+                                frame,
+                                resultBudget: &resultBudget
+                            )
+                        }
+                        if case .failure(let error) = terminalPCMFrame,
+                           let qvacError = error as? QVACError,
+                           case .resourceLimitExceeded = qvacError {
+                            throw qvacError
+                        }
                         let terminal = try await Self.resolveResponseStreamTerminal(
                             iterator,
                             operation: "audioGenStream"
@@ -581,6 +683,7 @@ public extension QVACClient {
                                 frame,
                                 accumulatedPCM: pcm,
                                 metadata: metadata,
+                                terminalPCMFrame: try terminalPCMFrame.get(),
                                 requestId: requestId
                             )
                         }
@@ -599,6 +702,10 @@ public extension QVACClient {
                         return terminal.audio
                     }
 
+                    let decoded = try Self.decodeAudioGenPCMFrame(
+                        frame,
+                        resultBudget: &resultBudget
+                    )
                     if let raw = frame.progress {
                         continuation.yield(
                             contentsOf: [try AudioGenProgress(wire: raw)],
@@ -609,7 +716,7 @@ public extension QVACClient {
                             )
                         )
                     }
-                    if let decoded = try Self.decodeAudioGenPCMFrame(frame) {
+                    if let decoded {
                         pcm.append(decoded.chunk)
                         metadata = decoded.metadata
                     }
@@ -638,7 +745,8 @@ public extension QVACClient {
     }
 
     private static func decodeAudioGenPCMFrame(
-        _ frame: AudioGenStreamResponse
+        _ frame: AudioGenStreamResponse,
+        resultBudget: inout QVACResultByteBudget
     ) throws -> (chunk: Data, metadata: AudioGenPCMMetadata)? {
         for (field, value) in [
             ("sampleRate", frame.sampleRate),
@@ -653,13 +761,12 @@ public extension QVACClient {
         }
 
         guard let encoded = frame.data else { return nil }
-        guard !encoded.isEmpty,
-              let chunk = Data(base64Encoded: encoded),
-              !chunk.isEmpty else {
-            throw QVACError.protocolViolation(
-                "audioGenStream returned empty or invalid base64 PCM data"
-            )
-        }
+        let chunk = try decodeRetainedBase64Output(
+            encoded,
+            invalidMessage: "audioGenStream returned empty or invalid base64 PCM data",
+            retention: .contiguousDataAppend,
+            resultBudget: &resultBudget
+        )
         let metadata = AudioGenPCMMetadata(
             sampleRate: frame.sampleRate,
             channels: frame.channels,
@@ -672,12 +779,13 @@ public extension QVACClient {
         _ frame: AudioGenStreamResponse,
         accumulatedPCM: Data,
         metadata: AudioGenPCMMetadata?,
+        terminalPCMFrame: (chunk: Data, metadata: AudioGenPCMMetadata)?,
         requestId: String
     ) throws -> AudioGenTerminalResolution {
         let progress = try frame.progress.map(AudioGenProgress.init(wire:))
         var pcm = accumulatedPCM
         var resolvedMetadata = metadata
-        if let decoded = try decodeAudioGenPCMFrame(frame) {
+        if let decoded = terminalPCMFrame {
             pcm.append(decoded.chunk)
             resolvedMetadata = decoded.metadata
         }
@@ -714,6 +822,29 @@ public extension QVACClient {
             stats: try frame.stats.map(AudioGenStats.init(wire:)),
             progress: progress
         )
+    }
+
+    /// Conservative retained-memory charge for one decoded binary element kept in
+    /// an aggregate result array. The payload is exact; the fixed charge covers the
+    /// `Data` value, ordinary heap-allocation metadata, and geometric array capacity.
+    internal static func retainedBinaryArrayElementBytes(_ byteCount: Int) -> Int {
+        let structuralBytes = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+            QVACBufferedJSONRetainedSizeEstimator.saturatingMultiply(
+                MemoryLayout<Data>.stride,
+                2
+            ),
+            64
+        )
+        return QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+            max(0, byteCount),
+            structuralBytes
+        )
+    }
+
+    /// `Data.append` may retain spare capacity. Charging twice the appended payload
+    /// bounds both live PCM bytes and ordinary geometric growth of the backing store.
+    internal static func retainedContiguousDataAppendBytes(_ byteCount: Int) -> Int {
+        QVACBufferedJSONRetainedSizeEstimator.saturatingMultiply(max(0, byteCount), 2)
     }
 
     // MARK: - Batch completion
@@ -845,18 +976,30 @@ public extension QVACClient {
         guard !prompts.isEmpty else {
             throw QVACError.invalidArgument("batchCompletion requires at least one prompt")
         }
-        let callerIds = prompts.compactMap(\.id)
-        guard callerIds.allSatisfy({ !$0.isEmpty }) else {
+        guard prompts.count <= maximumBatchPrompts else {
+            throw QVACError.invalidArgument(
+                "batchCompletion has \(prompts.count) prompts; maximumBatchPrompts is "
+                    + "\(maximumBatchPrompts)"
+            )
+        }
+        // SDK 0.17 correlates prompts without caller-supplied ids by their decimal
+        // position. Validate those effective ids—not just the explicit subset—so
+        // an explicit id cannot alias a positional fallback and collapse two
+        // independent prompt states into one.
+        let fallbackIds = prompts.enumerated().map { index, prompt in
+            prompt.id ?? String(index)
+        }
+        guard fallbackIds.allSatisfy({ !$0.isEmpty }) else {
             throw QVACError.invalidArgument("batchCompletion prompt ids must not be empty")
         }
-        guard Set(callerIds).count == callerIds.count else {
+        guard Set(fallbackIds).count == fallbackIds.count else {
             throw QVACError.invalidArgument("batchCompletion prompt ids must be unique")
         }
         for (index, prompt) in prompts.enumerated() {
             try Self.validateCompletionResponseFormat(
                 prompt.responseFormat,
                 hasTools: prompt.tools?.isEmpty == false,
-                context: "batchCompletion prompt \(prompt.id ?? String(index))"
+                context: "batchCompletion prompt \(fallbackIds[index])"
             )
         }
         let requestId = UUID().uuidString
@@ -877,15 +1020,14 @@ public extension QVACClient {
             name: "batchCompletion.events",
             maximumBufferedBytes: maximumBufferedStreamBytes
         )
-        let fallbackIds = prompts.enumerated().map { index, prompt in
-            prompt.id ?? String(index)
-        }
+        let callerIds = prompts.compactMap(\.id)
         let coordinator = BatchCompletionCoordinator(
             requestId: requestId,
             fallbackIds: fallbackIds,
             initialKnownIds: Set(callerIds),
             eventSink: eventSink,
-            maximumBufferedStreamBytes: maximumBufferedStreamBytes
+            maximumBufferedStreamBytes: maximumBufferedStreamBytes,
+            resultBudget: makeResultByteBudget(operation: "batchCompletionStream")
         )
         let processing = Task<Void, Never> {
             let iterator = QVACResponseStreamIteratorBox(source)
@@ -911,6 +1053,7 @@ public extension QVACClient {
                         )
                     }
                     if frame.done == true {
+                        try coordinator.preflightTerminalFrame(frame)
                         _ = try await Self.resolveResponseStreamTerminal(
                             iterator,
                             operation: "batchCompletionStream"
@@ -1058,6 +1201,18 @@ private struct BatchCompletionAccumulator: Sendable {
         }
     }
 
+    /// Worst-case retained storage for the normalized no-tool assistant value.
+    /// Normalization only removes text, so charging the complete source string
+    /// before running the regular expressions safely bounds the allocation.
+    var cacheableAssistantContentReservationBytes: Int {
+        guard failureMessage == nil,
+              stopReason != .cancelled,
+              toolCalls.isEmpty else {
+            return 0
+        }
+        return QVACClient.retainedStringAggregateAppendBytes(rawFullText ?? contentText)
+    }
+
     func result(requestId: String) -> Result<QVACClient.CompletionFinal, Error> {
         if let failureMessage {
             return .failure(QVACError.server(.completionFailed, message: failureMessage))
@@ -1129,11 +1284,13 @@ private final class BatchCompletionCoordinator: @unchecked Sendable {
     private let resultsPromise: BatchPromise<[QVACClient.BatchCompletionResult]>
     private let statsPromise: BatchPromise<QVACClient.CompletionStats?>
     private let lock = NSLock()
+    private var resultBudget: QVACResultByteBudget
     private var orderedIds: [String] = []
     private var knownIds: Set<String>
     private var idsResolved = false
     private var terminal = false
     private var terminalError: Error?
+    private var prechargedTerminalIDs: [String]?
     private var settledIds: Set<String> = []
     private var states: [String: BatchCompletionPerIDState] = [:]
 
@@ -1142,13 +1299,15 @@ private final class BatchCompletionCoordinator: @unchecked Sendable {
         fallbackIds: [String],
         initialKnownIds: Set<String>,
         eventSink: QVACBufferedStreamSink<QVACClient.BatchCompletionEvent>,
-        maximumBufferedStreamBytes: Int
+        maximumBufferedStreamBytes: Int,
+        resultBudget: QVACResultByteBudget
     ) {
         self.requestId = requestId
         self.fallbackIds = fallbackIds
         knownIds = initialKnownIds
         self.eventSink = eventSink
         self.maximumBufferedStreamBytes = maximumBufferedStreamBytes
+        self.resultBudget = resultBudget
         let cancellationRelay = BatchProcessingCancellationRelay()
         self.cancellationRelay = cancellationRelay
         idsPromise = BatchPromise { cancellationRelay.cancel() }
@@ -1228,6 +1387,33 @@ private final class BatchCompletionCoordinator: @unchecked Sendable {
         }
     }
 
+    /// Atomically validates and reserves terminal-only retained state before the
+    /// transport drain. This lets an ids-array overage cancel a peer that never
+    /// sends END, while `consume` remains the sole publisher/settler after EOF.
+    func preflightTerminalFrame(_ frame: BatchCompletionStreamResponse) throws {
+        try validateTerminalFrame(frame)
+        guard let ids = frame.ids else { return }
+        let idsEstimatedBytes = QVACClient.conservativeBufferedJSONBytes(
+            ids,
+            elementCount: ids.count,
+            fallback: Int.max
+        )
+        try lock.withLock {
+            guard !terminal else { return }
+            if let reserved = prechargedTerminalIDs {
+                guard reserved == ids else {
+                    throw QVACError.protocolViolation(
+                        "batchCompletionStream terminal ids changed after reservation"
+                    )
+                }
+                return
+            }
+            guard !idsResolved else { return }
+            try resultBudget.consume(idsEstimatedBytes)
+            prechargedTerminalIDs = ids
+        }
+    }
+
     /// Returns true when this is the terminal response frame.
     func consume(_ frame: BatchCompletionStreamResponse) throws -> Bool {
         let parsedEvents = try frame.events.map(QVACClient.BatchCompletionEvent.init(wire:))
@@ -1260,6 +1446,22 @@ private final class BatchCompletionCoordinator: @unchecked Sendable {
             frame.events,
             fallback: maximumBufferedStreamBytes
         )
+        let aggregateEstimatedBytes = parsedEvents.reduce(into: 0) { total, parsed in
+            total = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+                total,
+                QVACClient.retainedCompletionAggregateBytes(for: parsed.event)
+            )
+        }
+        let idsEstimatedBytes: Int
+        if let ids = frame.ids {
+            idsEstimatedBytes = QVACClient.conservativeBufferedJSONBytes(
+                ids,
+                elementCount: ids.count,
+                fallback: Int.max
+            )
+        } else {
+            idsEstimatedBytes = 0
+        }
         var estimatedBytesByID: [String: Int] = [:]
         for id in groupOrder {
             estimatedBytesByID[id] = conservativeBatchCompletionEventBytes(
@@ -1288,6 +1490,11 @@ private final class BatchCompletionCoordinator: @unchecked Sendable {
             return true
         }
 
+        // Event observers have their own bounded queues. The coordinator's
+        // per-id accumulators and aggregate result promises are authoritative and
+        // otherwise retain data across an unlimited number of legal records.
+        // Reserve the complete frame contribution atomically before changing any
+        // id map, accumulator, or public stream.
         var prospectiveKnownIds = knownIds
         if let ids = frame.ids { prospectiveKnownIds.formUnion(ids) }
         prospectiveKnownIds.formUnion(groupOrder)
@@ -1297,6 +1504,31 @@ private final class BatchCompletionCoordinator: @unchecked Sendable {
                 "batchCompletionStream introduced more ids than requested prompts"
             )
         }
+        let introducedIds = prospectiveKnownIds.subtracting(knownIds)
+        let introducedIDBytes = introducedIds.reduce(into: 0) { total, id in
+            let stringBytes = QVACClient.retainedStringAggregateAppendBytes(id)
+            let structuralBytes = QVACBufferedJSONRetainedSizeEstimator.saturatingMultiply(
+                MemoryLayout<String>.stride,
+                2
+            )
+            total = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+                total,
+                QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+                    stringBytes,
+                    structuralBytes
+                )
+            )
+        }
+        do {
+            try resultBudget.consume(aggregateEstimatedBytes)
+            try resultBudget.consume(introducedIDBytes)
+            if frame.ids != nil, !idsResolved, prechargedTerminalIDs != frame.ids {
+                try resultBudget.consume(idsEstimatedBytes)
+            }
+        } catch {
+            lock.unlock()
+            throw error
+        }
         for id in (frame.ids ?? []) + groupOrder where !knownIds.contains(id) {
             knownIds.insert(id)
         }
@@ -1304,6 +1536,7 @@ private final class BatchCompletionCoordinator: @unchecked Sendable {
         if let ids = frame.ids, !idsResolved {
             orderedIds = ids
             resolvedIDs = resolveIdsLocked(ids)
+            prechargedTerminalIDs = nil
         }
         for event in parsedEvents {
             let state = stateLocked(for: event.id)
@@ -1324,6 +1557,17 @@ private final class BatchCompletionCoordinator: @unchecked Sendable {
             // absent, results remain in original prompt order regardless of event
             // arrival order.
             let ids = orderedIds.isEmpty ? fallbackIds : orderedIds
+            let cacheReservation = ids.reduce(into: 0) { total, id in
+                let bytes = states[id]?.accumulator
+                    .cacheableAssistantContentReservationBytes ?? 0
+                total = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(total, bytes)
+            }
+            do {
+                try resultBudget.consume(cacheReservation)
+            } catch {
+                lock.unlock()
+                throw error
+            }
             if !idsResolved { resolvedIDs = resolveIdsLocked(ids) }
             settledIds = Set(ids)
 
@@ -1432,11 +1676,9 @@ private final class BatchCompletionCoordinator: @unchecked Sendable {
 
 /// Estimates the retained decoded event batch from its JSON wire representation.
 ///
-/// Two times the encoded UTF-8 size plus fixed per-event storage is deliberately
-/// conservative for Swift enum/array/dictionary overhead. Encoding JSONValue is
-/// expected to be infallible for decoded wire data; reserving the entire configured
-/// budget on an encoder failure keeps estimation best-effort and cannot fail the
-/// batch operation itself.
+/// The decoded JSON tree plus fixed per-event storage is deliberately conservative
+/// for Swift enum/array/dictionary overhead. The estimator walks already-decoded
+/// storage and never serializes the event again before buffer admission.
 private func conservativeBatchCompletionEventBytes(
     _ wireEvents: [JSONValue],
     fallback: Int

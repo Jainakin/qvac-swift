@@ -90,6 +90,18 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
                     file: file,
                     line: line
                 )
+            case .resourceLimitExceeded(
+                let operation,
+                let resource,
+                let maximumBytes,
+                let attemptedBytes
+            ):
+                XCTFail(
+                    "\(name): \(operation) \(resource) reached \(attemptedBytes) bytes, "
+                        + "limit \(maximumBytes)",
+                    file: file,
+                    line: line
+                )
             }
         } catch {
             XCTFail("\(name): unexpected error type — \(error)", file: file, line: line)

@@ -548,39 +548,40 @@ extension QVACClient {
         )
     }
 
-    /// Conservative, non-throwing retained-size estimate for decoded JSON-backed
-    /// batches. JSON encoding should be infallible for values already decoded from
-    /// the wire; charging beyond the supplied budget on an unexpected failure makes
-    /// the existing buffer-overflow path fail closed without throwing here.
-    internal static func conservativeBufferedJSONBytes<T: Encodable>(
+    /// Fail-closed fallback for a decoded value without an allocation-free retained-
+    /// size specialization. Buffer admission must never JSON-encode an untrusted
+    /// value merely to measure it: that would allocate before the byte ceiling is
+    /// enforced. Known wire/public types use the overloads below; an accidental new
+    /// call site is rejected by charging one byte beyond its supplied budget.
+    internal static func conservativeBufferedJSONBytes<T>(
         _ value: T,
         elementCount: Int,
         fallback: Int
     ) -> Int {
-        conservativeEncodedJSONBytes(
-            value,
-            elementCount: elementCount,
-            fallback: fallback
+        _ = value
+        _ = elementCount
+        return QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+            max(1, fallback),
+            1
         )
     }
 
-    /// JSON values need structural accounting in addition to encoded-size
-    /// accounting. A deeply nested tree of tiny containers can retain far more
-    /// memory than its compact wire representation suggests.
+    /// JSON values are measured from their already-decoded storage. A deeply nested
+    /// tree of tiny containers can retain far more memory than its compact wire
+    /// representation suggests, so encoded length is neither necessary nor safe as
+    /// the admission metric.
     internal static func conservativeBufferedJSONBytes(
         _ value: JSONValue,
         elementCount: Int,
         fallback: Int
     ) -> Int {
+        _ = fallback
         let retainedBytes = QVACBufferedJSONRetainedSizeEstimator.estimate(value)
         guard retainedBytes != Int.max else { return Int.max }
-        return max(
-            conservativeEncodedJSONBytes(
-                value,
-                elementCount: max(1, elementCount),
-                fallback: fallback
-            ),
-            retainedBytes
+        return conservativeKnownBufferedBytes(
+            JSONValue.self,
+            elementCount: max(1, elementCount),
+            variableBytes: retainedBytes
         )
     }
 
@@ -592,48 +593,213 @@ extension QVACClient {
         elementCount: Int,
         fallback: Int
     ) -> Int {
+        _ = fallback
         let retainedBytes = QVACBufferedJSONRetainedSizeEstimator.estimate(value)
         guard retainedBytes != Int.max else { return Int.max }
-        return max(
-            conservativeEncodedJSONBytes(
-                value,
-                elementCount: max(value.count, elementCount),
-                fallback: fallback
-            ),
-            retainedBytes
+        return conservativeKnownBufferedBytes(
+            [JSONValue].self,
+            elementCount: max(value.count, elementCount),
+            variableBytes: retainedBytes
         )
     }
 
-    private static func conservativeEncodedJSONBytes<T: Encodable>(
-        _ value: T,
+    /// Allocation-free specialization for terminal batch identifiers.
+    internal static func conservativeBufferedJSONBytes(
+        _ value: [String],
         elementCount: Int,
         fallback: Int
     ) -> Int {
-        guard let encodedBytes = try? JSONEncoder.qvac.encode(value).count else {
-            return QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
-                max(1, fallback),
-                1
+        _ = fallback
+        let retainedBytes = QVACBufferedJSONRetainedSizeEstimator.estimate(value)
+        guard retainedBytes != Int.max else { return Int.max }
+        return conservativeKnownBufferedBytes(
+            [String].self,
+            elementCount: max(value.count, elementCount),
+            variableBytes: retainedBytes
+        )
+    }
+
+    internal static func conservativeBufferedJSONBytes(
+        _ value: ModelProgressResponse,
+        elementCount: Int,
+        fallback: Int
+    ) -> Int {
+        _ = fallback
+        var variableBytes = QVACBufferedJSONRetainedSizeEstimator.retainedStringBytes(
+            value.downloadKey
+        )
+        if let fileSetInfo = value.fileSetInfo {
+            variableBytes = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+                variableBytes,
+                QVACBufferedJSONRetainedSizeEstimator.estimate(fileSetInfo)
             )
         }
-        let expandedBytes = QVACBufferedJSONRetainedSizeEstimator.saturatingMultiply(
-            encodedBytes,
-            2
+        if let shardInfo = value.shardInfo {
+            variableBytes = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+                variableBytes,
+                QVACBufferedJSONRetainedSizeEstimator.estimate(shardInfo)
+            )
+        }
+        return conservativeKnownBufferedBytes(
+            ModelProgressResponse.self,
+            elementCount: elementCount,
+            variableBytes: variableBytes
         )
+    }
+
+    internal static func conservativeBufferedJSONBytes(
+        _ value: FinetuneProgressResponse,
+        elementCount: Int,
+        fallback: Int
+    ) -> Int {
+        _ = fallback
+        var variableBytes = QVACBufferedJSONRetainedSizeEstimator.retainedStringBytes(
+            value.modelId
+        )
+        for json in [value.accuracy, value.accuracyUncertainty, value.loss, value.lossUncertainty] {
+            variableBytes = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+                variableBytes,
+                QVACBufferedJSONRetainedSizeEstimator.estimate(json)
+            )
+        }
+        return conservativeKnownBufferedBytes(
+            FinetuneProgressResponse.self,
+            elementCount: elementCount,
+            variableBytes: variableBytes
+        )
+    }
+
+    internal static func conservativeBufferedJSONBytes(
+        _ value: RagProgressResponse,
+        elementCount: Int,
+        fallback: Int
+    ) -> Int {
+        _ = fallback
+        let strings = [value.operation, value.stage, value.workspace]
+        return conservativeKnownBufferedBytes(
+            RagProgressResponse.self,
+            elementCount: elementCount,
+            variableBytes: QVACBufferedJSONRetainedSizeEstimator.estimate(strings)
+        )
+    }
+
+    internal static func conservativeBufferedJSONBytes(
+        _ value: TextToSpeechResponse,
+        elementCount: Int,
+        fallback: Int
+    ) -> Int {
+        _ = fallback
+        var variableBytes = QVACBufferedJSONRetainedSizeEstimator.saturatingMultiply(
+            value.buffer.count,
+            64
+        )
+        if let sentenceChunk = value.sentenceChunk {
+            variableBytes = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+                variableBytes,
+                QVACBufferedJSONRetainedSizeEstimator.retainedStringBytes(sentenceChunk)
+            )
+        }
+        if let stats = value.stats {
+            variableBytes = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+                variableBytes,
+                QVACBufferedJSONRetainedSizeEstimator.estimate(stats)
+            )
+        }
+        return conservativeKnownBufferedBytes(
+            TextToSpeechResponse.self,
+            elementCount: elementCount,
+            variableBytes: variableBytes
+        )
+    }
+
+    internal static func conservativeBufferedJSONBytes(
+        _ value: TranslateResponse,
+        elementCount: Int,
+        fallback: Int
+    ) -> Int {
+        _ = fallback
+        var variableBytes = QVACBufferedJSONRetainedSizeEstimator.retainedStringBytes(value.token)
+        if let error = value.error {
+            variableBytes = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+                variableBytes,
+                QVACBufferedJSONRetainedSizeEstimator.retainedStringBytes(error)
+            )
+        }
+        if let stats = value.stats {
+            variableBytes = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+                variableBytes,
+                QVACBufferedJSONRetainedSizeEstimator.estimate(stats)
+            )
+        }
+        return conservativeKnownBufferedBytes(
+            TranslateResponse.self,
+            elementCount: elementCount,
+            variableBytes: variableBytes
+        )
+    }
+
+    internal static func conservativeBufferedJSONBytes(
+        _ value: DiffusionProgressTick,
+        elementCount: Int,
+        fallback: Int
+    ) -> Int {
+        _ = value
+        _ = fallback
+        return conservativeKnownBufferedBytes(
+            DiffusionProgressTick.self,
+            elementCount: elementCount,
+            variableBytes: 0
+        )
+    }
+
+    internal static func conservativeBufferedJSONBytes(
+        _ value: VideoProgressTick,
+        elementCount: Int,
+        fallback: Int
+    ) -> Int {
+        _ = value
+        _ = fallback
+        return conservativeKnownBufferedBytes(
+            VideoProgressTick.self,
+            elementCount: elementCount,
+            variableBytes: 0
+        )
+    }
+
+    internal static func conservativeBufferedJSONBytes(
+        _ value: AudioGenProgress,
+        elementCount: Int,
+        fallback: Int
+    ) -> Int {
+        _ = fallback
+        return conservativeKnownBufferedBytes(
+            AudioGenProgress.self,
+            elementCount: elementCount,
+            variableBytes: QVACBufferedJSONRetainedSizeEstimator.retainedStringBytes(value.stage)
+        )
+    }
+
+    private static func conservativeKnownBufferedBytes<T>(
+        _ type: T.Type,
+        elementCount: Int,
+        variableBytes: Int
+    ) -> Int {
         let elementOverhead = QVACBufferedJSONRetainedSizeEstimator.saturatingMultiply(
             max(0, elementCount),
             128
         )
+        // This covers the public batch/element containers plus the decoded response
+        // and transport-envelope objects alive during handoff. The previous
+        // encoder-based estimate implicitly included those copies via a second JSON
+        // buffer; keep the ceiling conservative without performing that allocation.
         let rootOverhead = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
             MemoryLayout<T>.stride,
-            64
+            512
         )
         return max(
             1,
             QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
-                QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
-                    expandedBytes,
-                    elementOverhead
-                ),
+                QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(variableBytes, elementOverhead),
                 rootOverhead
             )
         )
@@ -726,7 +892,23 @@ enum QVACBufferedJSONRetainedSizeEstimator {
         return total
     }
 
-    private static func retainedStringBytes(_ value: String) -> Int {
+    static func estimate(_ values: [String]) -> Int {
+        var total = saturatingAdd(
+            MemoryLayout<[String]>.stride,
+            collectionAllocationOverhead
+        )
+        total = saturatingAdd(
+            total,
+            saturatingMultiply(values.count, MemoryLayout<String>.stride * 2)
+        )
+        for value in values {
+            total = saturatingAdd(total, retainedStringBytes(value))
+            if total == Int.max { return Int.max }
+        }
+        return total
+    }
+
+    static func retainedStringBytes(_ value: String) -> Int {
         saturatingAdd(
             saturatingAdd(MemoryLayout<String>.stride, stringAllocationOverhead),
             saturatingMultiply(value.utf8.count, 2)

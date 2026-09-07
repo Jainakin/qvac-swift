@@ -181,7 +181,9 @@ public extension QVACClient {
         )
         if !stream { tokensCont.finish() }
         let statsBox = ResultBox<TranslationStats?>()
+        let initialResultBudget = makeResultByteBudget(operation: "translate")
         let processing = Task<String, Error> {
+            var resultBudget = initialResultBudget
             var full = ""
             do {
                 let responses = QVACResponseStreamIteratorBox(responseStream)
@@ -217,7 +219,10 @@ public extension QVACClient {
                                 stats: try r.stats.map(Self.decodeTranslationStats)
                             )
                         }
-                        if !stream { full += terminal.token }
+                        if !stream {
+                            try resultBudget.consumeRetainedString(terminal.token)
+                            full += terminal.token
+                        }
                         statsBox.set(terminal.stats)
                         tokensCont.finish()
                         return full
@@ -233,7 +238,10 @@ public extension QVACClient {
                             )
                         )
                     }
-                    if !stream { full += r.token }
+                    if !stream {
+                        try resultBudget.consumeRetainedString(r.token)
+                        full += r.token
+                    }
                 }
                 try Task.checkCancellation()
                 throw QVACError.client(

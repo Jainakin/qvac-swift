@@ -26,10 +26,11 @@ artifact revisions start at `r2`, use evidence schema 3, and are published under
 new tags. Enable GitHub immutable releases before publishing a new artifact or
 source release.
 
-## Publication blockers
+## License and privacy publication blockers
 
 Candidate builds and source review may proceed, but the release workflows block a
 new binary publication until the native-license and privacy reviews are complete.
+BareKit r2 has an additional engineering-activation gate described in section 3.
 
 ### Native licenses
 
@@ -154,15 +155,25 @@ presented as public URL-installation evidence.
 
 ## 3. Publish the artifact release
 
-After the publication blockers are resolved:
+This step is intentionally disabled in the current tree. The artifact workflow
+rejects every `publish=true` run while the BareKit provenance lock records
+`activationStatus: "blocked"`. Resolving the six license and privacy records is
+necessary, but it does not by itself authorize removal of that engineering
+gate.
 
-1. confirm GitHub immutable releases are enabled;
+Before enabling publication, complete every activation requirement recorded in
+`tools/native/bare-kit/provenance.lock.json`, retain the resulting evidence, and
+land a reviewed change that unlocks the provenance verifier and artifact
+workflow. Then:
+
+1. confirm all license, privacy, and BareKit activation gates are closed and
+   GitHub immutable releases are enabled;
 2. review the generated notices and privacy evidence;
 3. rerun **Build SDK 0.17 Artifacts** from the final `main` commit with the same
    unused revision, `publish` enabled, and `license_reviewed=true`;
 4. wait for the workflow to verify the successful CI run for that commit and
    publish `artifacts-sdk-0.17.0-rN`; and
-5. retain the workflow and release attestations with the submission record.
+5. retain the workflow and release attestations with the release evidence set.
 
 The workflow rebuilds the assets, binds them to the source commit, checks the URL
 manifest, verifies every release asset, and rejects partial or mismatched release

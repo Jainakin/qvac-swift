@@ -2,7 +2,8 @@
 // QVAC Swift Client — exact SDK 0.17.0 development manifest.
 // Generated from tools/release/artifacts.development.json. Run
 // tools/runtime/link-ios-artifacts.sh before local iOS builds. Release tags must
-// use the URL manifest generated only after immutable artifacts are published.
+// use the URL manifest generated from a verified non-publishing candidate and
+// committed before its matching immutable artifacts are published.
 
 import PackageDescription
 

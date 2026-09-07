@@ -22,22 +22,16 @@ public extension QVACClient {
 
         init(from value: JSONValue) throws {
             guard case .object(let obj) = value,
+                  case .number(let rawId) = obj["id"] ?? .null,
                   case .string(let t) = obj["text"] ?? .null,
                   case .number(let s) = obj["startMs"] ?? .null,
-                  case .number(let e) = obj["endMs"] ?? .null else {
+                  case .number(let e) = obj["endMs"] ?? .null,
+                  case .bool(let appendFlag) = obj["append"] ?? .null else {
                 throw QVACError.protocolViolation("transcribe segment has an invalid shape")
             }
-            let segId: Int
-            if case .number(let n) = obj["id"] ?? .null {
-                segId = try QVACClient.checkedWireInteger(n, field: "transcribe segment.id")
-            } else {
-                segId = 0
-            }
-            let appendFlag: Bool = {
-                if case .bool(let b) = obj["append"] ?? .null { return b }
-                return false
-            }()
-            self.id = segId
+            self.id = try QVACClient.checkedWireInteger(
+                rawId, field: "transcribe segment.id"
+            )
             self.text = t
             self.startMs = try QVACClient.checkedWireInteger(
                 s, field: "transcribe segment.startMs"
@@ -100,14 +94,16 @@ public extension QVACClient {
         )
     }
 
-    /// Bytes-form transcribe — base64-encodes the audio on the wire.
+    /// Transcribe in-memory audio bytes, base64-encoded on the wire.
+    /// Empty input is forwarded as an empty base64 string, matching QVAC 0.17.
     func transcribe(
         modelId: String,
         audioBytes: Data,
         prompt: String? = nil,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> TranscriptionRun {
-        try await transcribeRun(
+        try validateBase64InputSizes([audioBytes.count], operation: "transcribe")
+        return try await transcribeRun(
             modelId: modelId,
             audioChunk: .object(["type": .string("base64"), "value": .string(audioBytes.base64EncodedString())]),
             prompt: prompt,
@@ -135,10 +131,14 @@ public extension QVACClient {
             .transcribe(request),
             rpcOptions: rpcOptions
         )
+        let maximumAccumulatedResultBytes = self.maximumAccumulatedResultBytes
+        let initialResultBudget = makeResultByteBudget(operation: "transcribe")
         let result = Task<TranscriptionOutcome, Error> {
+            var resultBudget = initialResultBudget
             var fullText = ""
             var segments: [TranscribeSegment] = []
             var stats: JSONValue?
+            var retainedStatsBytes = 0
             let responses = QVACResponseStreamIteratorBox(stream)
             while let response = try await responses.next() {
                 if case .error(let error) = response {
@@ -166,11 +166,32 @@ public extension QVACClient {
                         var terminalText = fullText
                         var terminalSegments = segments
                         var terminalStats = stats
-                        if let text = frame.text { terminalText += text }
-                        if let rawSegment = frame.segment {
-                            terminalSegments.append(try TranscribeSegment(from: rawSegment))
+                        if let text = frame.text {
+                            try resultBudget.consumeRetainedString(text)
+                            terminalText += text
                         }
-                        if let responseStats = frame.stats { terminalStats = responseStats }
+                        if let rawSegment = frame.segment {
+                            let parsed = try TranscribeSegment(from: rawSegment)
+                            try resultBudget.consume(Self.conservativeBufferedJSONBytes(
+                                rawSegment,
+                                elementCount: 1,
+                                fallback: maximumAccumulatedResultBytes
+                            ))
+                            terminalSegments.append(parsed)
+                        }
+                        if let responseStats = frame.stats {
+                            let nextStatsBytes = Self.conservativeBufferedJSONBytes(
+                                responseStats,
+                                elementCount: 1,
+                                fallback: maximumAccumulatedResultBytes
+                            )
+                            try resultBudget.replace(
+                                retainedStatsBytes,
+                                with: nextStatsBytes
+                            )
+                            retainedStatsBytes = nextStatsBytes
+                            terminalStats = responseStats
+                        }
                         return TranscriptionOutcome(
                             text: terminalText,
                             segments: terminalSegments,
@@ -178,11 +199,32 @@ public extension QVACClient {
                         )
                     }
                 }
-                if let text = frame.text { fullText += text }
-                if let rawSegment = frame.segment {
-                    segments.append(try TranscribeSegment(from: rawSegment))
+                if let text = frame.text {
+                    try resultBudget.consumeRetainedString(text)
+                    fullText += text
                 }
-                if let responseStats = frame.stats { stats = responseStats }
+                if let rawSegment = frame.segment {
+                    let parsed = try TranscribeSegment(from: rawSegment)
+                    try resultBudget.consume(Self.conservativeBufferedJSONBytes(
+                        rawSegment,
+                        elementCount: 1,
+                        fallback: maximumAccumulatedResultBytes
+                    ))
+                    segments.append(parsed)
+                }
+                if let responseStats = frame.stats {
+                    let nextStatsBytes = Self.conservativeBufferedJSONBytes(
+                        responseStats,
+                        elementCount: 1,
+                        fallback: maximumAccumulatedResultBytes
+                    )
+                    try resultBudget.replace(
+                        retainedStatsBytes,
+                        with: nextStatsBytes
+                    )
+                    retainedStatsBytes = nextStatsBytes
+                    stats = responseStats
+                }
             }
             throw QVACError.client(
                 .streamEndedWithoutResponse,

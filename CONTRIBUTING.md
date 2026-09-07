@@ -52,6 +52,34 @@ Run the checks relevant to the change. For most Swift changes:
 ```bash
 swift build -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
 tools/ci/run-unit-tests.sh
+tools/coverage/run.sh
+```
+
+Changes to transport, buffering, cancellation, or other concurrency-sensitive
+code should also run the complete reviewed inventory under Thread Sanitizer:
+
+```bash
+tools/ci/run-unit-tests.sh --sanitize=thread
+```
+
+Changes to byte framing, binary decoding, unsafe memory access, or native
+transport boundaries should run the same inventory under Address Sanitizer and
+Undefined Behavior Sanitizer as well:
+
+```bash
+tools/ci/run-unit-tests.sh --sanitize=address
+tools/ci/run-unit-tests.sh --sanitize=undefined
+```
+
+CI runs all three sanitizer modes independently over the complete reviewed
+macOS unit inventory on pull requests and `main` pushes. The non-publishing
+BareKit r2 candidate job also runs the complete reviewed iOS smoke inventory
+under Thread Sanitizer. Its log gate requires the exact started and passed test
+identities, rejects skips and substitutions, and fails on any Thread Sanitizer
+diagnostic. Exercise that gate's negative cases with:
+
+```bash
+node tools/ci/verify-ios-test-log.mjs --self-test
 ```
 
 Changes to transport, streaming, generated APIs, model operations, packaging, or

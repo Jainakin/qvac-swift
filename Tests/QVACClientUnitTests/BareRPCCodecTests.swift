@@ -193,6 +193,459 @@ final class BareRPCCodecTests: XCTestCase {
         }
     }
 
+    func test_decoder_rejects_trailing_bytes_for_every_frame_shape() {
+        let bodies: [Data] = [
+            BareRPCCodec.encodeRequestBody(
+                id: 1,
+                command: 2,
+                stream: [],
+                data: Data("request".utf8)
+            ),
+            BareRPCCodec.encodeRequestBody(
+                id: 2,
+                command: 3,
+                stream: [.open],
+                data: nil
+            ),
+            BareRPCCodec.encodeResponseBody(
+                id: 3,
+                stream: [.open],
+                payload: .success(nil)
+            ),
+            BareRPCCodec.encodeStreamBody(
+                id: 4,
+                flags: [.response, .end]
+            ),
+        ]
+
+        for var body in bodies {
+            body.append(0xA5)
+            XCTAssertThrowsError(try BareRPCCodec.decodeFrameBody(body)) { error in
+                XCTAssertEqual(error as? BareRPCCodecError, .trailingBytes(1))
+            }
+        }
+    }
+
+    func test_unary_response_retention_limit_preserves_exact_and_structural_validation() throws {
+        let id: UInt64 = 73
+        let payload = Data([0x10, 0x20, 0x30, 0x40])
+        let body = BareRPCCodec.encodeResponseBody(
+            id: id,
+            stream: [],
+            payload: .success(payload)
+        )
+
+        let exact = try BareRPCCodec.decodeFrameBody(
+            body,
+            maximumRetainedResponsePayloadBytes: { frameID in
+                XCTAssertEqual(frameID, id)
+                return payload.count
+            }
+        )
+        XCTAssertEqual(
+            exact,
+            .response(id: id, stream: [], payload: .success(payload))
+        )
+
+        let maximum = payload.count - 1
+        let rejected = try BareRPCCodec.decodeFrameBody(
+            body,
+            maximumRetainedResponsePayloadBytes: { _ in maximum }
+        )
+        XCTAssertEqual(
+            rejected,
+            .responsePayloadLimitExceeded(
+                id: id,
+                stream: [],
+                error: .init(
+                    maximumBytes: maximum,
+                    attemptedBytes: payload.count
+                )
+            )
+        )
+
+        var truncated = body
+        truncated.removeLast()
+        XCTAssertThrowsError(try BareRPCCodec.decodeFrameBody(
+            truncated,
+            maximumRetainedResponsePayloadBytes: { _ in maximum }
+        )) { error in
+            XCTAssertEqual(error as? BareRPCCodecError, .truncated)
+        }
+
+        var trailing = body
+        trailing.append(0xA5)
+        XCTAssertThrowsError(try BareRPCCodec.decodeFrameBody(
+            trailing,
+            maximumRetainedResponsePayloadBytes: { _ in maximum }
+        )) { error in
+            XCTAssertEqual(error as? BareRPCCodecError, .trailingBytes(1))
+        }
+    }
+
+    func test_error_payload_retention_limit_uses_aggregate_utf8_boundary_and_validates_skipped_bytes() throws {
+        let id: UInt64 = 7
+        let error = BareRPCError(message: "12345", code: "ABC", errno: -9)
+        let body = BareRPCCodec.encodeResponseBody(
+            id: id,
+            stream: [],
+            payload: .failure(error)
+        )
+        let aggregateUTF8Bytes = error.message.utf8.count + error.code.utf8.count
+
+        var exactMaterializations = 0
+        let exact = try BareRPCCodec.decodeFrameBody(
+            body,
+            maximumRetainedErrorPayloadBytes: { frameID in
+                XCTAssertEqual(frameID, id)
+                return aggregateUTF8Bytes
+            },
+            payloadMaterializationObserver: { _ in
+                exactMaterializations += 1
+            }
+        )
+        XCTAssertEqual(
+            exact,
+            .response(id: id, stream: [], payload: .failure(error))
+        )
+        XCTAssertEqual(exactMaterializations, 2, "retained message and code must materialize once each")
+
+        let maximum = aggregateUTF8Bytes - 1
+        var rejectedMaterializations = 0
+        let rejected = try BareRPCCodec.decodeFrameBody(
+            body,
+            maximumRetainedErrorPayloadBytes: { _ in maximum },
+            payloadMaterializationObserver: { _ in
+                rejectedMaterializations += 1
+            }
+        )
+        XCTAssertEqual(
+            rejected,
+            .errorPayloadLimitExceeded(
+                id: id,
+                error: .init(
+                    maximumBytes: maximum,
+                    attemptedBytes: aggregateUTF8Bytes
+                )
+            )
+        )
+        XCTAssertEqual(
+            rejectedMaterializations,
+            0,
+            "an oversized error must be rejected before copying either UTF-8 field"
+        )
+
+        var unownedMaterializations = 0
+        let unowned = try BareRPCCodec.decodeFrameBody(
+            body,
+            maximumRetainedErrorPayloadBytes: { _ in nil },
+            payloadMaterializationObserver: { _ in
+                unownedMaterializations += 1
+            }
+        )
+        XCTAssertEqual(
+            unowned,
+            .errorPayloadLimitExceeded(
+                id: id,
+                error: .init(maximumBytes: 0, attemptedBytes: aggregateUTF8Bytes)
+            )
+        )
+        XCTAssertEqual(
+            unownedMaterializations,
+            0,
+            "an unowned late error must be skipped before copying either UTF-8 field"
+        )
+
+        // The first four one-byte fields are type, id, hasError, and stream;
+        // byte four is the message length and byte five begins the message.
+        var invalidUTF8 = body
+        invalidUTF8[5] = 0xFF
+        XCTAssertThrowsError(try BareRPCCodec.decodeFrameBody(
+            invalidUTF8,
+            maximumRetainedErrorPayloadBytes: { _ in nil }
+        )) { decodingError in
+            XCTAssertEqual(decodingError as? CompactEncodingError, .invalidUTF8)
+        }
+
+        var trailing = body
+        trailing.append(0xA5)
+        XCTAssertThrowsError(try BareRPCCodec.decodeFrameBody(
+            trailing,
+            maximumRetainedErrorPayloadBytes: { _ in maximum }
+        )) { decodingError in
+            XCTAssertEqual(decodingError as? BareRPCCodecError, .trailingBytes(1))
+        }
+    }
+
+    func test_stream_payload_admission_retains_exact_rejects_cap_plus_one_and_skips_unknown() throws {
+        let id: UInt64 = 74
+        let payload = Data([0x10, 0x20, 0x30, 0x40])
+        let body = BareRPCCodec.encodeStreamBody(
+            id: id,
+            flags: [.response, .data],
+            payload: .data(payload)
+        )
+        let maximum = payload.count + BoundedRPCDataChannel.retainedValueOverheadBytes
+
+        var exactMaterializations = 0
+        let exact = try BareRPCCodec.decodeFrameBody(
+            body,
+            streamPayloadAdmission: { frameID, flags, byteCount in
+                XCTAssertEqual(frameID, id)
+                XCTAssertEqual(flags, [.response, .data])
+                XCTAssertEqual(byteCount, payload.count)
+                return .retain
+            },
+            payloadMaterializationObserver: { _ in
+                exactMaterializations += 1
+            }
+        )
+        XCTAssertEqual(
+            exact,
+            .stream(id: id, flags: [.response, .data], payload: .data(payload))
+        )
+        XCTAssertEqual(exactMaterializations, 1)
+
+        let capPlusOne = BareRPCStreamBufferOverflow(
+            maximumBufferedBytes: maximum - 1,
+            attemptedBufferedBytes: maximum
+        )
+        var rejectedMaterializations = 0
+        let rejected = try BareRPCCodec.decodeFrameBody(
+            body,
+            streamPayloadAdmission: { _, _, _ in .reject(capPlusOne) },
+            payloadMaterializationObserver: { _ in
+                rejectedMaterializations += 1
+            }
+        )
+        XCTAssertEqual(
+            rejected,
+            .streamPayloadLimitExceeded(
+                id: id,
+                flags: [.response, .data],
+                error: capPlusOne
+            )
+        )
+        XCTAssertEqual(
+            rejectedMaterializations,
+            0,
+            "a rejected stream field must not be copied out of the receive buffer"
+        )
+
+        var skippedMaterializations = 0
+        let skipped = try BareRPCCodec.decodeFrameBody(
+            body,
+            streamPayloadAdmission: { _, _, _ in .skip },
+            payloadMaterializationObserver: { _ in
+                skippedMaterializations += 1
+            }
+        )
+        XCTAssertEqual(
+            skipped,
+            .streamPayloadSkipped(id: id, flags: [.response, .data])
+        )
+        XCTAssertEqual(
+            skippedMaterializations,
+            0,
+            "an unknown stream field must not be copied out of the receive buffer"
+        )
+
+        var truncated = body
+        truncated.removeLast()
+        XCTAssertThrowsError(try BareRPCCodec.decodeFrameBody(
+            truncated,
+            streamPayloadAdmission: { _, _, _ in .skip }
+        )) { decodingError in
+            XCTAssertEqual(decodingError as? BareRPCCodecError, .truncated)
+        }
+
+        var trailing = body
+        trailing.append(0xA5)
+        XCTAssertThrowsError(try BareRPCCodec.decodeFrameBody(
+            trailing,
+            streamPayloadAdmission: { _, _, _ in .skip }
+        )) { decodingError in
+            XCTAssertEqual(decodingError as? BareRPCCodecError, .trailingBytes(1))
+        }
+    }
+
+    func test_skipped_error_utf8_scan_accepts_scalar_boundaries_and_rejects_malformed_sequences() throws {
+        let valid = "\u{0000}\u{007F}\u{0080}\u{07FF}\u{0800}\u{D7FF}\u{E000}\u{FFFF}\u{10000}\u{10FFFF}"
+        let validError = BareRPCError(message: valid, code: "E_é_€_😀", errno: 0)
+        let validUTF8Bytes = validError.message.utf8.count + validError.code.utf8.count
+        let skipped = try BareRPCCodec.decodeFrameBody(
+            BareRPCCodec.encodeResponseBody(
+                id: 1,
+                stream: [],
+                payload: .failure(validError)
+            ),
+            maximumRetainedErrorPayloadBytes: { _ in nil },
+            payloadMaterializationObserver: { _ in
+                XCTFail("valid unowned error unexpectedly materialized")
+            }
+        )
+        XCTAssertEqual(
+            skipped,
+            .errorPayloadLimitExceeded(
+                id: 1,
+                error: .init(maximumBytes: 0, attemptedBytes: validUTF8Bytes)
+            )
+        )
+
+        let malformedSequences: [[UInt8]] = [
+            [0x80],
+            [0xC0, 0x80],
+            [0xC2],
+            [0xC2, 0x20],
+            [0xE0, 0x9F, 0xBF],
+            [0xED, 0xA0, 0x80],
+            [0xE1, 0x80],
+            [0xE1, 0x80, 0x20],
+            [0xF0, 0x8F, 0xBF, 0xBF],
+            [0xF4, 0x90, 0x80, 0x80],
+            [0xF1, 0x80, 0x80],
+            [0xF1, 0x80, 0x80, 0x20],
+            [0xF5, 0x80, 0x80, 0x80],
+        ]
+        for bytes in malformedSequences {
+            var body = BareRPCCodec.encodeResponseBody(
+                id: 1,
+                stream: [],
+                payload: .failure(.init(
+                    message: String(repeating: "a", count: bytes.count),
+                    code: "",
+                    errno: 0
+                ))
+            )
+            // One-byte type/id/bool/stream/message-length headers precede
+            // these deliberately short message fields.
+            body.replaceSubrange(5..<(5 + bytes.count), with: bytes)
+            XCTAssertThrowsError(try BareRPCCodec.decodeFrameBody(
+                body,
+                maximumRetainedErrorPayloadBytes: { _ in nil },
+                payloadMaterializationObserver: { _ in
+                    XCTFail("malformed skipped error unexpectedly materialized")
+                }
+            )) { error in
+                XCTAssertEqual(
+                    error as? CompactEncodingError,
+                    .invalidUTF8,
+                    "sequence \(bytes)"
+                )
+            }
+        }
+    }
+
+    func test_frame_encoders_preflight_complete_body_length_at_exact_boundary() throws {
+        let requestPayload = Data(repeating: 0x41, count: 32)
+        let streamPayload = Data(repeating: 0x42, count: 32)
+        let responsePayload = Data(repeating: 0x43, count: 32)
+        let responseError = BareRPCError(
+            message: String(repeating: "failure", count: 8),
+            code: "E_LIMIT",
+            errno: 7
+        )
+        let cases: [(body: Data, encode: (Int) throws -> Data)] = [
+            (
+                BareRPCCodec.encodeRequestBody(
+                    id: 1, command: 2, stream: [], data: requestPayload
+                ),
+                { maximum in
+                    try BareRPCCodec.encodeRequestFrame(
+                        id: 1,
+                        command: 2,
+                        data: requestPayload,
+                        maximumBodyBytes: maximum
+                    )
+                }
+            ),
+            (
+                BareRPCCodec.encodeStreamBody(
+                    id: 3,
+                    flags: [.response, .data],
+                    payload: .data(streamPayload)
+                ),
+                { maximum in
+                    try BareRPCCodec.encodeStreamFrame(
+                        id: 3,
+                        flags: [.response, .data],
+                        payload: .data(streamPayload),
+                        maximumBodyBytes: maximum
+                    )
+                }
+            ),
+            (
+                BareRPCCodec.encodeResponseBody(
+                    id: 4,
+                    stream: [],
+                    payload: .success(responsePayload)
+                ),
+                { maximum in
+                    try BareRPCCodec.encodeResponseFrame(
+                        id: 4,
+                        stream: [],
+                        payload: .success(responsePayload),
+                        maximumBodyBytes: maximum
+                    )
+                }
+            ),
+            (
+                BareRPCCodec.encodeResponseBody(
+                    id: 5,
+                    stream: [],
+                    payload: .failure(responseError)
+                ),
+                { maximum in
+                    try BareRPCCodec.encodeResponseFrame(
+                        id: 5,
+                        stream: [],
+                        payload: .failure(responseError),
+                        maximumBodyBytes: maximum
+                    )
+                }
+            ),
+        ]
+
+        for item in cases {
+            let exact = try item.encode(item.body.count)
+            XCTAssertEqual(exact.count, item.body.count + 4)
+
+            let maximum = item.body.count - 1
+            XCTAssertThrowsError(try item.encode(maximum)) { error in
+                guard let invalid = error as? BareRPCInvalidArgument else {
+                    return XCTFail("expected BareRPCInvalidArgument, got \(error)")
+                }
+                XCTAssertEqual(
+                    invalid.reason,
+                    "outbound bare-rpc frame is \(item.body.count) bytes; "
+                        + "maximumWireMessageBytes is \(maximum)"
+                )
+            }
+        }
+    }
+
+    func test_frame_reader_rejects_trailing_bytes_inside_declared_body() {
+        var frame = BareRPCCodec.__testEncodeStreamFrame(
+            id: 5,
+            flags: [.response, .end]
+        )
+        var declaredLength: UInt32 = 0
+        for index in 0..<4 {
+            declaredLength |= UInt32(frame[index]) << (8 * index)
+        }
+        declaredLength += 1
+        for index in 0..<4 {
+            frame[index] = UInt8((declaredLength >> (8 * index)) & 0xFF)
+        }
+        frame.append(0xA5)
+
+        let reader = BareRPCFrameReader()
+        XCTAssertThrowsError(try reader.append(frame)) { error in
+            XCTAssertEqual(error as? BareRPCCodecError, .trailingBytes(1))
+        }
+        XCTAssertNil(reader.next())
+    }
+
     /// Default reader must accept the largest plausibly-legitimate frame (1 MiB ≪ the
     /// configured default cap, to keep the ceiling from accidentally rejecting real traffic.
     func test_reader_accepts_one_mib_frame_under_default_cap() throws {

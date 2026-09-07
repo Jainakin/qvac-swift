@@ -36,6 +36,18 @@ struct BareRPCStreamBufferOverflow: Error, Sendable, Equatable, CustomStringConv
     }
 }
 
+/// Decoder-to-channel admission result for an inbound STREAM(DATA) field.
+///
+/// The frame body is already resident in the bounded transport receive buffer,
+/// but `.skip` and `.reject` let the codec advance over its data field without
+/// allocating a second `Data` value. A rejection is operation-local; malformed
+/// framing still throws from the codec and closes the connection generation.
+enum BareRPCStreamPayloadAdmission: Sendable, Equatable {
+    case retain
+    case skip
+    case reject(BareRPCStreamBufferOverflow)
+}
+
 struct BareRPCProtocolError: Error, Sendable, Equatable {
     let reason: String
     init(_ reason: String) { self.reason = reason }
@@ -135,17 +147,12 @@ final class BoundedRPCDataChannel: @unchecked Sendable {
             lock.unlock()
             return nil
         }
-        let (chargedBytes, chargeOverflowed) = value.count.addingReportingOverflow(
-            Self.retainedValueOverheadBytes
-        )
-        let (attempted, totalOverflowed) = bufferedBytes.addingReportingOverflow(chargedBytes)
-        if chargeOverflowed || totalOverflowed || attempted > maximumBufferedBytes {
+        if let overflow = overflowLocked(forPayloadByteCount: value.count) {
             lock.unlock()
-            return BareRPCStreamBufferOverflow(
-                maximumBufferedBytes: maximumBufferedBytes,
-                attemptedBufferedBytes: chargeOverflowed || totalOverflowed ? Int.max : attempted
-            )
+            return overflow
         }
+        let chargedBytes = value.count + Self.retainedValueOverheadBytes
+        let attempted = bufferedBytes + chargedBytes
         if let current = waiter {
             waiter = nil
             waiting = current
@@ -157,6 +164,20 @@ final class BoundedRPCDataChannel: @unchecked Sendable {
         lock.unlock()
         waiting?.resume(returning: value)
         return nil
+    }
+
+    /// Decide whether the next stream data field can be retained before the
+    /// codec copies it out of the receive buffer. The producer actor dispatches
+    /// decoded frames serially, so prior frames in the same transport read have
+    /// already updated this accounting before the next admission check.
+    func admission(forPayloadByteCount payloadByteCount: Int) -> BareRPCStreamPayloadAdmission {
+        lock.withLock {
+            guard terminal == nil else { return .skip }
+            if let overflow = overflowLocked(forPayloadByteCount: payloadByteCount) {
+                return .reject(overflow)
+            }
+            return .retain
+        }
     }
 
     func finish(throwing error: Error? = nil, discardingBuffered: Bool = false) {
@@ -286,6 +307,22 @@ final class BoundedRPCDataChannel: @unchecked Sendable {
         inFlightBytes = 0
     }
 
+    private func overflowLocked(
+        forPayloadByteCount payloadByteCount: Int
+    ) -> BareRPCStreamBufferOverflow? {
+        let (chargedBytes, chargeOverflowed) = payloadByteCount.addingReportingOverflow(
+            Self.retainedValueOverheadBytes
+        )
+        let (attempted, totalOverflowed) = bufferedBytes.addingReportingOverflow(chargedBytes)
+        guard chargeOverflowed || totalOverflowed || attempted > maximumBufferedBytes else {
+            return nil
+        }
+        return BareRPCStreamBufferOverflow(
+            maximumBufferedBytes: maximumBufferedBytes,
+            attemptedBufferedBytes: chargeOverflowed || totalOverflowed ? Int.max : attempted
+        )
+    }
+
     /// Test-only visibility for deterministic byte-accounting and retention
     /// assertions without timing producer/consumer races.
     func __testState() -> (
@@ -337,18 +374,31 @@ final class BareRPCDuplexSession: @unchecked Sendable {
 
 actor BareRPCClient {
 
+    /// Remote errors are diagnostic text, never model output. Keeping their
+    /// aggregate UTF-8 payload small prevents a hostile peer from turning the
+    /// general media-sized wire ceiling into equally large `Data` and `String`
+    /// allocations while retaining ample room for actionable diagnostics.
+    static let defaultMaximumRetainedErrorBytes = 64 * 1024
+
     // ----------- Configuration & state -----------
 
     /// Per-request bookkeeping for `send`.
     private final class PendingSend {
         let continuation: CheckedContinuation<Data?, Error>
+        /// Maximum unary RESPONSE data bytes this operation is willing to
+        /// retain. The frame decoder consults this before copying the data field.
+        let maximumResponseBytes: Int
         var timeoutTask: Task<Void, Never>?
         var writeTask: Task<Void, Never>?
         var writeStarted = false
         var writeCompleted = false
 
-        init(continuation: CheckedContinuation<Data?, Error>) {
+        init(
+            continuation: CheckedContinuation<Data?, Error>,
+            maximumResponseBytes: Int
+        ) {
             self.continuation = continuation
+            self.maximumResponseBytes = maximumResponseBytes
         }
     }
 
@@ -410,6 +460,7 @@ actor BareRPCClient {
     private let logger: BareRPCLogger?
     private let maximumWireMessageBytes: Int
     private let maximumBufferedStreamBytes: Int
+    private let maximumRetainedErrorBytes: Int
     private var nextId: UInt64 = 1
     private var pendingSends: [UInt64: PendingSend] = [:]
     private var pendingStreams: [UInt64: PendingStream] = [:]
@@ -429,6 +480,10 @@ actor BareRPCClient {
         self.logger = logger
         self.maximumWireMessageBytes = BareRPCFrameReader.defaultMaxFrameSize
         self.maximumBufferedStreamBytes = BareRPCFrameReader.defaultMaxFrameSize
+        self.maximumRetainedErrorBytes = min(
+            Self.defaultMaximumRetainedErrorBytes,
+            BareRPCFrameReader.defaultMaxFrameSize
+        )
         self.reader = BareRPCFrameReader(
             validatedMaxFrameSize: BareRPCFrameReader.defaultMaxFrameSize
         )
@@ -449,6 +504,7 @@ actor BareRPCClient {
         transport: BareTransport,
         maximumWireMessageBytes: Int,
         maximumBufferedStreamBytes: Int? = nil,
+        maximumRetainedErrorBytes: Int? = nil,
         logger: BareRPCLogger? = nil
     ) throws {
         guard maximumWireMessageBytes > 0,
@@ -463,10 +519,18 @@ actor BareRPCClient {
                 "maximumBufferedStreamBytes must be between 1 and UInt32.max"
             )
         }
+        let errorLimit = maximumRetainedErrorBytes
+            ?? min(Self.defaultMaximumRetainedErrorBytes, maximumWireMessageBytes)
+        guard errorLimit > 0, errorLimit <= maximumWireMessageBytes else {
+            throw BareRPCInvalidArgument(
+                "maximumRetainedErrorBytes must be between 1 and maximumWireMessageBytes"
+            )
+        }
         self.transport = transport
         self.logger = logger
         self.maximumWireMessageBytes = maximumWireMessageBytes
         self.maximumBufferedStreamBytes = bufferLimit
+        self.maximumRetainedErrorBytes = errorLimit
         self.reader = BareRPCFrameReader(validatedMaxFrameSize: maximumWireMessageBytes)
         let inbound = transport.inboundStream()
         Task { [weak self] in
@@ -485,6 +549,10 @@ actor BareRPCClient {
         self.logger = logger
         self.maximumWireMessageBytes = maximumWireMessageBytes
         self.maximumBufferedStreamBytes = maximumBufferedStreamBytes
+        self.maximumRetainedErrorBytes = min(
+            Self.defaultMaximumRetainedErrorBytes,
+            maximumWireMessageBytes
+        )
         self.reader = BareRPCFrameReader(validatedMaxFrameSize: maximumWireMessageBytes)
         let inbound = transport.inboundStream()
         Task { [weak self] in
@@ -520,10 +588,17 @@ actor BareRPCClient {
     func send(
         command: UInt64,
         data: Data?,
-        timeout: Duration? = nil
+        timeout: Duration? = nil,
+        maximumResponseBytes: Int? = nil
     ) async throws -> Data? {
         try ensureOpen()
         try validate(timeout: timeout)
+        let responseLimit = maximumResponseBytes ?? maximumWireMessageBytes
+        guard responseLimit > 0, responseLimit <= maximumWireMessageBytes else {
+            throw BareRPCInvalidArgument(
+                "maximumResponseBytes must be between 1 and maximumWireMessageBytes"
+            )
+        }
         let id = allocateId()
         let frame = try BareRPCCodec.encodeRequestFrame(
             id: id,
@@ -534,7 +609,10 @@ actor BareRPCClient {
         )
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (c: CheckedContinuation<Data?, Error>) in
-                let pending = PendingSend(continuation: c)
+                let pending = PendingSend(
+                    continuation: c,
+                    maximumResponseBytes: responseLimit
+                )
                 pendingSends[id] = pending
                 if Task.isCancelled {
                     resolveSend(id: id, with: .failure(CancellationError()))
@@ -742,16 +820,63 @@ actor BareRPCClient {
     /// Feed a chunk of bytes from the transport. Used by the feeder task; not part of the
     /// API.
     private func feed(_ data: Data) throws {
-        try reader.append(data)
-        while let frame = reader.next() {
-            dispatch(frame)
-        }
+        try reader.appendConsumingFrames(
+            data,
+            maximumRetainedResponsePayloadBytes: { id in
+                // A settled/unknown unary id has no consumer. Returning zero lets
+                // the decoder validate and skip any non-empty late payload without
+                // allocating a throwaway Data value. Active ordinary sends retain
+                // up to the global wire ceiling; bounded sends use their lower cap.
+                pendingSends[id]?.maximumResponseBytes ?? 0
+            },
+            maximumRetainedErrorPayloadBytes: { id in
+                if pendingSends[id] != nil
+                    || pendingStreams[id] != nil
+                    || pendingDuplex[id] != nil {
+                    return maximumRetainedErrorBytes
+                }
+                // A late error for a settled or unknown operation is validated
+                // and skipped without constructing diagnostic strings.
+                return nil
+            },
+            streamPayloadAdmission: { id, flags, payloadByteCount in
+                guard flags.contains(.response) else {
+                    // Request-direction DATA is never consumed by this client.
+                    return .skip
+                }
+                if let stream = pendingStreams[id] {
+                    return stream.channel.admission(
+                        forPayloadByteCount: payloadByteCount
+                    )
+                }
+                if let duplex = pendingDuplex[id] {
+                    return duplex.channel.admission(
+                        forPayloadByteCount: payloadByteCount
+                    )
+                }
+                return .skip
+            },
+            onFrame: { frame in
+                // Dispatch before decoding the next coalesced frame so its
+                // admission decision observes this frame's retained-byte charge.
+                dispatch(frame)
+            }
+        )
     }
 
     private func dispatch(_ frame: BareRPCFrame) {
         switch frame {
         case .response(let id, let flags, let payload):
             handleResponse(id: id, flags: flags, payload: payload)
+        case .responsePayloadLimitExceeded(let id, let flags, let error):
+            handleResponsePayloadLimitExceeded(id: id, flags: flags, error: error)
+        case .errorPayloadLimitExceeded(let id, let error):
+            handleErrorPayloadLimitExceeded(id: id, error: error)
+        case .streamPayloadLimitExceeded(let id, let flags, let error):
+            handleStreamPayloadLimitExceeded(id: id, flags: flags, error: error)
+        case .streamPayloadSkipped:
+            // The operation/direction was already terminal or never consumed.
+            break
         case .stream(let id, let flags, let payload):
             handleStream(id: id, flags: flags, payload: payload)
         case .request:
@@ -761,30 +886,123 @@ actor BareRPCClient {
         }
     }
 
-    private func handleResponse(id: UInt64, flags: BareRPCStreamFlags, payload: BareRPCResponsePayload) {
-        // Streaming bootstrap: RESPONSE with non-zero stream flags is the server saying
-        // "I've opened my outgoing-response stream; STREAM frames follow."
-        if flags.rawValue != 0 {
-            if let s = pendingStreams[id] {
-                s.serverOpened = true
-                armStreamTimeout(id: id)
-                return
-            }
-            if let d = pendingDuplex[id] {
-                d.responseOpened = true
-                completeDuplexSetupIfReady(id: id)
-                return
-            }
-            // Unrequested RESPONSE(stream=*) — server bug or stale id. Ignore.
+    private func handleResponsePayloadLimitExceeded(
+        id: UInt64,
+        flags: BareRPCStreamFlags,
+        error: BareRPCResponsePayloadLimitExceeded
+    ) {
+        if pendingSends[id] != nil {
+            resolveSend(id: id, with: .failure(error))
             return
         }
-        // Single-shot RESPONSE.
-        switch payload {
-        case .success(let data):
-            resolveSend(id: id, with: .success(data))
-        case .failure(let err):
-            resolveSend(id: id, with: .failure(err))
+
+        // A stream/duplex request must never receive an inline unary payload.
+        // Preserve the existing response-shape diagnostics after discarding the
+        // unretained data; an already-settled unknown id remains a no-op.
+        handleResponse(id: id, flags: flags, payload: .success(nil))
+    }
+
+    private func handleErrorPayloadLimitExceeded(
+        id: UInt64,
+        error: BareRPCResponsePayloadLimitExceeded
+    ) {
+        if pendingSends[id] != nil {
+            resolveSend(id: id, with: .failure(error))
+        } else if pendingStreams[id] != nil {
+            failStream(id: id, with: error, notifyRemote: false)
+        } else if pendingDuplex[id] != nil {
+            failDuplex(id: id, with: error, notifyRemote: false)
         }
+        // Settled and unknown ids are deliberately ignored after validation.
+    }
+
+    private func handleStreamPayloadLimitExceeded(
+        id: UInt64,
+        flags: BareRPCStreamFlags,
+        error: BareRPCStreamBufferOverflow
+    ) {
+        guard flags.contains(.response) else { return }
+        if pendingStreams[id] != nil {
+            failStream(id: id, with: error, notifyRemote: true)
+        } else if pendingDuplex[id] != nil {
+            failDuplex(id: id, with: error, notifyRemote: true)
+        }
+        // Settled and unknown ids are deliberately ignored after validation.
+    }
+
+    private func handleResponse(id: UInt64, flags: BareRPCStreamFlags, payload: BareRPCResponsePayload) {
+        // Route by the operation that owns this id before interpreting the stream
+        // field. Upstream bare-rpc sends a plain RESPONSE(error, stream=0) when a
+        // server-stream or duplex handler throws before opening its response stream.
+        // Treating every stream=0 response as unary silently discarded that failure
+        // and left the real operation waiting until its timeout.
+        if pendingSends[id] != nil {
+            switch payload {
+            case .failure(let error):
+                // bare-rpc treats the error bit as authoritative even if a peer
+                // also supplies a malformed stream field.
+                resolveSend(id: id, with: .failure(error))
+            case .success(let data):
+                guard flags.rawValue == 0 else {
+                    resolveSend(
+                        id: id,
+                        with: .failure(BareRPCProtocolError(
+                            "unary request received a streaming RESPONSE"
+                        ))
+                    )
+                    return
+                }
+                resolveSend(id: id, with: .success(data))
+            }
+            return
+        }
+
+        if pendingStreams[id] != nil {
+            switch payload {
+            case .failure(let error):
+                failStream(id: id, with: error, notifyRemote: false)
+            case .success:
+                // Pinned bare-rpc's OutgoingStream._open emits exactly s.OPEN in
+                // a RESPONSE frame; direction and lifecycle combinations belong
+                // only to STREAM frames and are protocol violations here.
+                guard flags == [.open] else {
+                    failStream(
+                        id: id,
+                        with: BareRPCProtocolError(
+                            "server stream received a non-opening RESPONSE"
+                        ),
+                        notifyRemote: false
+                    )
+                    return
+                }
+                pendingStreams[id]?.serverOpened = true
+                armStreamTimeout(id: id)
+            }
+            return
+        }
+
+        if pendingDuplex[id] != nil {
+            switch payload {
+            case .failure(let error):
+                failDuplex(id: id, with: error, notifyRemote: false)
+            case .success:
+                // See the server-stream branch above: response bootstrap is an
+                // exact OPEN, not a general stream-control bitmask.
+                guard flags == [.open] else {
+                    failDuplex(
+                        id: id,
+                        with: BareRPCProtocolError(
+                            "duplex response stream received a non-opening RESPONSE"
+                        ),
+                        notifyRemote: false
+                    )
+                    return
+                }
+                pendingDuplex[id]?.responseOpened = true
+                completeDuplexSetupIfReady(id: id)
+            }
+        }
+        // Unknown ids belong to an already-settled operation and are ignored.
     }
 
     private func handleStream(id: UInt64, flags: BareRPCStreamFlags, payload: BareRPCStreamPayload) {

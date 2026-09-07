@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 2,
+  "test": {
+    "module": "QVACiOSSmokeTests",
+    "expectedCount": 37,
+    "inventoryPath": "tools/ci/ios-smoke-test-inventory.txt",
+    "inventorySHA256": "406d901b69476eafa308f691cfa2284abb0a1acbbeda90aa3d4f0eee00f55108"
+  },
+  "sources": [
+    {
+      "path": "Sources/QVACClient/Internal/Transport/BareIPCTransport.swift",
+      "requiredCoveredLines": [90, 180, 209, 247, 254, 262, 264, 273, 278, 303, 304, 308, 310, 377, 381, 390, 401, 406, 419, 423, 453, 464, 471, 492, 494, 500, 512, 522, 531, 538, 559, 566, 573, 589, 603, 612, 624, 634, 645, 655, 665, 675, 686],
+      "gate": {
+        "lines": {
+          "minimumPercentBasisPoints": 9000,
+          "minimumCovered": 670,
+          "minimumTotal": 680,
+          "maximumUncovered": 30
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 8000,
+          "minimumCovered": 90,
+          "minimumTotal": 96,
+          "maximumUncovered": 12
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 8200,
+          "minimumCovered": 215,
+          "minimumTotal": 235,
+          "maximumUncovered": 30
+        }
+      }
+    },
+    {
+      "path": "Sources/QVACClient/Public/QVACClient.swift",
+      "requiredCoveredLines": [232, 279, 581, 585, 608, 658, 720, 739],
+      "gate": {
+        "lines": {
+          "minimumPercentBasisPoints": 2000,
+          "minimumCovered": 380,
+          "minimumTotal": 1500,
+          "maximumUncovered": 1250
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 2000,
+          "minimumCovered": 35,
+          "minimumTotal": 140,
+          "maximumUncovered": 120
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 1800,
+          "minimumCovered": 105,
+          "minimumTotal": 500,
+          "maximumUncovered": 430
+        }
+      }
+    },
+    {
+      "path": "Sources/QVACClient/Internal/BareRPC/Handshake.swift",
+      "requiredCoveredLines": [92, 99, 102, 103, 104, 117, 118, 121, 122, 123],
+      "gate": {
+        "lines": {
+          "minimumPercentBasisPoints": 7500,
+          "minimumCovered": 52,
+          "minimumTotal": 65,
+          "maximumUncovered": 20
+        },
+        "functions": {
+          "minimumPercentBasisPoints": 8000,
+          "minimumCovered": 9,
+          "minimumTotal": 10,
+          "maximumUncovered": 3
+        },
+        "regions": {
+          "minimumPercentBasisPoints": 5000,
+          "minimumCovered": 25,
+          "minimumTotal": 44,
+          "maximumUncovered": 25
+        }
+      }
+    }
+  ]
+}

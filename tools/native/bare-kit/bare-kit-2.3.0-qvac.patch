@@ -1,0 +1,425 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7371af65cc24ddba00151acd160ab358c2730afb..9bb0ef69ea4f1b17c5eb4550f71d1d5320a25c56 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -14,7 +14,9 @@ if(APPLE)
+   enable_language(OBJC)
+ endif()
+ 
+-fetch_package("github:holepunchto/bare@1.29.4")
++# Resolve the exact commit behind Bare 1.29.4. The release tag is useful human
++# provenance, but a mutable tag is not an acceptable native artifact input.
++fetch_package("github:holepunchto/bare#5cf8db08c17a433a2f05b25e397a7ebcdcf5a158")
+ 
+ add_subdirectory(shared)
+ 
+diff --git a/apple/BareKit/BareKit.h b/apple/BareKit/BareKit.h
+index 9c4d2382ec9d689ff2afd861269b5ef128902147..97cbca69b8434529cb75fadc604ab9db8d107928 100644
+--- a/apple/BareKit/BareKit.h
++++ b/apple/BareKit/BareKit.h
+@@ -5,6 +5,8 @@
+ 
+ #import <Foundation/Foundation.h>
+ 
++FOUNDATION_EXPORT NSString *_Nonnull const BareKitQVACPatchLevel;
++
+ @interface BareWorkletConfiguration : NSObject
+ 
+ @property NSUInteger memoryLimit;
+@@ -84,6 +86,14 @@
+ 
+ - (NSData *_Nullable)read;
+ 
++/**
++ * Read one available IPC chunk and report terminal POSIX failures.
++ *
++ * A nil result with a nil error means that the nonblocking descriptor would
++ * block. A nonnil, zero-length result means end of file.
++ */
++- (NSData *_Nullable)readWithError:(NSError *_Nullable *_Nullable)error;
++
+ - (void)read:(void (^_Nonnull)(NSData *_Nullable data, NSError *_Nullable error))completion;
+ 
+ - (NSInteger)write:(NSData *_Nonnull)data;
+diff --git a/apple/BareKit/BareKit.m b/apple/BareKit/BareKit.m
+index 1ede50c45ec7505fbee7b222befc6a5565bdd320..64161f6b0263c90cea263ceabec55a328f5e6a79 100644
+--- a/apple/BareKit/BareKit.m
++++ b/apple/BareKit/BareKit.m
+@@ -1,6 +1,7 @@
+ #import <Foundation/Foundation.h>
+ 
+ #import <assert.h>
++#import <errno.h>
+ #import <string.h>
+ #import <utf.h>
+ #import <uv.h>
+@@ -10,6 +11,8 @@
+ #import "../../shared/ipc.h"
+ #import "../../shared/worklet.h"
+ 
++NSString *const BareKitQVACPatchLevel = @"qvac-bare-kit-2.3.0-ipc-hardening-1";
++
+ typedef void (^BareWorkletPushHandler)(NSData *_Nullable reply, NSError *_Nullable error);
+ 
+ @interface BareWorkletPushContext : NSObject
+@@ -286,6 +289,34 @@ - (void)poll:(int)events;
+ 
+ @end
+ 
++typedef void (^BareIPCWriteCompletion)(NSError *_Nullable error);
++
++@interface BareIPCWriteContext : NSObject
++
++@property(nonatomic, retain) NSData *remaining;
++@property(nonatomic, copy) BareIPCWriteCompletion completion;
++
++@end
++
++
++@implementation BareIPCWriteContext
++
++- (void)dealloc {
++  [_remaining release];
++  [_completion release];
++
++  [super dealloc];
++}
++
++@end
++
++static NSError *
++bare_ipc__posix_error(int errorCode) {
++  return [NSError errorWithDomain:NSPOSIXErrorDomain
++                             code:errorCode == 0 ? EIO : errorCode
++                         userInfo:nil];
++}
++
+ static void
+ bare_ipc__on_poll(bare_ipc_poll_t *poll, int events) {
+   @autoreleasepool {
+@@ -298,6 +329,7 @@ - (void)poll:(int)events;
+ @implementation BareIPC {
+   bare_ipc_t _ipc;
+   bare_ipc_poll_t _poll;
++  BOOL _closed;
+ }
+ 
+ - (_Nullable instancetype)initWithWorklet:(BareWorklet *_Nonnull)worklet {
+@@ -313,82 +345,148 @@ - (_Nullable instancetype)initWithWorklet:(BareWorklet *_Nonnull)worklet {
+     assert(err == 0);
+ 
+     _poll.data = (__bridge void *) self;
++    _closed = NO;
+   }
+ 
+   return self;
+ }
+ 
+ - (void)setReadable:(void (^)(BareIPC *_Nonnull))readable {
+-  if (readable == nil) {
+-    _readable = nil;
+-  } else {
++  void (^previous)(BareIPC *) = nil;
++
++  @synchronized(self) {
++    if (_closed) return;
++
++    previous = _readable;
+     _readable = [readable copy];
++
++    [self update];
+   }
+ 
+-  [self update];
++  [previous release];
+ }
+ 
+ - (void)setWritable:(void (^)(BareIPC *_Nonnull))writable {
+-  if (writable == nil) {
+-    _writable = nil;
++  void (^previous)(BareIPC *) = nil;
+ 
+-  } else {
++  @synchronized(self) {
++    if (_closed) return;
++
++    previous = _writable;
+     _writable = [writable copy];
++
++    [self update];
+   }
+ 
+-  [self update];
++  [previous release];
+ }
+ 
+ - (void)update {
+-  int events = 0;
++  @synchronized(self) {
++    if (_closed) return;
+ 
+-  if (_readable) events |= bare_ipc_readable;
+-  if (_writable) events |= bare_ipc_writable;
++    int events = 0;
+ 
+-  int err;
++    if (_readable) events |= bare_ipc_readable;
++    if (_writable) events |= bare_ipc_writable;
+ 
+-  if (events) {
+-    err = bare_ipc_poll_start(&_poll, events, bare_ipc__on_poll);
+-    assert(err == 0);
+-  } else {
+-    err = bare_ipc_poll_stop(&_poll);
+-    assert(err == 0);
++    int err;
++
++    if (events) {
++      err = bare_ipc_poll_start(&_poll, events, bare_ipc__on_poll);
++      assert(err == 0);
++    } else {
++      err = bare_ipc_poll_stop(&_poll);
++      assert(err == 0);
++    }
+   }
+ }
+ 
+ - (void)poll:(int)events {
+-  if (events & bare_ipc_readable) _readable(self);
+-  if (events & bare_ipc_writable) _writable(self);
++  if (events & bare_ipc_readable) {
++    void (^readable)(BareIPC *) = nil;
++
++    @synchronized(self) {
++      if (!_closed) readable = [_readable copy];
++    }
++
++    if (readable) {
++      readable(self);
++      [readable release];
++    }
++  }
++
++  if (events & bare_ipc_writable) {
++    void (^writable)(BareIPC *) = nil;
++
++    @synchronized(self) {
++      if (!_closed) writable = [_writable copy];
++    }
++
++    if (writable) {
++      writable(self);
++      [writable release];
++    }
++  }
+ }
+ 
+ - (NSData *_Nullable)read {
++  return [self readWithError:nil];
++}
++
++- (NSData *_Nullable)readWithError:(NSError *_Nullable *_Nullable)error {
++  if (error) *error = nil;
++
+   int err;
++  int errorCode = 0;
+ 
+-  void *data;
+-  size_t len;
+-  err = bare_ipc_read(&_ipc, &data, &len);
+-  assert(err == 0 || err == bare_ipc_would_block);
++  void *data = NULL;
++  size_t len = 0;
++
++  @synchronized(self) {
++    if (_closed) {
++      err = bare_ipc_error;
++      errorCode = EBADF;
++    } else {
++      err = bare_ipc_read(&_ipc, &data, &len);
++      if (err == bare_ipc_error) errorCode = errno;
++    }
++  }
+ 
+   if (err == bare_ipc_would_block) {
+     return nil;
+   }
+ 
+-  return [[NSData alloc] initWithBytes:data length:len];
++  if (err != 0) {
++    assert(err == bare_ipc_error);
++
++    if (error) {
++      *error = [NSError errorWithDomain:NSPOSIXErrorDomain
++                                   code:errorCode == 0 ? EIO : errorCode
++                               userInfo:nil];
++    }
++
++    return nil;
++  }
++
++  return [NSData dataWithBytes:data length:len];
+ }
+ 
+ - (void)read:(void (^_Nonnull)(NSData *_Nullable data, NSError *_Nullable error))completion {
+-  NSData *data = [self read];
++  NSError *error = nil;
++  NSData *data = [self readWithError:&error];
+ 
+-  if (data) {
+-    completion(data, nil);
++  if (data || error) {
++    completion(data, error);
+   } else {
+     self.readable = ^(BareIPC *ipc) {
+-      NSData *data = [self read];
++      NSError *error = nil;
++      NSData *data = [ipc readWithError:&error];
+ 
+-      if (data) {
+-        self.readable = nil;
++      if (data || error) {
++        ipc.readable = nil;
+ 
+-        completion(data, nil);
++        completion(data, error);
+       }
+     };
+   }
+@@ -396,8 +494,17 @@ - (void)read:(void (^_Nonnull)(NSData *_Nullable data, NSError *_Nullable error)
+ 
+ - (NSInteger)write:(NSData *_Nonnull)data {
+   int err;
+-  err = bare_ipc_write(&_ipc, data.bytes, data.length);
+-  assert(err >= 0 || err == bare_ipc_would_block);
++
++  @synchronized(self) {
++    if (_closed) {
++      errno = EBADF;
++      return bare_ipc_error;
++    }
++
++    err = bare_ipc_write(&_ipc, data.bytes, data.length);
++  }
++
++  assert(err >= 0 || err == bare_ipc_would_block || err == bare_ipc_error);
+ 
+   if (err == bare_ipc_would_block) {
+     return 0;
+@@ -410,39 +517,70 @@ - (void)write:(NSData *_Nonnull)data
+    completion:(void (^_Nonnull)(NSError *_Nullable error))completion {
+   NSInteger written = [self write:data];
+ 
++  if (written < 0) {
++    int errorCode = errno;
++
++    completion(bare_ipc__posix_error(errorCode));
++    return;
++  }
++
+   if (written == data.length) {
+     completion(nil);
+   } else {
+-    data = [data subdataWithRange:NSMakeRange(written, data.length - written)];
+-
+-    [data retain];
+-
+-    __block NSData *remaining = data;
++    BareIPCWriteContext *context = [[BareIPCWriteContext alloc] init];
++    context.remaining = [data subdataWithRange:NSMakeRange(written, data.length - written)];
++    context.completion = completion;
+ 
+     self.writable = ^(BareIPC *ipc) {
+-      NSInteger written = [self write:remaining];
++      NSInteger written = [ipc write:context.remaining];
+ 
+-      if (written == remaining.length) {
+-        [remaining release];
++      if (written < 0) {
++        int errorCode = errno;
+ 
+-        self.writable = nil;
++        ipc.writable = nil;
++        context.completion(bare_ipc__posix_error(errorCode));
++        return;
++      }
+ 
+-        completion(nil);
++      if (written == context.remaining.length) {
++        ipc.writable = nil;
++        context.completion(nil);
+       } else {
+-        NSData *data = [remaining subdataWithRange:NSMakeRange(written, remaining.length - written)];
+-
+-        [data retain];
+-        [remaining release];
+-
+-        remaining = data;
++        context.remaining = [context.remaining
++          subdataWithRange:NSMakeRange(written, context.remaining.length - written)];
+       }
+     };
++
++    [context release];
+   }
+ }
+ 
+ - (void)close {
++  void (^readable)(BareIPC *) = nil;
++  void (^writable)(BareIPC *) = nil;
++
++  @synchronized(self) {
++    if (_closed) return;
++
++    _closed = YES;
++
++    readable = _readable;
++    writable = _writable;
++    _readable = nil;
++    _writable = nil;
++  }
++
++  [readable release];
++  [writable release];
++
+   bare_ipc_poll_destroy(&_poll);
+   bare_ipc_destroy(&_ipc);
+ }
+ 
++- (void)dealloc {
++  [self close];
++
++  [super dealloc];
++}
++
+ @end
+diff --git a/shared/posix/ipc.c b/shared/posix/ipc.c
+index 102999ab7465969ab0c774d6e96e7cd2b74959a8..991d1135d8a0eb22681cf833c90335d33a283a23 100644
+--- a/shared/posix/ipc.c
++++ b/shared/posix/ipc.c
+@@ -18,7 +18,11 @@ bare_ipc_destroy(bare_ipc_t *ipc) {
+ 
+ int
+ bare_ipc_read(bare_ipc_t *ipc, void **data, size_t *len) {
+-  ssize_t res = read(ipc->incoming, ipc->data, BARE_IPC_READ_BUFFER_SIZE);
++  ssize_t res;
++
++  do {
++    res = read(ipc->incoming, ipc->data, BARE_IPC_READ_BUFFER_SIZE);
++  } while (res < 0 && errno == EINTR);
+ 
+   if (res < 0) {
+     return (errno == EAGAIN || errno == EWOULDBLOCK) ? bare_ipc_would_block : bare_ipc_error;
+@@ -32,7 +36,11 @@ bare_ipc_read(bare_ipc_t *ipc, void **data, size_t *len) {
+ 
+ int
+ bare_ipc_write(bare_ipc_t *ipc, const void *data, size_t len) {
+-  ssize_t res = write(ipc->outgoing, data, len);
++  ssize_t res;
++
++  do {
++    res = write(ipc->outgoing, data, len);
++  } while (res < 0 && errno == EINTR);
+ 
+   if (res < 0) {
+     return (errno == EAGAIN || errno == EWOULDBLOCK) ? bare_ipc_would_block : bare_ipc_error;

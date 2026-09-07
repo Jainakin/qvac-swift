@@ -36,6 +36,34 @@ final class PublicAPISmokeTests: XCTestCase {
         }
         XCTAssertEqual(transport.bareExecutable.standardizedFileURL, localBare.standardizedFileURL)
     }
+
+    func test_macOS_configuration_does_not_treat_an_executable_directory_as_local_bare() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qvac-local-bare-directory-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let nodeModules = root.appendingPathComponent("node_modules", isDirectory: true)
+        let directoryNamedBare = nodeModules.appendingPathComponent(
+            "bare-runtime/bin/bare",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directoryNamedBare,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: directoryNamedBare.path
+        )
+
+        let configuration = try QVACClient.Configuration.macOS(nodeModulesDir: nodeModules)
+        guard case .macOSSubprocess(let transport) = configuration.storage else {
+            return XCTFail("expected macOS subprocess configuration")
+        }
+        XCTAssertNotEqual(
+            transport.bareExecutable.standardizedFileURL,
+            directoryNamedBare.standardizedFileURL
+        )
+    }
     #endif
 
     // MARK: - Single-shot request envelopes

@@ -24,14 +24,15 @@ include a compatibility layer for earlier QVAC SDK versions.
 
 ## Installation
 
-The 0.2 release line contains the current SDK 0.17.0 API. Add the package URL in
-Xcode, or declare it in `Package.swift`:
+The current hardened revision for the QVAC SDK 0.17.0 contract is an unreleased
+review candidate. To evaluate it through the public repository URL, use the
+`main` branch:
 
 ```swift
 dependencies: [
     .package(
         url: "https://github.com/Jainakin/qvac-swift.git",
-        .upToNextMinor(from: "0.2.0")
+        branch: "main"
     )
 ],
 targets: [
@@ -44,11 +45,11 @@ targets: [
 ]
 ```
 
-If `0.2.0` is not yet available during review, evaluators can temporarily replace
-the version requirement with `branch: "main"`. Do not ship a branch-based
-dependency. Commit your application's `Package.resolved` file when using a
-reviewed release. The existing `v0.1.0` tag predates the current stream types and
-buffering behavior.
+This branch-based declaration is for evaluation only. After the maintainers
+publish the reviewed `0.2.0` source release, replace `branch: "main"` with
+`.upToNextMinor(from: "0.2.0")`, and commit your application's
+`Package.resolved` file. The existing `v0.1.0` tag predates the current stream
+types and buffering behavior.
 
 ## Quick start
 
@@ -174,9 +175,35 @@ lazily. Lossless streams report `QVACStreamBufferOverflow` when a consumer canno
 keep up; progress streams coalesce older snapshots while retaining the newest
 bounded window.
 
-The default wire-message limit is 256 MiB to accommodate media returned as
-base64 JSON. Applications can lower `maximumWireMessageBytes` and
-`maximumBufferedStreamBytes` for their model set and memory budget.
+Raw stream capacity is checked before a DATA field is copied out of the receive
+frame. Late data is structurally validated and skipped. Remote bare-rpc error text
+is retained up to a 64 KiB aggregate UTF-8 ceiling (or the lower wire ceiling), so
+media-sized wire limits do not permit equally large diagnostic `String` allocations.
+
+The default inbound wire-message and decoded-record limit is 256 MiB to
+accommodate media returned as base64 JSON. Encoded requests and duplex chunks
+have a separate 48 MiB outbound ceiling, while convenience APIs that inline
+binary values reject more than 24 MiB of aggregate raw input before allocating
+base64 or JSON copies. They also accept at most 1,024 separately encoded binary
+items, preventing tiny arrays from bypassing the byte budget through container
+overhead. Eager high-level results assembled across multiple records are bounded
+by `maximumAccumulatedResultBytes`, which defaults to the wire-message limit. VLA
+actions have an additional 8 MiB default cap because base64 decoding temporarily
+retains more than one representation of the output. Model info, system-resource,
+registry-get, and VLA-hyperparameter responses use a separate 256 KiB
+encoded-response ceiling. Unpaginated registry list/search responses use an
+independent 4 MiB ceiling so the current catalog and normal growth fit without
+opening the general metadata limit.
+Batch completion accepts at most 256 prompts by default. The
+`maximumBatchPrompts` limit is checked before allocating per-prompt tasks,
+streams, or result state. Set it to the largest batch the application is designed
+to accept, and use a lower value on memory-constrained devices.
+Applications can tune `maximumWireMessageBytes`, `maximumOutboundPayloadBytes`,
+`maximumInlineBinaryBytes`, `maximumInlineBinaryItems`,
+`maximumBatchPrompts`, `maximumAccumulatedResultBytes`,
+`maximumVLAActionBytes`, `maximumMetadataResponseBytes`,
+`maximumRegistryResponseBytes`, and `maximumBufferedStreamBytes` for their model
+set and physical-device memory budget.
 
 ### Profiling
 
@@ -217,6 +244,7 @@ CI=true node tools/ci/package-manifest-mode.mjs --activate-development
 
 swift build -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
 tools/ci/run-unit-tests.sh
+tools/coverage/run.sh
 ```
 
 Run the example application after generating its Xcode project:
@@ -240,8 +268,9 @@ and SHA-256 and treat missing configuration or skipped tests as failures.
 - [Security model](Sources/QVACClient/Documentation.docc/Security.md)
 - [Transport protocol notes](docs/protocol-notes.md)
 - [Code generation](tools/codegen/README.md)
+- [Coverage policy and evidence](tools/coverage/README.md)
 - [Distribution and release](docs/distribution.md)
-- [Submission evidence](SUBMISSION.md)
+- [Engineering review record](SUBMISSION.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)
@@ -255,9 +284,11 @@ contracts, the worker bundle, and binary artifacts are checksum-verified in CI.
 See [`tools/provenance/qvac-sdk.lock.json`](tools/provenance/qvac-sdk.lock.json)
 for the source and package identities.
 
-The next binary release remains blocked until the native-license and Apple
-privacy-manifest reviews listed in [the release guide](docs/distribution.md) are
-complete. Designated maintainers own release and Swift Package Index publication.
+The next binary release remains blocked until both the native-license and Apple
+privacy-manifest reviews and the separate BareKit r2 engineering-activation
+requirements listed in [the release guide](docs/distribution.md) are complete.
+The artifact workflow rejects every publishing run while that gate is closed.
+Designated maintainers own release and Swift Package Index publication.
 
 ## License
 

@@ -2,7 +2,7 @@
 
 Notable changes to QVACClient are recorded here.
 
-## 0.2.0
+## [Unreleased]
 
 - Added finite per-request deadlines across unary, server-stream, and duplex
   operations.
@@ -10,10 +10,19 @@ Notable changes to QVACClient are recorded here.
 - Added generation-aware worker reconnection without replaying in-flight work.
 - Reworked public stream buffering to preserve producer batches, bound retained
   bytes, coalesce progress snapshots, and report lossless overflow explicitly.
+- Added independent inbound, outbound, inline-binary byte and item, accumulated
+  result, metadata-response, record, and stream-buffer limits, with checked
+  arithmetic and fail-fast validation for handshakes, media, and tensor operations.
+- Hardened macOS socket and iOS BareIPC teardown against accept, callback, write,
+  cancellation, and concurrent-close races.
 - Strengthened real-model, RAG, profiling, package-consumer, and iOS runtime tests.
+- Added fail-closed macOS and iOS source-coverage gates, exact test inventories,
+  macOS Address, Thread, and Undefined Behavior Sanitizer jobs, and a native and
+  Swift iOS Simulator Thread Sanitizer job.
 - Added publication checks for native-license provenance and Apple privacy
   manifests.
-- Reorganized user, contributor, release, and reviewer documentation.
+- Reorganized user, contributor, release, and reviewer documentation and removed
+  obsolete prototype sources and binaries from the distribution repository.
 
 ## 0.1.0
 

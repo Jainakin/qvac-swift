@@ -430,8 +430,10 @@ public extension QVACClient {
             name: "completion.toolCallStream",
             maximumBufferedBytes: maximumBufferedStreamBytes
         )
+        let initialResultBudget = makeResultByteBudget(operation: "completionStream")
 
         let final = Task<CompletionFinal, Error> {
+            var resultBudget = initialResultBudget
             var contentText = ""
             var thinkingText = ""
             var toolCalls: [CompletionToolCall] = []
@@ -479,6 +481,13 @@ public extension QVACClient {
                     var frameTokens: [String] = []
                     var frameToolCalls: [CompletionToolCall] = []
                     for event in parsedEvents {
+                        // Public event views have independent bounded queues. Charge
+                        // only values retained by the authoritative final aggregate;
+                        // raw deltas and tool diagnostics remain observable without
+                        // consuming a result budget they do not occupy.
+                        try resultBudget.consume(
+                            Self.retainedCompletionAggregateBytes(for: event)
+                        )
                         switch event {
                         case .contentDelta(_, let text):
                             contentText += text
@@ -500,6 +509,49 @@ public extension QVACClient {
                             break
                         }
                     }
+                    if frame.done == true {
+                        let validation = terminalValidation ?? .failure(
+                            QVACError.protocolViolation(
+                                "completionStream terminal validation was not captured"
+                            )
+                        )
+                        _ = try await Self.resolveResponseStreamTerminal(
+                            responses,
+                            operation: "completionStream"
+                        ) {
+                            try validation.get()
+                        }
+                        // The normalized assistant cache is an additional retained
+                        // string, not merely a view over `rawFullText`. Reserve its
+                        // worst-case UTF-8 storage before normalization allocates it
+                        // or the provisional terminal frame becomes observable.
+                        if terminalError == nil,
+                           stopReason != .cancelled,
+                           toolCalls.isEmpty {
+                            try resultBudget.consumeRetainedString(rawFullText ?? contentText)
+                        }
+                        // A terminal record is provisional until the same iterator
+                        // reaches transport EOF (possibly after profiling metadata).
+                        // Publish it only after the drain so a post-terminal domain
+                        // record cannot become externally observable before the
+                        // authoritative protocol violation.
+                        eventSink.yield(
+                            contentsOf: parsedEvents,
+                            estimatedBytes: estimatedFrameBytes
+                        )
+                        if stream {
+                            tokenSink.yield(
+                                contentsOf: frameTokens,
+                                estimatedBytes: estimatedFrameBytes
+                            )
+                            toolSink.yield(
+                                contentsOf: frameToolCalls,
+                                estimatedBytes: estimatedFrameBytes
+                            )
+                        }
+                        receivedTerminalFrame = true
+                        break
+                    }
                     eventSink.yield(
                         contentsOf: parsedEvents,
                         estimatedBytes: estimatedFrameBytes
@@ -514,21 +566,6 @@ public extension QVACClient {
                             estimatedBytes: estimatedFrameBytes
                         )
                     }
-                    if frame.done == true {
-                        let validation = terminalValidation ?? .failure(
-                            QVACError.protocolViolation(
-                                "completionStream terminal validation was not captured"
-                            )
-                        )
-                        _ = try await Self.resolveResponseStreamTerminal(
-                            responses,
-                            operation: "completionStream"
-                        ) {
-                            try validation.get()
-                        }
-                        receivedTerminalFrame = true
-                        break
-                    }
                 }
                 guard receivedTerminalFrame else {
                     throw QVACError.client(
@@ -536,10 +573,31 @@ public extension QVACClient {
                         message: "completionStream ended without a terminal done frame"
                     )
                 }
-                eventSink.finish()
-                tokenSink.finish()
-                toolSink.finish()
                 let fullText = rawFullText ?? contentText
+                if let terminalError {
+                    // The terminal failure/cancellation event is part of the public
+                    // event history even though the aggregate task rejects. End the
+                    // observational views normally before throwing so consumers can
+                    // drain that declared terminal record without receiving the same
+                    // semantic failure a second time from the sequence itself.
+                    eventSink.finish()
+                    tokenSink.finish()
+                    toolSink.finish()
+                    throw QVACError.server(.completionFailed, message: terminalError)
+                }
+                if stopReason == .cancelled {
+                    eventSink.finish()
+                    tokenSink.finish()
+                    toolSink.finish()
+                    throw QVACError.inferenceCancelled(
+                        requestId: requestId,
+                        partial: .init(
+                            text: contentText,
+                            toolCalls: toolCalls,
+                            stats: stats
+                        )
+                    )
+                }
                 let result = CompletionFinal(
                     contentText: contentText,
                     thinkingText: thinkingText.isEmpty ? nil : thinkingText,
@@ -551,19 +609,9 @@ public extension QVACClient {
                         ? Self.normalizeAssistantCacheContent(fullText)
                         : nil
                 )
-                if let terminalError {
-                    throw QVACError.server(.completionFailed, message: terminalError)
-                }
-                if stopReason == .cancelled {
-                    throw QVACError.inferenceCancelled(
-                        requestId: requestId,
-                        partial: .init(
-                            text: result.contentText,
-                            toolCalls: result.toolCalls,
-                            stats: result.stats
-                        )
-                    )
-                }
+                eventSink.finish()
+                tokenSink.finish()
+                toolSink.finish()
                 return result
             } catch {
                 eventSink.finish(throwing: error)
@@ -599,6 +647,46 @@ public extension QVACClient {
             options: .regularExpression
         )
         return unclosed.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Conservative retained-memory contribution of one completion event to the
+    /// eager `CompletionFinal`. Events that are only forwarded to bounded live
+    /// streams contribute zero.
+    internal static func retainedCompletionAggregateBytes(
+        for event: CompletionEvent
+    ) -> Int {
+        switch event {
+        case .contentDelta(_, let text), .thinkingDelta(_, let text):
+            return retainedStringAggregateAppendBytes(text)
+        case .toolCall(_, let call):
+            var total = QVACBufferedJSONRetainedSizeEstimator.saturatingMultiply(
+                MemoryLayout<CompletionToolCall>.stride,
+                2
+            )
+            for string in [call.id, call.name, call.raw].compactMap({ $0 }) {
+                total = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+                    total,
+                    retainedStringAggregateAppendBytes(string)
+                )
+            }
+            total = QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+                total,
+                QVACBufferedJSONRetainedSizeEstimator.estimate(.object(call.arguments))
+            )
+            return total
+        case .stats:
+            // The aggregate replaces a fixed-width value rather than appending.
+            return 0
+        case .done(_, _, let raw):
+            return raw.map(retainedStringAggregateAppendBytes) ?? 0
+        case .failure(_, let message, let raw):
+            return QVACBufferedJSONRetainedSizeEstimator.saturatingAdd(
+                retainedStringAggregateAppendBytes(message),
+                raw.map(retainedStringAggregateAppendBytes) ?? 0
+            )
+        case .rawDelta, .toolError:
+            return 0
+        }
     }
 
     /// Validate the executable 0.17 response-format schema at the rich API

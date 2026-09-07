@@ -60,3 +60,37 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.qvac.example.qvacchat.macos
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         ENABLE_HARDENED_RUNTIME: "NO"
+
+  QVACChatPhysicalDeviceTests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: QVACChat-iOS
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+        PRODUCT_BUNDLE_IDENTIFIER: com.qvac.example.qvacchat.physicaluitests
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+
+schemes:
+  QVACChat-iOS:
+    build:
+      targets:
+        QVACChat-iOS: all
+    run:
+      config: Debug
+
+  QVACChat-PhysicalDevice:
+    build:
+      targets:
+        QVACChat-iOS: all
+        QVACChatPhysicalDeviceTests:
+          - test
+    test:
+      gatherCoverageData: false
+      targets:
+        - name: QVACChatPhysicalDeviceTests
+          parallelizable: false
+          randomExecutionOrder: false

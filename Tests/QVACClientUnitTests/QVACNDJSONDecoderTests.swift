@@ -54,6 +54,38 @@ final class QVACNDJSONDecoderTests: XCTestCase {
         }
     }
 
+    func test_receive_rejects_cross_chunk_overflow_before_mutating_retained_record() throws {
+        var decoder = QVACNDJSONDecoder(maximumRecordBytes: 4)
+        try decoder.receive(Data("123".utf8))
+
+        XCTAssertThrowsError(try decoder.receive(Data("45".utf8))) { error in
+            XCTAssertEqual(error as? QVACNDJSONError, .recordTooLarge(limit: 4))
+        }
+
+        // The rejected chunk must not be retained. The original three-byte prefix
+        // can still be completed exactly at the limit and decoded unchanged.
+        try decoder.receive(Data("4\n".utf8))
+        XCTAssertEqual(try decoder.nextRecord(), Data("1234".utf8))
+        XCTAssertNil(try decoder.nextRecord())
+    }
+
+    func test_receive_validates_large_coalesced_chunks_transactionally() throws {
+        var valid = QVACNDJSONDecoder(maximumRecordBytes: 4)
+        try valid.receive(Data("1234\n1\n2345".utf8))
+        XCTAssertEqual(
+            try valid.finish().map { String(decoding: $0, as: UTF8.self) },
+            ["1234", "1", "2345"]
+        )
+
+        var invalid = QVACNDJSONDecoder(maximumRecordBytes: 4)
+        XCTAssertThrowsError(try invalid.receive(Data("ok\n12345\ntail".utf8))) { error in
+            XCTAssertEqual(error as? QVACNDJSONError, .recordTooLarge(limit: 4))
+        }
+        try invalid.receive(Data("safe\n".utf8))
+        XCTAssertEqual(try invalid.nextRecord(), Data("safe".utf8))
+        XCTAssertNil(try invalid.nextRecord())
+    }
+
     func test_profiling_trailer_requires_top_level_json_boolean_true() {
         XCTAssertTrue(QVACNDJSONDecoder.isProfilingTrailer(Data(
             #"{"__profilingTrailer":true,"__profiling":{"elapsedMs":12}}"#.utf8

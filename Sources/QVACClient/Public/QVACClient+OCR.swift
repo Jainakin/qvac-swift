@@ -55,6 +55,8 @@ public extension QVACClient {
     final class OCRRun: @unchecked Sendable {
         /// One block array per worker frame, retained as byte-bounded atomic batches.
         public let blockStream: QVACBufferedStream<[OCRTextBlock]>
+        /// Complete non-streaming block aggregation. Decoded structure and collection
+        /// overhead are charged against `maximumAccumulatedResultBytes` per record.
         public let blocks: Task<[OCRTextBlock], Error>
         public let stats: Task<OCRStats?, Error>
         private let processing: Task<[OCRTextBlock], Error>
@@ -105,6 +107,7 @@ public extension QVACClient {
         stream: Bool = false,
         rpcOptions: QVACRPCOptions = .init()
     ) async throws -> OCRRun {
+        try validateBase64InputSizes([imageBytes.count], operation: "ocr")
         return try await ocrInternal(
             modelId: modelId,
             imageValue: .object(["type": .string("base64"), "value": .string(imageBytes.base64EncodedString())]),
@@ -135,7 +138,9 @@ public extension QVACClient {
         )
         if !stream { blockCont.finish() }
         let statsBox = ResultBox<OCRStats?>()
+        let initialResultBudget = makeResultByteBudget(operation: "ocrStream")
         let processing = Task<[OCRTextBlock], Error> {
+            var resultBudget = initialResultBudget
             var collected: [OCRTextBlock] = []
             do {
                 let responses = QVACResponseStreamIteratorBox(responseStream)
@@ -159,6 +164,18 @@ public extension QVACClient {
                     // omit `done`. Retain terminal validation as a Result, drain the
                     // exact iterator (capturing profiling), and only then expose it.
                     if r.done == true || r.error != nil {
+                        if !stream,
+                           r.error == nil,
+                           let terminalWireBlocks = r.blocks,
+                           !terminalWireBlocks.isEmpty {
+                            try resultBudget.consume(
+                                Self.conservativeBufferedJSONBytes(
+                                    terminalWireBlocks,
+                                    elementCount: terminalWireBlocks.count,
+                                    fallback: Int.max
+                                )
+                            )
+                        }
                         let terminal = try await Self.resolveResponseStreamTerminal(
                             responses,
                             operation: "ocrStream"
@@ -185,7 +202,10 @@ public extension QVACClient {
                         } else {
                             collected.append(contentsOf: terminal.blocks)
                         }
-                        if r.stats != nil { statsBox.set(terminal.stats) }
+                        // QVAC 0.17 treats only the done frame's stats as
+                        // authoritative. An omitted terminal value clears any
+                        // provisional nonterminal snapshot.
+                        statsBox.set(terminal.stats)
                         blockCont.finish()
                         return stream ? [] : collected
                     }
@@ -203,7 +223,14 @@ public extension QVACClient {
                                     )
                                 )
                             }
-                        } else {
+                        } else if !blocks.isEmpty {
+                            try resultBudget.consume(
+                                Self.conservativeBufferedJSONBytes(
+                                    wireBlocks,
+                                    elementCount: blocks.count,
+                                    fallback: Int.max
+                                )
+                            )
                             collected.append(contentsOf: blocks)
                         }
                     }

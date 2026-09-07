@@ -6,8 +6,8 @@
 set -euo pipefail
 
 readonly MODULE="QVACClientUnitTests"
-readonly EXPECTED_TEST_COUNT=326
-readonly EXPECTED_INVENTORY_SHA256="6b21abc73fec49b52d1b6d57af836ae268fea905a116fae123e5a7effd38da2b"
+readonly EXPECTED_TEST_COUNT=620
+readonly EXPECTED_INVENTORY_SHA256="a251633a8f990fb260dcd283a3dbed2fae389047049129f55832680030cede64"
 readonly SWIFTC_FLAGS=(
     -Xswiftc -warnings-as-errors
     -Xswiftc -strict-concurrency=complete
@@ -15,9 +15,14 @@ readonly SWIFTC_FLAGS=(
 QVAC_CI_TEMP_DIR=""
 
 cleanup() {
+    local status="$?"
     if [[ -n "$QVAC_CI_TEMP_DIR" ]]; then
         rm -rf -- "$QVAC_CI_TEMP_DIR"
     fi
+    # Bash 3.2 can otherwise replace an early `set -u`/execution failure with
+    # the successful status of the cleanup command.
+    trap - EXIT
+    exit "$status"
 }
 trap cleanup EXIT
 
@@ -293,16 +298,44 @@ self_test() {
 
 if [[ "${1:-}" == "--self-test" ]]; then
     if [[ "$#" != "1" ]]; then
-        reject "usage: $0 [--self-test]"
-        exit 2
+        reject "usage: $0 [--self-test | --sanitize=address | --sanitize=thread | --sanitize=undefined]" || exit 2
     fi
     self_test
     exit 0
 fi
-if [[ "$#" != "0" ]]; then
-    reject "usage: $0 [--self-test]"
-    exit 2
+SANITIZER=""
+TEST_MODE="standard"
+if [[ "$#" == "1" ]]; then
+    case "$1" in
+        --sanitize=address)
+            SANITIZER="address"
+            TEST_MODE="Address Sanitizer"
+            ;;
+        --sanitize=thread)
+            SANITIZER="thread"
+            TEST_MODE="Thread Sanitizer"
+            ;;
+        --sanitize=undefined)
+            SANITIZER="undefined"
+            TEST_MODE="Undefined Behavior Sanitizer"
+            ;;
+        *)
+            reject "usage: $0 [--self-test | --sanitize=address | --sanitize=thread | --sanitize=undefined]" || exit 2
+            ;;
+    esac
+elif [[ "$#" != "0" ]]; then
+    reject "usage: $0 [--self-test | --sanitize=address | --sanitize=thread | --sanitize=undefined]" || exit 2
 fi
+readonly SANITIZER
+readonly TEST_MODE
+
+run_swift_test() {
+    if [[ -n "$SANITIZER" ]]; then
+        swift test "--sanitize=$SANITIZER" "$@"
+    else
+        swift test "$@"
+    fi
+}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -317,16 +350,17 @@ PASSED="$QVAC_CI_TEMP_DIR/unit-passed.txt"
 cd "$REPOSITORY_ROOT"
 validate_reviewed_inventory \
     "$REVIEWED_INVENTORY" "$MODULE" "$EXPECTED_TEST_COUNT" "$EXPECTED_INVENTORY_SHA256"
-swift test "${SWIFTC_FLAGS[@]}" list > "$LISTING"
+run_swift_test "${SWIFTC_FLAGS[@]}" list > "$LISTING"
 build_expected_inventory \
     "$LISTING" "$MODULE" "$EXPECTED_TEST_COUNT" "$DISCOVERED_INVENTORY"
 compare_to_reviewed_inventory \
     "$DISCOVERED_INVENTORY" "$REVIEWED_INVENTORY" "swift test list"
-printf '[unit-tests] verified committed inventory: module=%s tests=%s sha256=%s\n' \
-    "$MODULE" "$EXPECTED_TEST_COUNT" "$EXPECTED_INVENTORY_SHA256"
+printf '[unit-tests] verified committed inventory: module=%s tests=%s sha256=%s mode=%s\n' \
+    "$MODULE" "$EXPECTED_TEST_COUNT" "$EXPECTED_INVENTORY_SHA256" "$TEST_MODE"
 
-swift test "${SWIFTC_FLAGS[@]}" --filter "^${MODULE}\\." 2>&1 | tee "$OUTPUT"
+run_swift_test "${SWIFTC_FLAGS[@]}" \
+    --filter "^${MODULE}\\." 2>&1 | tee "$OUTPUT"
 verify_execution \
     "$OUTPUT" "$MODULE" "$EXPECTED_TEST_COUNT" "$REVIEWED_INVENTORY" "$STARTED" "$PASSED"
-printf '[unit-tests] verified %s: exactly %s executed, zero failures, zero skips\n' \
-    "$MODULE" "$EXPECTED_TEST_COUNT"
+printf '[unit-tests] verified %s: exactly %s executed, zero failures, zero skips (%s)\n' \
+    "$MODULE" "$EXPECTED_TEST_COUNT" "$TEST_MODE"

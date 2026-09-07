@@ -95,6 +95,212 @@ jobs:
           node tools/release/generate-third-party-notices.mjs --self-test
           node tools/release/verify-privacy-manifests.mjs --check
           node tools/release/verify-privacy-manifests.mjs --self-test
+          node tools/native/bare-kit/verify.mjs --check
+          tools/native/bare-kit/build-candidate.sh --self-test
+
+  barekit-candidate:
+    name: BareKit r2 candidate · non-publishing
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            tools/native/bare-kit/package-lock.json
+            tools/runtime/package-lock.json
+      - name: Build and verify the BareKit r2 candidate
+        run: tools/native/bare-kit/build-candidate.sh
+      - name: Install checksum-pinned XcodeGen
+        run: |
+          XCODEGEN_VERSION=2.46.0
+          XCODEGEN_SHA256=4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
+          XCODEGEN_ARCHIVE="$RUNNER_TEMP/xcodegen-$XCODEGEN_VERSION.zip"
+          XCODEGEN_ROOT="$RUNNER_TEMP/xcodegen-$XCODEGEN_VERSION"
+          curl --fail --location --silent --show-error \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --max-time 300 \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/$XCODEGEN_VERSION/xcodegen.zip" \
+            --output "$XCODEGEN_ARCHIVE"
+          printf '%s  %s\n' "$XCODEGEN_SHA256" "$XCODEGEN_ARCHIVE" | shasum -a 256 -c -
+          mkdir -p "$XCODEGEN_ROOT"
+          ditto -x -k "$XCODEGEN_ARCHIVE" "$XCODEGEN_ROOT"
+          QVAC_XCODEGEN="$XCODEGEN_ROOT/xcodegen/bin/xcodegen"
+          test -x "$QVAC_XCODEGEN"
+          test "$("$QVAC_XCODEGEN" --version)" = "Version: $XCODEGEN_VERSION"
+          echo "QVAC_XCODEGEN=$QVAC_XCODEGEN" >> "$GITHUB_ENV"
+      - name: Verify the exact-inventory iOS test-log gate
+        run: node tools/ci/verify-ios-test-log.mjs --self-test
+      - name: Validate the candidate through the complete iOS transport suite
+        run: |
+          cp Package.swift "$RUNNER_TEMP/Package.swift.canonical"
+          restore_package_manifest() {
+            cp "$RUNNER_TEMP/Package.swift.canonical" Package.swift
+          }
+          trap restore_package_manifest EXIT
+
+          QVAC_BARE_KIT_CANDIDATE="$GITHUB_WORKSPACE/tools/native/bare-kit/.build/BareKit.xcframework" \
+            tools/runtime/link-ios-artifacts.sh
+          node tools/ci/package-manifest-mode.mjs --activate-development
+          swift package dump-package >/dev/null
+
+          xcodebuild -scheme QVACClient \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/qvac-barekit-r2-device-dd" \
+            CODE_SIGNING_ALLOWED=NO \
+            SWIFT_SUPPRESS_WARNINGS=NO \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
+            build 2>&1 | tee "$RUNNER_TEMP/qvac-barekit-r2-device.log"
+
+          tools/coverage/run-ios-transport.sh --self-test
+          (
+            cd Tests/QVACiOSSmokeHarness
+            xcodebuild -scheme QVACiOSSmokeHarness-Package \
+              -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
+              -derivedDataPath "$RUNNER_TEMP/qvac-barekit-r2-ios-dd" \
+              CODE_SIGNING_ALLOWED=NO \
+              -parallel-testing-enabled NO \
+              -enableCodeCoverage YES \
+              SWIFT_SUPPRESS_WARNINGS=NO \
+              SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+              OTHER_SWIFT_FLAGS='-strict-concurrency=complete -profile-generate -profile-coverage-mapping' \
+              -resultBundlePath "$RUNNER_TEMP/qvac-barekit-r2-ios.xcresult" \
+              -only-testing:QVACiOSSmokeTests \
+              test
+          ) 2>&1 | tee "$RUNNER_TEMP/qvac-barekit-r2-ios.log"
+          tools/coverage/run-ios-transport.sh \
+            "$RUNNER_TEMP/qvac-barekit-r2-ios-dd" \
+            "$RUNNER_TEMP/qvac-barekit-r2-ios.log" \
+            "$RUNNER_TEMP/qvac-barekit-r2-ios-coverage"
+          cat "$RUNNER_TEMP/qvac-barekit-r2-ios-coverage/ios-transport-coverage-summary.md" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          (
+            cd Examples/QVACChat
+            "$QVAC_XCODEGEN" generate
+            xcodebuild -project QVACChat.xcodeproj -scheme QVACChat-iOS \
+              -destination 'generic/platform=iOS Simulator' \
+              -derivedDataPath "$RUNNER_TEMP/qvac-barekit-r2-example-dd" \
+              SWIFT_SUPPRESS_WARNINGS=NO \
+              SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+              OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
+              build
+          ) 2>&1 | tee "$RUNNER_TEMP/qvac-barekit-r2-example.log"
+
+          restore_package_manifest
+          trap - EXIT
+          git diff --exit-code -- Package.swift
+      - name: Upload candidate and validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bare-kit-r2-candidate-${{ github.sha }}
+          path: |
+            tools/native/bare-kit/.build/BareKit.xcframework
+            tools/native/bare-kit/.build/bare-kit-native-closure.json
+            tools/native/bare-kit/bare-kit-2.3.0-qvac.patch
+            tools/native/bare-kit/provenance.lock.json
+            ${{ runner.temp }}/qvac-barekit-r2-device.log
+            ${{ runner.temp }}/qvac-barekit-r2-ios.log
+            ${{ runner.temp }}/qvac-barekit-r2-ios.xcresult
+            ${{ runner.temp }}/qvac-barekit-r2-ios-coverage
+            ${{ runner.temp }}/qvac-barekit-r2-example.log
+          if-no-files-found: error
+          retention-days: 30
+
+  barekit-native-tsan:
+    name: BareKit r2 native-source + Swift TSan · non-publishing
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            tools/native/bare-kit/package-lock.json
+            tools/runtime/package-lock.json
+      - name: Verify native and exact-test evidence gates
+        run: |
+          node tools/native/bare-kit/verify.mjs --self-test
+          node tools/ci/verify-ios-test-log.mjs --self-test
+      - name: Stage the pinned runtime dependency closure
+        run: tools/runtime/link-ios-artifacts.sh
+      - name: Build the simulator-only native Thread Sanitizer artifact
+        run: |
+          tools/native/bare-kit/build-candidate.sh --thread-sanitizer-simulator \
+            2>&1 | tee "$RUNNER_TEMP/qvac-barekit-r2-native-tsan-build.log"
+      - name: Run the exact iOS inventory with BareKit-source and Swift instrumentation
+        run: |
+          cp Package.swift "$RUNNER_TEMP/Package.swift.canonical"
+          restore_package_manifest() {
+            cp "$RUNNER_TEMP/Package.swift.canonical" Package.swift
+          }
+          trap restore_package_manifest EXIT
+
+          TSAN_CANDIDATE="$GITHUB_WORKSPACE/tools/native/bare-kit/.build/tsan/BareKit.xcframework"
+          STAGED_BARE_KIT="$GITHUB_WORKSPACE/tools/runtime/.build/artifacts/BareKit.xcframework"
+          test -d "$TSAN_CANDIDATE"
+          test -d "$STAGED_BARE_KIT"
+          rm -rf "$STAGED_BARE_KIT"
+          cp -R "$TSAN_CANDIDATE" "$STAGED_BARE_KIT"
+          diff --recursive --brief "$TSAN_CANDIDATE" "$STAGED_BARE_KIT"
+
+          node tools/native/bare-kit/verify.mjs \
+            --thread-sanitizer-artifact "$STAGED_BARE_KIT" \
+            --compile-commands "$GITHUB_WORKSPACE/tools/native/bare-kit/.build/tsan/source/build/compile_commands.json" \
+            --source-root "$GITHUB_WORKSPACE/tools/native/bare-kit/.build/tsan/source" \
+            | tee "$RUNNER_TEMP/qvac-barekit-r2-ios-tsan.log"
+          node tools/ci/package-manifest-mode.mjs --activate-development
+          swift package dump-package >/dev/null
+
+          (
+            cd Tests/QVACiOSSmokeHarness
+            TSAN_OPTIONS='halt_on_error=1:exitcode=66' \
+              xcodebuild -scheme QVACiOSSmokeHarness-Package \
+                -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
+                -derivedDataPath "$RUNNER_TEMP/qvac-barekit-r2-ios-tsan-dd" \
+                CODE_SIGNING_ALLOWED=NO \
+                -parallel-testing-enabled NO \
+                -enableThreadSanitizer YES \
+                SWIFT_SUPPRESS_WARNINGS=NO \
+                SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+                OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
+                -resultBundlePath "$RUNNER_TEMP/qvac-barekit-r2-ios-tsan.xcresult" \
+                -only-testing:QVACiOSSmokeTests \
+                test
+          ) 2>&1 | tee -a "$RUNNER_TEMP/qvac-barekit-r2-ios-tsan.log"
+          node tools/ci/verify-ios-test-log.mjs \
+            --thread-sanitizer "$RUNNER_TEMP/qvac-barekit-r2-ios-tsan.log" \
+            | tee "$RUNNER_TEMP/qvac-barekit-r2-ios-tsan-verification.txt"
+
+          restore_package_manifest
+          trap - EXIT
+          git diff --exit-code -- Package.swift
+      - name: Upload native Thread Sanitizer evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bare-kit-r2-native-tsan-${{ github.sha }}
+          path: |
+            tools/native/bare-kit/.build/tsan/BareKit.xcframework
+            tools/native/bare-kit/.build/tsan/bare-kit-tsan-evidence.json
+            tools/native/bare-kit/.build/tsan/evidence/ios-arm64-simulator.json
+            tools/native/bare-kit/.build/tsan/source/build/compile_commands.json
+            tools/native/bare-kit/bare-kit-2.3.0-qvac.patch
+            tools/native/bare-kit/provenance.lock.json
+            ${{ runner.temp }}/qvac-barekit-r2-native-tsan-build.log
+            ${{ runner.temp }}/qvac-barekit-r2-ios-tsan.log
+            ${{ runner.temp }}/qvac-barekit-r2-ios-tsan.xcresult
+            ${{ runner.temp }}/qvac-barekit-r2-ios-tsan-verification.txt
+          if-no-files-found: error
+          retention-days: 30
 
   unit:
     name: Unit tests · macOS arm64
@@ -128,6 +334,116 @@ jobs:
           swift package dump-package >/dev/null
           swift build -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete
           tools/ci/run-unit-tests.sh
+
+  coverage:
+    name: First-party coverage gate · macOS arm64
+    runs-on: macos-15
+    needs: [codegen]
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/runtime/package-lock.json
+      - name: Prepare local binary dependencies
+        run: |
+          tools/runtime/link-ios-artifacts.sh
+          node tools/ci/package-manifest-mode.mjs --activate-development
+      - name: Run fail-closed first-party coverage gate
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(xcodebuild -version)" = $'Xcode 16.4\nBuild version 16F6'
+          tools/coverage/run.sh --self-test
+          set +e
+          tools/coverage/run.sh "$RUNNER_TEMP/qvac-coverage"
+          STATUS="$?"
+          set -e
+          if [ -f "$RUNNER_TEMP/qvac-coverage/coverage-summary.md" ]; then
+            cat "$RUNNER_TEMP/qvac-coverage/coverage-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$STATUS"
+      - name: Upload coverage evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: first-party-coverage-${{ github.sha }}
+          path: ${{ runner.temp }}/qvac-coverage
+          if-no-files-found: error
+          retention-days: 30
+
+  thread-sanitizer:
+    name: Thread Sanitizer · macOS arm64
+    runs-on: macos-15
+    needs: [codegen]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/runtime/package-lock.json
+      - name: Prepare local binary dependencies
+        run: |
+          tools/runtime/link-ios-artifacts.sh
+          node tools/ci/package-manifest-mode.mjs --activate-development
+      - name: Run complete reviewed unit inventory under Thread Sanitizer
+        env:
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(xcodebuild -version)" = $'Xcode 16.4\nBuild version 16F6'
+          tools/ci/run-unit-tests.sh --sanitize=thread
+
+  address-sanitizer:
+    name: Address Sanitizer · macOS arm64
+    runs-on: macos-15
+    needs: [codegen]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/runtime/package-lock.json
+      - name: Prepare local binary dependencies
+        run: |
+          tools/runtime/link-ios-artifacts.sh
+          node tools/ci/package-manifest-mode.mjs --activate-development
+      - name: Run complete reviewed unit inventory under Address Sanitizer
+        env:
+          ASAN_OPTIONS: halt_on_error=1:exitcode=67
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(xcodebuild -version)" = $'Xcode 16.4\nBuild version 16F6'
+          tools/ci/run-unit-tests.sh --sanitize=address
+
+  undefined-behavior-sanitizer:
+    name: Undefined Behavior Sanitizer · macOS arm64
+    runs-on: macos-15
+    needs: [codegen]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.QVAC_NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/runtime/package-lock.json
+      - name: Prepare local binary dependencies
+        run: |
+          tools/runtime/link-ios-artifacts.sh
+          node tools/ci/package-manifest-mode.mjs --activate-development
+      - name: Run complete reviewed unit inventory under Undefined Behavior Sanitizer
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1:exitcode=68
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(xcodebuild -version)" = $'Xcode 16.4\nBuild version 16F6'
+          tools/ci/run-unit-tests.sh --sanitize=undefined
 
   documentation:
     name: Documentation
@@ -167,6 +483,7 @@ jobs:
           xcodebuild docbuild -scheme QVACClient \
             -destination 'platform=macOS' \
             -derivedDataPath "$RUNNER_TEMP/qvac-docc-dd" \
+            SWIFT_SUPPRESS_WARNINGS=NO \
             SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
             OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
             OTHER_DOCC_FLAGS='--warnings-as-errors'
@@ -296,39 +613,58 @@ jobs:
         run: |
           swift package dump-package >/dev/null
           git diff --exit-code -- Sources Tests
+          # Xcode-generated SwiftPM targets suppress warnings by default. Clear
+          # that setting before enabling warnings-as-errors to avoid passing the
+          # Swift compiler both -suppress-warnings and -warnings-as-errors.
           xcodebuild -scheme QVACClient \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/qvac-package-device-dd" \
-            CODE_SIGNING_ALLOWED=NO build
+            CODE_SIGNING_ALLOWED=NO \
+            SWIFT_SUPPRESS_WARNINGS=NO \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
+            build
           xcodebuild -scheme QVACClient \
             -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath "$RUNNER_TEMP/qvac-package-dd" build
-      - name: Run iOS Simulator worker test
+            -derivedDataPath "$RUNNER_TEMP/qvac-package-dd" \
+            SWIFT_SUPPRESS_WARNINGS=NO \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
+            build
+      - name: Run complete iOS transport suite with source coverage
         working-directory: Tests/QVACiOSSmokeHarness
         run: |
           swift package dump-package >/dev/null
+          ../../tools/coverage/run-ios-transport.sh --self-test
           xcodebuild -scheme QVACiOSSmokeHarness-Package \
             -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
             -derivedDataPath "$RUNNER_TEMP/qvac-ios-smoke-dd" \
             CODE_SIGNING_ALLOWED=NO \
             -parallel-testing-enabled NO \
-            -only-testing:QVACiOSSmokeTests/QVACiOSSmokeTests/testBundledWorkerHandshakeHeartbeatAndIdempotentClose \
+            -enableCodeCoverage YES \
+            SWIFT_SUPPRESS_WARNINGS=NO \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            OTHER_SWIFT_FLAGS='-strict-concurrency=complete -profile-generate -profile-coverage-mapping' \
+            -resultBundlePath "$RUNNER_TEMP/qvac-ios-smoke.xcresult" \
+            -only-testing:QVACiOSSmokeTests \
             test 2>&1 | tee "$RUNNER_TEMP/qvac-ios-smoke.log"
-          ../../tools/ci/assert-ios-smoke-log.sh \
+          ../../tools/coverage/run-ios-transport.sh \
+            "$RUNNER_TEMP/qvac-ios-smoke-dd" \
             "$RUNNER_TEMP/qvac-ios-smoke.log" \
-            QVACiOSSmokeTests
-          xcodebuild -scheme QVACiOSSmokeHarness-Package \
-            -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
-            -derivedDataPath "$RUNNER_TEMP/qvac-ios-smoke-dd" \
-            CODE_SIGNING_ALLOWED=NO \
-            -parallel-testing-enabled NO \
-            -only-testing:QVACiOSSmokeTests/BareIPCReadableDrainTests/testResponseBytesAreDeliveredBeforeObservableZeroByteEOF \
-            test 2>&1 | tee "$RUNNER_TEMP/qvac-ios-eof-adapter.log"
-          ../../tools/ci/assert-ios-smoke-log.sh \
-            "$RUNNER_TEMP/qvac-ios-eof-adapter.log" \
-            QVACiOSSmokeTests \
-            BareIPCReadableDrainTests \
-            testResponseBytesAreDeliveredBeforeObservableZeroByteEOF
+            "$RUNNER_TEMP/qvac-ios-transport-coverage"
+          cat "$RUNNER_TEMP/qvac-ios-transport-coverage/ios-transport-coverage-summary.md" \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload iOS transport coverage evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ios-transport-coverage-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/qvac-ios-smoke.xcresult
+            ${{ runner.temp }}/qvac-ios-smoke.log
+            ${{ runner.temp }}/qvac-ios-transport-coverage
+          if-no-files-found: error
+          retention-days: 30
       - name: Install checksum-pinned XcodeGen
         run: |
           XCODEGEN_VERSION=2.46.0
@@ -355,10 +691,18 @@ jobs:
           "$QVAC_XCODEGEN" generate
           xcodebuild -project QVACChat.xcodeproj -scheme QVACChat-iOS \
             -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath "$RUNNER_TEMP/qvac-chat-ios-dd" build
+            -derivedDataPath "$RUNNER_TEMP/qvac-chat-ios-dd" \
+            SWIFT_SUPPRESS_WARNINGS=NO \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
+            build
           xcodebuild -project QVACChat.xcodeproj -scheme QVACChat-macOS \
             -destination 'platform=macOS' \
-            -derivedDataPath "$RUNNER_TEMP/qvac-chat-macos-dd" build
+            -derivedDataPath "$RUNNER_TEMP/qvac-chat-macos-dd" \
+            SWIFT_SUPPRESS_WARNINGS=NO \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
+            build
 
   ios17-url-runtime:
     name: iOS 17 package integration
@@ -488,6 +832,9 @@ jobs:
                 -destination-timeout 180 \
                 -derivedDataPath "$RUNNER_TEMP/qvac-ios17-candidate-dd" \
                 -parallel-testing-enabled NO \
+                SWIFT_SUPPRESS_WARNINGS=NO \
+                SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+                OTHER_SWIFT_FLAGS='-strict-concurrency=complete' \
                 -only-testing:QVACiOSSmokeTests/QVACiOSSmokeTests/testBundledWorkerHandshakeHeartbeatAndIdempotentClose \
                 -resultBundlePath "$RUNNER_TEMP/qvac-ios17-runtime.xcresult" \
                 test

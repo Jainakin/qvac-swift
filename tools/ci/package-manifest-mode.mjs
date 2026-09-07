@@ -164,6 +164,24 @@ function releaseEvidence(releaseBase, sdk) {
       sha256: checksum('sdk-provenance'),
       url: `${releaseBase}qvac-sdk-provenance.json`,
     },
+    bareKitPatch: {
+      assetName: 'bare-kit-2.3.0-qvac.patch',
+      size: 1,
+      sha256: checksum('bare-kit-patch'),
+      url: `${releaseBase}bare-kit-2.3.0-qvac.patch`,
+    },
+    bareKitProvenance: {
+      assetName: 'bare-kit-patch-provenance.json',
+      size: 1,
+      sha256: checksum('bare-kit-provenance'),
+      url: `${releaseBase}bare-kit-patch-provenance.json`,
+    },
+    bareKitNativeClosure: {
+      assetName: 'bare-kit-native-closure.json',
+      size: 1,
+      sha256: checksum('bare-kit-native-closure'),
+      url: `${releaseBase}bare-kit-native-closure.json`,
+    },
   }
 }
 

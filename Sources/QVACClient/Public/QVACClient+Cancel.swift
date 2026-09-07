@@ -35,7 +35,7 @@ public extension QVACClient {
         guard case .cancel(let result) = response else {
             throw QVACError.protocolViolation("expected cancel response, got \(response.discriminator)")
         }
-        if result.success == false {
+        if result.error != nil || result.success == false {
             throw QVACError.server(.cancelFailed, message: result.error)
         }
         return CancelAcknowledgement(cancelled: result.cancelled)

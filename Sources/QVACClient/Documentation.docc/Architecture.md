@@ -24,14 +24,16 @@ factory; operation implementations share one path.
 ## Startup and shutdown
 
 Construction starts the transport and performs the `__init_config` handshake.
-Both startup and the handshake have finite deadlines.
+Both startup and the handshake have finite deadlines, and the handshake payload
+is checked against the outbound byte ceiling before its first transport write.
 
 EOF, a read error, or a write failure ends the current connection. In-flight
 operations fail once and are never replayed. A later call starts one shared
 reconnect attempt and repeats the handshake; callers that crossed the connection
 boundary receive ``QVACError/connectionReset``. The replacement worker has no
 loaded models or in-memory session state, so applications must restore that state
-before retrying. Calling `close()` disables reconnection.
+before retrying. Replacement handshakes use the same outbound ceiling as initial
+startup. Calling `close()` disables reconnection.
 
 macOS observes worker exit through socket EOF. iOS can reconnect after BareIPC
 reports EOF or a write failure, but BareKit may not expose every worklet exit. A
@@ -92,10 +94,20 @@ loop early, dropping its iterator, cancelling the consuming task, or calling
 value remains retained. Normal remote completion releases the same state without
 emitting a redundant destroy frame.
 
-The 256 MiB default wire ceiling accommodates current video/upscale records, but
-base64 JSON and `Data` conversion can temporarily multiply peak memory. Applications
-should select a lower limit when their supported models cannot legitimately emit
-large media.
+The 256 MiB default inbound wire ceiling accommodates current video/upscale
+records. A separate 48 MiB outbound ceiling bounds encoded requests and duplex
+chunks, and binary convenience APIs preflight a 24 MiB aggregate raw-input limit
+plus a 1,024-item ceiling before base64 conversion. Eager cross-record results,
+small metadata/control responses, unpaginated registry responses, and VLA
+decoded actions use separate finite budgets. Their defaults are respectively the
+wire ceiling, 256 KiB, 4 MiB, and 8 MiB, with every specialized limit clamped to
+the applicable client-wide bounds. Batch completion also rejects more than
+`maximumBatchPrompts` prompts (256 by default) before creating per-prompt tasks,
+streams, or result state.
+Because base64 JSON and `Data` conversion can still temporarily multiply peak
+memory, applications should select lower limits when their supported models
+cannot legitimately consume or emit large media. Size `maximumBatchPrompts` to
+the largest supported batch and lower it for memory-constrained deployments.
 
 ## Deadlines and cancellation
 

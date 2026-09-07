@@ -24,7 +24,8 @@ export function validateReleaseManifest(manifest) {
       fail(`schema v2 is accepted only for immutable ${legacyArtifactTag} at ${legacySourceCommit}`)
     }
     if (manifest.runtimeResolutionInventory !== undefined || manifest.sdkProvenance !== undefined
-        || manifest.privacyAudit !== undefined) {
+        || manifest.privacyAudit !== undefined || manifest.bareKitPatch !== undefined
+        || manifest.bareKitProvenance !== undefined || manifest.bareKitNativeClosure !== undefined) {
       fail('historical schema v2 must not claim schema-v3 evidence bindings')
     }
   } else if (manifest.schemaVersion === 3) {
@@ -113,6 +114,24 @@ export function validateReleaseManifest(manifest) {
       16 * 1024 * 1024,
     )
     validateBoundAsset(manifest.sdkProvenance, 'qvac-sdk-provenance.json', 'SDK provenance', 16 * 1024 * 1024)
+    validateBoundAsset(
+      manifest.bareKitPatch,
+      'bare-kit-2.3.0-qvac.patch',
+      'BareKit patch',
+      1024 * 1024,
+    )
+    validateBoundAsset(
+      manifest.bareKitProvenance,
+      'bare-kit-patch-provenance.json',
+      'BareKit provenance',
+      16 * 1024 * 1024,
+    )
+    validateBoundAsset(
+      manifest.bareKitNativeClosure,
+      'bare-kit-native-closure.json',
+      'BareKit native closure',
+      16 * 1024 * 1024,
+    )
     if (runtimeResolutionInventory.sha256 !== manifest.sdk.runtimeInventorySHA256) {
       fail('runtime resolution inventory checksum does not match sdk.runtimeInventorySHA256')
     }
@@ -252,7 +271,8 @@ export function renderDevelopmentPackageManifest(manifest) {
 // QVAC Swift Client — exact SDK 0.17.0 development manifest.
 // Generated from tools/release/artifacts.development.json. Run
 // tools/runtime/link-ios-artifacts.sh before local iOS builds. Release tags must
-// use the URL manifest generated only after immutable artifacts are published.
+// use the URL manifest generated from a verified non-publishing candidate and
+// committed before its matching immutable artifacts are published.
 
 import PackageDescription
 
