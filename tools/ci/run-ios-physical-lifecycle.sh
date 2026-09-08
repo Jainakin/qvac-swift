@@ -34,6 +34,12 @@ fail() {
     exit 1
 }
 
+canonical_directory() {
+    local directory="$1"
+    [[ -d "$directory" && ! -L "$directory" ]] || return 1
+    (cd -P "$directory" && pwd -P)
+}
+
 WORK_ROOT=""
 RUN_COMPLETED=false
 cleanup() {
@@ -65,6 +71,9 @@ if [[ "${1:-}" == "--internal-self-test-nounset-cleanup" ]]; then
     if [[ ! -d "$WORK_ROOT" || -L "$WORK_ROOT" ]]; then
         exit 3
     fi
+    if ! WORK_ROOT="$(canonical_directory "$WORK_ROOT")"; then
+        exit 3
+    fi
     trap cleanup EXIT
     : > "$WORK_ROOT/.qvac-physical-cleanup-test"
     if [[ ! -f "$WORK_ROOT/.qvac-physical-cleanup-test" ||
@@ -87,7 +96,22 @@ if [[ "${1:-}" == "--self-test" ]]; then
     fi
     [[ -d "$WORK_ROOT" && ! -L "$WORK_ROOT" ]] \
         || fail "cleanup self-test parent must be a real directory"
+    WORK_ROOT="$(canonical_directory "$WORK_ROOT")" \
+        || fail "could not canonicalize cleanup self-test parent"
     trap cleanup EXIT
+
+    CANONICAL_PARENT="$WORK_ROOT/canonical-parent"
+    ALIAS_PARENT="$WORK_ROOT/alias-parent"
+    mkdir "$CANONICAL_PARENT"
+    ln -s "$CANONICAL_PARENT" "$ALIAS_PARENT"
+    mkdir "$ALIAS_PARENT/work"
+    CANONICAL_ALIAS_ROOT="$(canonical_directory "$ALIAS_PARENT/work")" \
+        || fail "could not canonicalize aliased temporary root"
+    [[ "$CANONICAL_ALIAS_ROOT" == "$CANONICAL_PARENT/work" &&
+       "$CANONICAL_ALIAS_ROOT" != "$ALIAS_PARENT/work" &&
+       "$CANONICAL_ALIAS_ROOT/child" == "$CANONICAL_ALIAS_ROOT/"* ]] \
+        || fail "aliased temporary-root containment was not canonicalized"
+
     CLEANUP_SELF_TEST_PREFIX="QVAC_PHYSICAL_CLEANUP_ARMED="
     set +e
     CLEANUP_SELF_TEST_OUTPUT="$(
@@ -275,7 +299,13 @@ CANDIDATE_LOG="$EVIDENCE/candidate-verification.log"
 node "$BARE_KIT_VERIFIER" --artifact "$CANDIDATE" \
     2>&1 | tee "$CANDIDATE_LOG"
 
-WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/qvac-physical-lifecycle.XXXXXX")"
+if ! WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/qvac-physical-lifecycle.XXXXXX")"; then
+    fail "could not create physical lifecycle work root"
+fi
+[[ -d "$WORK_ROOT" && ! -L "$WORK_ROOT" ]] \
+    || fail "physical lifecycle work root must be a real directory"
+WORK_ROOT="$(canonical_directory "$WORK_ROOT")" \
+    || fail "could not canonicalize physical lifecycle work root"
 trap cleanup EXIT
 SOURCE_COPY="$WORK_ROOT/qvac-swift"
 DERIVED_DATA="$WORK_ROOT/DerivedData"
