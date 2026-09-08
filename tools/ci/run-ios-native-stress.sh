@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPOSITORY_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd -P)"
 VERIFIER="$SCRIPT_DIR/verify-ios-native-stress-evidence.mjs"
+BUILD_INPUT_VERIFIER="$SCRIPT_DIR/verify-ios-build-inputs.mjs"
 BARE_KIT_VERIFIER="$REPOSITORY_ROOT/tools/native/bare-kit/verify.mjs"
 STAGED_ARTIFACTS="$REPOSITORY_ROOT/tools/runtime/.build/artifacts"
 REQUIRED_XCODEGEN_VERSION="2.46.0"
@@ -18,7 +19,9 @@ usage:
     --destination 'platform=iOS...,id=...' \
     --candidate /absolute/BareKit.xcframework \
     --evidence-dir /absolute/new-or-empty-directory \
-    [-- <additional xcodebuild signing options>]
+    [--development-team <10-character-team-id>] \
+    [--allow-provisioning-updates] \
+    [--allow-provisioning-device-registration]
 
   run-ios-native-stress.sh \
     --mode thread-sanitizer \
@@ -69,8 +72,19 @@ cleanup() {
 # RUN_COMPLETED was never set.
 if [[ "${1:-}" == "--internal-self-test-nounset-cleanup" ]]; then
     [[ "$#" -eq 1 ]] || exit 2
-    WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/qvac-native-stress-cleanup-test.XXXXXX")"
+    if ! WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/qvac-native-stress-cleanup-test.XXXXXX")"; then
+        exit 3
+    fi
+    if [[ ! -d "$WORK_ROOT" || -L "$WORK_ROOT" ]]; then
+        exit 3
+    fi
     trap cleanup EXIT
+    : > "$WORK_ROOT/.qvac-native-stress-cleanup-test"
+    if [[ ! -f "$WORK_ROOT/.qvac-native-stress-cleanup-test" ||
+          -L "$WORK_ROOT/.qvac-native-stress-cleanup-test" ]]; then
+        exit 3
+    fi
+    printf 'QVAC_NATIVE_STRESS_CLEANUP_ARMED=%s\n' "$WORK_ROOT"
     SELF_TEST_EMPTY_OPTIONS=()
     SELF_TEST_COMMAND=("${SELF_TEST_EMPTY_OPTIONS[@]}")
     exit 0
@@ -79,13 +93,37 @@ fi
 if [[ "${1:-}" == "--self-test" ]]; then
     [[ "$#" -eq 1 ]] || usage
     node "$VERIFIER" --self-test
+    node "$BUILD_INPUT_VERIFIER" --self-test
     bash -n "$0"
+    if ! WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/qvac-native-stress-self-test.XXXXXX")"; then
+        fail "could not create cleanup self-test parent"
+    fi
+    [[ -d "$WORK_ROOT" && ! -L "$WORK_ROOT" ]] \
+        || fail "cleanup self-test parent must be a real directory"
+    trap cleanup EXIT
+    CLEANUP_SELF_TEST_PREFIX="QVAC_NATIVE_STRESS_CLEANUP_ARMED="
     set +e
-    /bin/bash "$0" --internal-self-test-nounset-cleanup >/dev/null 2>&1
+    CLEANUP_SELF_TEST_OUTPUT="$(
+        TMPDIR="$WORK_ROOT" \
+            /bin/bash "$0" --internal-self-test-nounset-cleanup 2>/dev/null
+    )"
     CLEANUP_SELF_TEST_STATUS=$?
     set -e
     [[ "$CLEANUP_SELF_TEST_STATUS" -eq 1 ]] \
         || fail "cleanup must fail closed after a Bash nounset expansion abort"
+    case "$CLEANUP_SELF_TEST_OUTPUT" in
+        "$CLEANUP_SELF_TEST_PREFIX"*) ;;
+        *) fail "cleanup subprocess did not reach the armed nounset test point" ;;
+    esac
+    CLEANUP_SELF_TEST_PATH="${CLEANUP_SELF_TEST_OUTPUT#"$CLEANUP_SELF_TEST_PREFIX"}"
+    case "$CLEANUP_SELF_TEST_PATH" in
+        "$WORK_ROOT"/qvac-native-stress-cleanup-test.*) ;;
+        *) fail "cleanup subprocess reported an unexpected test directory" ;;
+    esac
+    if [[ "$CLEANUP_SELF_TEST_PATH" == *$'\n'* ||
+          -e "$CLEANUP_SELF_TEST_PATH" || -L "$CLEANUP_SELF_TEST_PATH" ]]; then
+        fail "cleanup subprocess did not remove its armed test directory"
+    fi
     EMPTY_OPTIONS=()
     EMPTY_OPTION_COUNT=0
     TEST_COMMAND=(xcodebuild)
@@ -94,8 +132,9 @@ if [[ "${1:-}" == "--self-test" ]]; then
     fi
     TEST_COMMAND+=(test)
     [[ "${TEST_COMMAND[*]}" == "xcodebuild test" ]] \
-        || fail "empty additional xcodebuild options were not handled safely"
-    echo "[ios-native-stress-self-test] argument-independent gates verified"
+        || fail "empty optional signing flags were not handled safely"
+    echo "[ios-native-stress-self-test] fixed-argument and cleanup gates verified"
+    RUN_COMPLETED=true
     exit 0
 fi
 
@@ -106,12 +145,13 @@ CANDIDATE=""
 EVIDENCE=""
 COMPILE_COMMANDS=""
 SOURCE_ROOT=""
-XCODEBUILD_OPTIONS=()
-XCODEBUILD_OPTION_COUNT=0
+DEVELOPMENT_TEAM=""
+ALLOW_PROVISIONING_UPDATES=false
+ALLOW_DEVICE_REGISTRATION=false
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
-        --mode|--platform|--destination|--candidate|--evidence-dir|--compile-commands|--source-root)
+        --mode|--platform|--destination|--candidate|--evidence-dir|--compile-commands|--source-root|--development-team)
             [[ "$#" -ge 2 && -n "$2" ]] || usage
             case "$1" in
                 --mode) MODE="$2" ;;
@@ -121,14 +161,19 @@ while [[ "$#" -gt 0 ]]; do
                 --evidence-dir) EVIDENCE="$2" ;;
                 --compile-commands) COMPILE_COMMANDS="$2" ;;
                 --source-root) SOURCE_ROOT="$2" ;;
+                --development-team) DEVELOPMENT_TEAM="$2" ;;
             esac
             shift 2
             ;;
-        --)
+        --allow-provisioning-updates)
+            [[ "$ALLOW_PROVISIONING_UPDATES" == false ]] || usage
+            ALLOW_PROVISIONING_UPDATES=true
             shift
-            XCODEBUILD_OPTIONS=("$@")
-            XCODEBUILD_OPTION_COUNT="$#"
-            break
+            ;;
+        --allow-provisioning-device-registration)
+            [[ "$ALLOW_DEVICE_REGISTRATION" == false ]] || usage
+            ALLOW_DEVICE_REGISTRATION=true
+            shift
             ;;
         *)
             usage
@@ -147,9 +192,18 @@ CANDIDATE="$(cd -P "$CANDIDATE" && pwd -P)"
 
 if [[ "$PLATFORM" == "simulator" ]]; then
     [[ "$DESTINATION" =~ ^platform=iOS\ Simulator,id=[A-Za-z0-9-]{8,64}$ ]] || usage
+    [[ -z "$DEVELOPMENT_TEAM" && "$ALLOW_PROVISIONING_UPDATES" == false \
+        && "$ALLOW_DEVICE_REGISTRATION" == false ]] \
+        || fail "device signing options are not accepted for Simulator evidence"
 else
     [[ "$DESTINATION" =~ ^platform=iOS,id=[A-Za-z0-9-]{8,64}$ ]] || usage
+    [[ "$DEVELOPMENT_TEAM" =~ ^[A-Z0-9]{10}$ ]] \
+        || fail "physical-device evidence requires a 10-character development team"
+    if [[ "$ALLOW_DEVICE_REGISTRATION" == true && "$ALLOW_PROVISIONING_UPDATES" != true ]]; then
+        fail "device registration requires --allow-provisioning-updates"
+    fi
 fi
+DEVICE_ID="${DESTINATION##*,id=}"
 if [[ "$MODE" == "thread-sanitizer" ]]; then
     [[ "$PLATFORM" == "simulator" ]] || fail "Thread Sanitizer is Simulator-only"
     [[ "$COMPILE_COMMANDS" == /* && -f "$COMPILE_COMMANDS" && ! -L "$COMPILE_COMMANDS" ]] \
@@ -203,6 +257,9 @@ command -v xcrun >/dev/null || fail "xcrun is required"
 
 [[ -d "$STAGED_ARTIFACTS" && ! -L "$STAGED_ARTIFACTS" ]] \
     || fail "run tools/runtime/link-ios-artifacts.sh before native stress validation"
+node "$BUILD_INPUT_VERIFIER" \
+    --artifact-root "$STAGED_ARTIFACTS" \
+    --allow-unreferenced-root-entries
 EXPECTED_TARGET_COUNT="$(
     node -e '
       const value = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))
@@ -237,14 +294,26 @@ fi
 
 WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/qvac-native-stress.XXXXXX")"
 trap cleanup EXIT
+WORK_ROOT="$(cd -P "$WORK_ROOT" && pwd -P)"
 SOURCE_COPY="$WORK_ROOT/source"
 DERIVED_DATA="$WORK_ROOT/DerivedData"
+SOURCE_ARCHIVE="$EVIDENCE/source.tar"
 mkdir "$SOURCE_COPY"
-git -C "$REPOSITORY_ROOT" archive --format=tar "$SOURCE_SHA" \
-    | tar -xf - -C "$SOURCE_COPY"
+git -C "$REPOSITORY_ROOT" archive --format=tar --output="$SOURCE_ARCHIVE" "$SOURCE_SHA"
+tar -xf "$SOURCE_ARCHIVE" -C "$SOURCE_COPY"
 
-mkdir -p "$SOURCE_COPY/tools/runtime/.build"
-ditto "$STAGED_ARTIFACTS" "$SOURCE_COPY/tools/runtime/.build/artifacts"
+mkdir -p "$SOURCE_COPY/tools/runtime/.build/artifacts"
+while IFS= read -r TARGET; do
+    [[ -n "$TARGET" && "$TARGET" != "BareKit" ]] || continue
+    ditto \
+        "$STAGED_ARTIFACTS/$TARGET.xcframework" \
+        "$SOURCE_COPY/tools/runtime/.build/artifacts/$TARGET.xcframework"
+done < <(
+    node -e '
+      const value = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))
+      for (const target of value.targets) process.stdout.write(target + "\n")
+    ' "$REPOSITORY_ROOT/tools/release/artifacts.development.json"
+)
 TEMP_BARE_KIT="$SOURCE_COPY/tools/runtime/.build/artifacts/BareKit.xcframework"
 [[ "$TEMP_BARE_KIT" == "$WORK_ROOT/"* ]] || fail "internal BareKit destination escaped work root"
 rm -rf "$TEMP_BARE_KIT"
@@ -256,10 +325,21 @@ cp "$SOURCE_COPY/Package.swift.dev" "$SOURCE_COPY/Package.swift"
     cd "$SOURCE_COPY"
     swift package dump-package >/dev/null
 )
+SWIFTPM_STATE="$SOURCE_COPY/.swiftpm"
+[[ "$SWIFTPM_STATE" == "$WORK_ROOT/"* ]] \
+    || fail "internal SwiftPM state path escaped work root"
+rm -rf "$SWIFTPM_STATE"
+[[ ! -e "$SWIFTPM_STATE" && ! -L "$SWIFTPM_STATE" ]] \
+    || fail "could not remove generated SwiftPM source-tree state"
 (
     cd "$SOURCE_COPY/Examples/QVACChat"
     "$XCODEGEN" generate
 )
+node "$BUILD_INPUT_VERIFIER" \
+    --source-archive "$SOURCE_ARCHIVE" \
+    --source-root "$SOURCE_COPY" \
+    --source-sha "$SOURCE_SHA" \
+    --xcodegen "$XCODEGEN"
 
 RESULT_BUNDLE="$EVIDENCE/native-stress.xcresult"
 TEST_LOG="$EVIDENCE/native-stress-xcodebuild.log"
@@ -287,12 +367,17 @@ XCODEBUILD=(
 )
 if [[ "$PLATFORM" == "simulator" ]]; then
     XCODEBUILD+=(CODE_SIGNING_ALLOWED=NO)
+else
+    XCODEBUILD+=(CODE_SIGN_STYLE=Automatic "DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM")
+    if [[ "$ALLOW_PROVISIONING_UPDATES" == true ]]; then
+        XCODEBUILD+=(-allowProvisioningUpdates)
+    fi
+    if [[ "$ALLOW_DEVICE_REGISTRATION" == true ]]; then
+        XCODEBUILD+=(-allowProvisioningDeviceRegistration)
+    fi
 fi
 if [[ "$MODE" == "thread-sanitizer" ]]; then
     XCODEBUILD+=(-enableThreadSanitizer YES)
-fi
-if (( XCODEBUILD_OPTION_COUNT > 0 )); then
-    XCODEBUILD+=("${XCODEBUILD_OPTIONS[@]}")
 fi
 XCODEBUILD+=(test)
 
@@ -309,7 +394,14 @@ node "$VERIFIER" \
     --log "$TEST_LOG" \
     --derived-data "$DERIVED_DATA" \
     --candidate "$CANDIDATE" \
+    --device-id "$DEVICE_ID" \
+    --development-team "${DEVELOPMENT_TEAM:-none}" \
+    --allow-provisioning-updates "$ALLOW_PROVISIONING_UPDATES" \
+    --allow-provisioning-device-registration "$ALLOW_DEVICE_REGISTRATION" \
+    --source-archive "$SOURCE_ARCHIVE" \
+    --source-root "$SOURCE_COPY" \
     --source-sha "$SOURCE_SHA" \
+    --xcodegen "$XCODEGEN" \
     --output "$EVIDENCE/native-stress-evidence.json"
 
 FINAL_STATUS="$(git -C "$REPOSITORY_ROOT" status --porcelain --untracked-files=all)"

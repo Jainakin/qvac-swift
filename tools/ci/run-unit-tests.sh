@@ -12,19 +12,54 @@ readonly SWIFTC_FLAGS=(
     -Xswiftc -warnings-as-errors
     -Xswiftc -strict-concurrency=complete
 )
+readonly SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 QVAC_CI_TEMP_DIR=""
+RUN_COMPLETED=false
 
 cleanup() {
-    local status="$?"
-    if [[ -n "$QVAC_CI_TEMP_DIR" ]]; then
-        rm -rf -- "$QVAC_CI_TEMP_DIR"
-    fi
-    # Bash 3.2 can otherwise replace an early `set -u`/execution failure with
-    # the successful status of the cleanup command.
+    local command_status="$?"
+    local cleanup_status=0
     trap - EXIT
-    exit "$status"
+    if [[ -n "$QVAC_CI_TEMP_DIR" ]]; then
+        rm -rf -- "$QVAC_CI_TEMP_DIR" || cleanup_status=$?
+    fi
+    if (( command_status != 0 )); then
+        exit "$command_status"
+    fi
+    if (( cleanup_status != 0 )); then
+        exit "$cleanup_status"
+    fi
+    if [[ "$RUN_COMPLETED" != true ]]; then
+        # Apple Bash 3.2 enters EXIT with status zero after some expansion
+        # failures. Only the explicit success marker may produce a zero exit.
+        exit 1
+    fi
+    exit 0
 }
 trap cleanup EXIT
+
+# Private subprocess mode used by --self-test. Apple Bash 3.2 aborts on this
+# empty-array expansion with EXIT status zero; newer Bash versions reach the
+# explicit zero exit. The completion sentinel must convert both paths to fail.
+if [[ "${1:-}" == "--internal-self-test-nounset-cleanup" ]]; then
+    [[ "$#" -eq 1 ]] || exit 2
+    if ! QVAC_CI_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/qvac-unit-cleanup-test.XXXXXX")"; then
+        exit 3
+    fi
+    if [[ ! -d "$QVAC_CI_TEMP_DIR" || -L "$QVAC_CI_TEMP_DIR" ]]; then
+        exit 3
+    fi
+    : > "$QVAC_CI_TEMP_DIR/.qvac-unit-cleanup-test"
+    if [[ ! -f "$QVAC_CI_TEMP_DIR/.qvac-unit-cleanup-test" ||
+          -L "$QVAC_CI_TEMP_DIR/.qvac-unit-cleanup-test" ]]; then
+        exit 3
+    fi
+    printf 'QVAC_UNIT_CLEANUP_ARMED=%s\n' "$QVAC_CI_TEMP_DIR"
+    SELF_TEST_EMPTY_OPTIONS=()
+    SELF_TEST_COMMAND=("${SELF_TEST_EMPTY_OPTIONS[@]}")
+    exit 0
+fi
 
 reject() {
     printf '[unit-tests] error: %s\n' "$*" >&2
@@ -210,7 +245,8 @@ verify_execution() {
 
 self_test() {
     local listing inventory rejected_inventory substituted_listing substituted_inventory
-    local output started passed inventory_sha256
+    local output started passed inventory_sha256 cleanup_self_test_status
+    local cleanup_self_test_output cleanup_self_test_path cleanup_self_test_prefix
     QVAC_CI_TEMP_DIR="$(mktemp -d)"
     listing="$QVAC_CI_TEMP_DIR/listing"
     inventory="$QVAC_CI_TEMP_DIR/inventory"
@@ -293,7 +329,40 @@ self_test() {
         return 1
     fi
 
-    printf '[unit-tests-self-test] count drift, equal-count substitution, hash drift, zero execution, skips, and execution identity mismatch are rejected\n'
+    cleanup_self_test_prefix="QVAC_UNIT_CLEANUP_ARMED="
+    set +e
+    cleanup_self_test_output="$(
+        TMPDIR="$QVAC_CI_TEMP_DIR" \
+            /bin/bash "$SCRIPT_PATH" --internal-self-test-nounset-cleanup 2>/dev/null
+    )"
+    cleanup_self_test_status=$?
+    set -e
+    if [[ "$cleanup_self_test_status" -ne 1 ]]; then
+        reject "cleanup must fail closed after a Bash nounset expansion abort"
+        return 1
+    fi
+    case "$cleanup_self_test_output" in
+        "$cleanup_self_test_prefix"*) ;;
+        *)
+            reject "cleanup subprocess did not reach the armed nounset test point"
+            return 1
+            ;;
+    esac
+    cleanup_self_test_path="${cleanup_self_test_output#"$cleanup_self_test_prefix"}"
+    case "$cleanup_self_test_path" in
+        "$QVAC_CI_TEMP_DIR"/qvac-unit-cleanup-test.*) ;;
+        *)
+            reject "cleanup subprocess reported an unexpected test directory"
+            return 1
+            ;;
+    esac
+    if [[ "$cleanup_self_test_path" == *$'\n'* ||
+          -e "$cleanup_self_test_path" || -L "$cleanup_self_test_path" ]]; then
+        reject "cleanup subprocess did not remove its armed test directory"
+        return 1
+    fi
+
+    printf '[unit-tests-self-test] count drift, equal-count substitution, hash drift, zero execution, skips, execution identity mismatch, and Bash nounset cleanup are rejected\n'
 }
 
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -301,6 +370,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
         reject "usage: $0 [--self-test | --sanitize=address | --sanitize=thread | --sanitize=undefined]" || exit 2
     fi
     self_test
+    RUN_COMPLETED=true
     exit 0
 fi
 SANITIZER=""
@@ -337,7 +407,6 @@ run_swift_test() {
     fi
 }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 QVAC_CI_TEMP_DIR="$(mktemp -d)"
 LISTING="$QVAC_CI_TEMP_DIR/swift-test-list.txt"
@@ -364,3 +433,4 @@ verify_execution \
     "$OUTPUT" "$MODULE" "$EXPECTED_TEST_COUNT" "$REVIEWED_INVENTORY" "$STARTED" "$PASSED"
 printf '[unit-tests] verified %s: exactly %s executed, zero failures, zero skips (%s)\n' \
     "$MODULE" "$EXPECTED_TEST_COUNT" "$TEST_MODE"
+RUN_COMPLETED=true

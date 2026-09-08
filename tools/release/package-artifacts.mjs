@@ -1,7 +1,16 @@
 #!/usr/bin/env node
 
 import { execFileSync } from 'node:child_process'
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import {
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { verifyBundle } from './verify-bundle-provenance.mjs'
@@ -31,6 +40,7 @@ const bareKitNativeClosurePath = join(
   '.build',
   'bare-kit-native-closure.json',
 )
+const builtBareKitCandidatePath = join(bareKitPatchDirectory, '.build', 'BareKit.xcframework')
 const allowedOutputRoots = [
   resolve(repoRoot, 'release-candidate'),
   generatedFrameworkRoot,
@@ -177,6 +187,53 @@ if (!Number.isSafeInteger(linkSet.stagedTargetCount)
 const bundle = verifyBundle(bundlePathCanonical)
 if (linkSet.bundle?.sha256 !== bundle.sha256) {
   throw new Error('[package-artifacts] link set does not belong to this worker bundle')
+}
+
+const {
+  snapshotCanonicalTree,
+  verifyNonBareArtifactClosure,
+} = await import('../ci/verify-ios-build-inputs.mjs')
+const artifactClosure = verifyNonBareArtifactClosure(frameworksDirCanonical, {
+  requireExactRoot: false,
+})
+const reviewedTargets = [
+  'BareKit',
+  ...artifactClosure.artifacts.map(({ target }) => target),
+].sort()
+if (JSON.stringify([...linkSet.targets].sort()) !== JSON.stringify(reviewedTargets)) {
+  throw new Error('[package-artifacts] link-set targets differ from the reviewed SDK 0.17.0 closure')
+}
+const stagedTargets = [...linkSet.targets, ...linkSet.excludedUnreferencedTargets].sort()
+const stagedRootEntries = readdirSync(frameworksDirCanonical).sort()
+const expectedRootEntries = stagedTargets.map(target => `${target}.xcframework`).sort()
+if (JSON.stringify(stagedRootEntries) !== JSON.stringify(expectedRootEntries)) {
+  throw new Error('[package-artifacts] staged framework root differs from its exact link-set closure')
+}
+
+const stagedBareKitPath = join(frameworksDirCanonical, 'BareKit.xcframework')
+assertExistingPathHasNoSymlinkComponents(stagedBareKitPath, frameworksDirCanonical, 'staged BareKit')
+execFileSync(process.execPath, [bareKitPatchVerifierPath, '--artifact', stagedBareKitPath], {
+  stdio: 'inherit',
+})
+assertExistingPathHasNoSymlinkComponents(
+  builtBareKitCandidatePath,
+  bareKitPatchDirectory,
+  'built BareKit candidate',
+)
+const builtBareKitCandidateCanonical = realpathSync(builtBareKitCandidatePath)
+const stagedBareKit = snapshotCanonicalTree(stagedBareKitPath, 'staged BareKit candidate')
+const builtBareKit = snapshotCanonicalTree(
+  builtBareKitCandidateCanonical,
+  'built BareKit candidate',
+)
+if ((lstatSync(stagedBareKitPath).mode & 0o7777)
+      !== (lstatSync(builtBareKitCandidateCanonical).mode & 0o7777)
+    || JSON.stringify(stagedBareKit.entries) !== JSON.stringify(builtBareKit.entries)) {
+  throw new Error('[package-artifacts] staged BareKit differs from the verified built candidate')
+}
+canonicalInputs.push(['built BareKit candidate', builtBareKitCandidateCanonical])
+if (overlaps(outputDirCanonical, builtBareKitCandidateCanonical)) {
+  throw new Error('[package-artifacts] output must not overlap the built BareKit candidate')
 }
 
 rmSync(outputDirCanonical, { recursive: true, force: true })

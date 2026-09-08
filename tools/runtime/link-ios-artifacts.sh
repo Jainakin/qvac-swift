@@ -84,4 +84,11 @@ if [[ "$BARE_KIT_IS_PATCHED" == true ]]; then
         --artifact "$OUTPUT/BareKit.xcframework"
 fi
 
+# Every distributable non-BareKit framework must match the reviewed SDK 0.17.0
+# closure. The linker intentionally stages nine additional transitive products;
+# compute-manifest decides which of those are excluded from release packaging.
+node "$SCRIPT_DIR/../ci/verify-ios-build-inputs.mjs" \
+    --artifact-root "$OUTPUT" \
+    --allow-unreferenced-root-entries
+
 echo "[link-ios] staged $(find "$OUTPUT" -maxdepth 1 -type d -name '*.xcframework' | wc -l | tr -d ' ') xcframeworks"

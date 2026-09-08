@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "scheme": "QVACChat-PhysicalDevice",
+  "testModule": "QVACChatPhysicalDeviceTests",
+  "inventoryPath": "tools/ci/ios-physical-lifecycle-test-inventory.txt",
+  "inventorySHA256": "379e621bd70d872dbbe30d3e73f1f975ffdd4a63a2d4fabc389fb9050804325b",
+  "expectedTestCount": 1,
+  "artifactManifestPath": "tools/release/artifacts.development.json",
+  "artifactManifestSHA256": "66e2298a6abf2c19b2af9c0411aea5d6c77c5a81a4a9b70d7e89447c51ed708b",
+  "expectedArtifactCount": 38,
+  "artifactTreeLockPath": "tools/ci/ios-local-artifact-tree-lock.json",
+  "artifactTreeLockSHA256": "e65402fd2c00c7fa3bfe491367461b8e63f2168bf0a22d91ff8b99db60436aa0",
+  "xcodeGenVersion": "2.46.0",
+  "xcodeGenExecutableSHA256": "8774da746668bc18fe74e54cbaf10f2631a1fb05947cd374179aa912f14f99db",
+  "workerBundlePath": "Sources/QVACClient/Resources/worker.mobile.bundle",
+  "workerBundleSize": 11495184,
+  "workerBundleSHA256": "3d17393e67b0ed6830a5dad2f575b9d8835589a4eed321629ff2f514066cd769",
+  "patchMarker": "qvac-bare-kit-2.3.0-ipc-hardening-1",
+  "requiredAttachments": [
+    "01-launched",
+    "02-model-load-outcome",
+    "03-completion-outcome",
+    "04-unloaded"
+  ]
+}

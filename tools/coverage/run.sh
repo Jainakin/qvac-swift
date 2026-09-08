@@ -19,24 +19,29 @@ readonly SWIFTC_FLAGS=(
 )
 QVAC_COVERAGE_SELF_TEST_DIR=""
 QVAC_COVERAGE_SCRATCH_DIR=""
+RUN_COMPLETED=false
 
 cleanup_self_test() {
+    local cleanup_status=0
     if [[ -n "$QVAC_COVERAGE_SELF_TEST_DIR" ]]; then
-        rm -rf -- "$QVAC_COVERAGE_SELF_TEST_DIR"
-        QVAC_COVERAGE_SELF_TEST_DIR=""
+        rm -rf -- "$QVAC_COVERAGE_SELF_TEST_DIR" || cleanup_status=$?
+        if (( cleanup_status == 0 )); then
+            QVAC_COVERAGE_SELF_TEST_DIR=""
+        fi
     fi
+    return "$cleanup_status"
 }
 
 cleanup_scratch() {
     if [[ -z "$QVAC_COVERAGE_SCRATCH_DIR" ]]; then
-        return
+        return 0
     fi
     case "$QVAC_COVERAGE_SCRATCH_DIR/" in
         "$SCRATCH_PARENT/"*) ;;
         *)
             printf '[coverage] refusing to clean unexpected scratch path: %s\n' \
                 "$QVAC_COVERAGE_SCRATCH_DIR" >&2
-            return
+            return 1
             ;;
     esac
     if [[ ! -d "$QVAC_COVERAGE_SCRATCH_DIR" ||
@@ -45,15 +50,37 @@ cleanup_scratch() {
           -L "$QVAC_COVERAGE_SCRATCH_DIR/$SCRATCH_MARKER" ]]; then
         printf '[coverage] refusing to clean unverified scratch path: %s\n' \
             "$QVAC_COVERAGE_SCRATCH_DIR" >&2
-        return
+        return 1
     fi
-    rm -rf -- "$QVAC_COVERAGE_SCRATCH_DIR"
+    rm -rf -- "$QVAC_COVERAGE_SCRATCH_DIR" || return $?
     QVAC_COVERAGE_SCRATCH_DIR=""
+    return 0
 }
 
 cleanup() {
-    cleanup_self_test
-    cleanup_scratch
+    local command_status="$?"
+    local cleanup_status=0
+    local current_cleanup_status=0
+    trap - EXIT
+    cleanup_self_test || cleanup_status=$?
+    cleanup_scratch || {
+        current_cleanup_status=$?
+        if (( cleanup_status == 0 )); then
+            cleanup_status="$current_cleanup_status"
+        fi
+    }
+    if (( command_status != 0 )); then
+        exit "$command_status"
+    fi
+    if (( cleanup_status != 0 )); then
+        exit "$cleanup_status"
+    fi
+    if [[ "$RUN_COMPLETED" != true ]]; then
+        # Apple Bash 3.2 enters EXIT with status zero after some expansion
+        # failures. Only the explicit success marker may produce a zero exit.
+        exit 1
+    fi
+    exit 0
 }
 
 reject() {
@@ -157,6 +184,8 @@ runner_self_test() {
     local fixture product darwin_root linux_root duplicate_root
     local darwin_binary linux_binary profile new_output reused_output unowned_output invalid_output symlink_output
     local failed_summary passed_summary malformed_summary publish_source publish_destination
+    local cleanup_self_test_status cleanup_self_test_output cleanup_self_test_path
+    local cleanup_self_test_prefix
     product="PackageTests"
     fixture="$(mktemp -d)"
     QVAC_COVERAGE_SELF_TEST_DIR="$fixture"
@@ -248,8 +277,40 @@ runner_self_test() {
         reject "runner self-test accepted missing staged evidence"
         return 1
     fi
+    cleanup_self_test_prefix="QVAC_COVERAGE_CLEANUP_ARMED="
+    set +e
+    cleanup_self_test_output="$(
+        TMPDIR="$QVAC_COVERAGE_SELF_TEST_DIR" \
+            /bin/bash "$SCRIPT_DIR/run.sh" --internal-self-test-nounset-cleanup 2>/dev/null
+    )"
+    cleanup_self_test_status=$?
+    set -e
+    if [[ "$cleanup_self_test_status" -ne 1 ]]; then
+        reject "cleanup must fail closed after a Bash nounset expansion abort"
+        return 1
+    fi
+    case "$cleanup_self_test_output" in
+        "$cleanup_self_test_prefix"*) ;;
+        *)
+            reject "cleanup subprocess did not reach the armed nounset test point"
+            return 1
+            ;;
+    esac
+    cleanup_self_test_path="${cleanup_self_test_output#"$cleanup_self_test_prefix"}"
+    case "$cleanup_self_test_path" in
+        "$QVAC_COVERAGE_SELF_TEST_DIR"/qvac-coverage-cleanup-test.*) ;;
+        *)
+            reject "cleanup subprocess reported an unexpected test directory"
+            return 1
+            ;;
+    esac
+    if [[ "$cleanup_self_test_path" == *$'\n'* ||
+          -e "$cleanup_self_test_path" || -L "$cleanup_self_test_path" ]]; then
+        reject "cleanup subprocess did not remove its armed test directory"
+        return 1
+    fi
     cleanup_self_test
-    printf '[coverage-runner-self-test] discovery, output ownership, and failure-report classification passed\n'
+    printf '[coverage-runner-self-test] discovery, output ownership, failure-report classification, and Bash nounset cleanup passed\n'
 }
 
 is_policy_failure_summary() {
@@ -283,6 +344,29 @@ publish_evidence() {
     done
 }
 
+# Private subprocess mode used by --self-test. Apple Bash 3.2 aborts on this
+# empty-array expansion with EXIT status zero; newer Bash versions reach the
+# explicit zero exit. The completion sentinel must convert both paths to fail.
+if [[ "${1:-}" == "--internal-self-test-nounset-cleanup" ]]; then
+    [[ "$#" -eq 1 ]] || exit 2
+    if ! QVAC_COVERAGE_SELF_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/qvac-coverage-cleanup-test.XXXXXX")"; then
+        exit 3
+    fi
+    if [[ ! -d "$QVAC_COVERAGE_SELF_TEST_DIR" || -L "$QVAC_COVERAGE_SELF_TEST_DIR" ]]; then
+        exit 3
+    fi
+    : > "$QVAC_COVERAGE_SELF_TEST_DIR/.qvac-coverage-cleanup-test"
+    if [[ ! -f "$QVAC_COVERAGE_SELF_TEST_DIR/.qvac-coverage-cleanup-test" ||
+          -L "$QVAC_COVERAGE_SELF_TEST_DIR/.qvac-coverage-cleanup-test" ]]; then
+        exit 3
+    fi
+    printf 'QVAC_COVERAGE_CLEANUP_ARMED=%s\n' "$QVAC_COVERAGE_SELF_TEST_DIR"
+    trap cleanup EXIT
+    SELF_TEST_EMPTY_OPTIONS=()
+    SELF_TEST_COMMAND=("${SELF_TEST_EMPTY_OPTIONS[@]}")
+    exit 0
+fi
+
 if [[ "${1:-}" == "--self-test" ]]; then
     if [[ "$#" != "1" ]]; then
         reject "usage: $0 [--self-test | output-directory]"
@@ -291,7 +375,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     trap cleanup EXIT
     node "$ANALYZER" --self-test
     runner_self_test
-    trap - EXIT
+    RUN_COMPLETED=true
     exit 0
 fi
 if [[ "$#" -gt 1 ]]; then
@@ -515,3 +599,4 @@ node "$ANALYZER" verify-attestation \
     --attestation "$OUTPUT_DIRECTORY/coverage-complete.json"
 
 printf '[coverage] evidence written to %s\n' "$OUTPUT_DIRECTORY"
+RUN_COMPLETED=true

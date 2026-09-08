@@ -92,6 +92,7 @@ jobs:
           tools/ci/run-required-suite.sh --self-test
           tools/ci/run-unit-tests.sh --self-test
           tools/ci/run-ios-native-stress.sh --self-test
+          tools/ci/run-ios-physical-lifecycle.sh --self-test
           node tools/ci/package-manifest-mode.mjs --self-test
           node tools/release/generate-third-party-notices.mjs --self-test
           node tools/release/verify-privacy-manifests.mjs --check
@@ -294,6 +295,7 @@ jobs:
           node tools/native/bare-kit/verify.mjs --self-test
           node tools/ci/verify-ios-test-log.mjs --self-test
           tools/ci/run-ios-native-stress.sh --self-test
+          tools/ci/run-ios-physical-lifecycle.sh --self-test
       - name: Install checksum-pinned XcodeGen
         run: |
           XCODEGEN_VERSION=2.46.0

@@ -16,18 +16,55 @@ readonly SWIFTC_FLAGS=(
     -Xswiftc -warnings-as-errors
     -Xswiftc -strict-concurrency=complete
 )
+readonly SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 
 QVAC_CI_TEMP_DIR=""
+RUN_COMPLETED=false
 
 cleanup() {
-    local status="$?"
-    if [[ -n "$QVAC_CI_TEMP_DIR" ]]; then
-        rm -rf -- "$QVAC_CI_TEMP_DIR"
-    fi
+    local command_status="$?"
+    local cleanup_status=0
     trap - EXIT
-    exit "$status"
+    if [[ -n "$QVAC_CI_TEMP_DIR" ]]; then
+        rm -rf -- "$QVAC_CI_TEMP_DIR" || cleanup_status=$?
+    fi
+    if (( command_status != 0 )); then
+        exit "$command_status"
+    fi
+    if (( cleanup_status != 0 )); then
+        exit "$cleanup_status"
+    fi
+    if [[ "$RUN_COMPLETED" != true ]]; then
+        # Apple Bash 3.2 enters EXIT with status zero after some expansion
+        # failures. Only the explicit success marker may produce a zero exit.
+        exit 1
+    fi
+    exit 0
 }
 trap cleanup EXIT
+
+# Private subprocess mode used by --self-test. Apple Bash 3.2 aborts on this
+# empty-array expansion with EXIT status zero; newer Bash versions reach the
+# explicit zero exit. The completion sentinel must convert both paths to fail.
+if [[ "${1:-}" == "--internal-self-test-nounset-cleanup" ]]; then
+    [[ "$#" -eq 1 ]] || exit 2
+    if ! QVAC_CI_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/qvac-required-cleanup-test.XXXXXX")"; then
+        exit 3
+    fi
+    if [[ ! -d "$QVAC_CI_TEMP_DIR" || -L "$QVAC_CI_TEMP_DIR" ]]; then
+        exit 3
+    fi
+    : > "$QVAC_CI_TEMP_DIR/.qvac-required-cleanup-test"
+    if [[ ! -f "$QVAC_CI_TEMP_DIR/.qvac-required-cleanup-test" ||
+          -L "$QVAC_CI_TEMP_DIR/.qvac-required-cleanup-test" ]]; then
+        exit 3
+    fi
+    printf 'QVAC_REQUIRED_CLEANUP_ARMED=%s\n' "$QVAC_CI_TEMP_DIR"
+    SELF_TEST_EMPTY_OPTIONS=()
+    SELF_TEST_COMMAND=("${SELF_TEST_EMPTY_OPTIONS[@]}")
+    exit 0
+fi
 
 reject() {
     printf '[required-suite] error: %s\n' "$*" >&2
@@ -252,6 +289,8 @@ self_test() {
     local output substituted_output started passed inventory inventory_sha256
     local bad_inventory unsorted_inventory duplicate_inventory invalid_inventory
     local symlink_inventory candidate_sha256 inventory_suite_counts ci_suite_counts
+    local cleanup_self_test_status cleanup_self_test_output cleanup_self_test_path
+    local cleanup_self_test_prefix
 
     QVAC_CI_TEMP_DIR="$(mktemp -d)"
     listing="$QVAC_CI_TEMP_DIR/listing"
@@ -428,10 +467,42 @@ self_test() {
         return 1
     fi
 
-    printf '[required-suite-self-test] strict flags, CI suite mapping, inventory integrity, identity drift, count drift, zero execution, skips, and execution substitution are verified\n'
+    cleanup_self_test_prefix="QVAC_REQUIRED_CLEANUP_ARMED="
+    set +e
+    cleanup_self_test_output="$(
+        TMPDIR="$QVAC_CI_TEMP_DIR" \
+            /bin/bash "$SCRIPT_PATH" --internal-self-test-nounset-cleanup 2>/dev/null
+    )"
+    cleanup_self_test_status=$?
+    set -e
+    if [[ "$cleanup_self_test_status" -ne 1 ]]; then
+        reject "cleanup must fail closed after a Bash nounset expansion abort"
+        return 1
+    fi
+    case "$cleanup_self_test_output" in
+        "$cleanup_self_test_prefix"*) ;;
+        *)
+            reject "cleanup subprocess did not reach the armed nounset test point"
+            return 1
+            ;;
+    esac
+    cleanup_self_test_path="${cleanup_self_test_output#"$cleanup_self_test_prefix"}"
+    case "$cleanup_self_test_path" in
+        "$QVAC_CI_TEMP_DIR"/qvac-required-cleanup-test.*) ;;
+        *)
+            reject "cleanup subprocess reported an unexpected test directory"
+            return 1
+            ;;
+    esac
+    if [[ "$cleanup_self_test_path" == *$'\n'* ||
+          -e "$cleanup_self_test_path" || -L "$cleanup_self_test_path" ]]; then
+        reject "cleanup subprocess did not remove its armed test directory"
+        return 1
+    fi
+
+    printf '[required-suite-self-test] strict flags, CI suite mapping, inventory integrity, identity drift, count drift, zero execution, skips, execution substitution, and Bash nounset cleanup are verified\n'
 }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 REVIEWED_INVENTORY="$SCRIPT_DIR/required-suite-inventory.txt"
 CI_WORKFLOW="$REPOSITORY_ROOT/.github/workflows/ci.yml"
@@ -441,6 +512,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
         reject "usage: $0 <XCTestSuite> <expected-test-count> [test-module] | --self-test" || exit 2
     fi
     self_test "$REVIEWED_INVENTORY" "$CI_WORKFLOW"
+    RUN_COMPLETED=true
     exit 0
 fi
 
@@ -486,3 +558,4 @@ verify_execution \
     "$REVIEWED_SUITE" "$STARTED" "$PASSED"
 printf '[required-suite] %s.%s/ executed exactly %s reviewed tests with zero failures and zero skips\n' \
     "$MODULE" "$SUITE" "$EXPECTED"
+RUN_COMPLETED=true

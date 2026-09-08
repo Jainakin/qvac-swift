@@ -1,8 +1,8 @@
 import XCTest
 
-/// Manual release evidence for the complete iOS runtime path. Run this scheme on
-/// a provisioned physical device; it downloads a pinned model, exercises the
-/// bundled worker and native addons, verifies streamed output, and unloads cleanly.
+/// Physical-device evidence for the complete iOS runtime path. The test loads an
+/// immutable model revision from the worker cache or network, exercises the bundled
+/// worker and native addons, verifies completion output, and unloads cleanly.
 @MainActor
 final class QVACChatPhysicalDeviceTests: XCTestCase {
     private let app = XCUIApplication()

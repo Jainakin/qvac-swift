@@ -42,9 +42,9 @@ worker contract. The delivered client intentionally supports only QVAC SDK
 
 ## Recorded local validation
 
-The table records current working-tree calibration for the complete 626-test
-inventory. These local measurements do not replace clean hosted validation of
-the delivered commit.
+The table records reviewed local calibration for the complete 626-test
+inventory. Local measurements do not replace clean hosted validation or
+device evidence bound to the delivered commit.
 
 | Gate | Result |
 |---|---|
@@ -53,14 +53,14 @@ the delivered commit.
 | macOS Address Sanitizer | 626 of 626 passed with no failures, skips, or sanitizer diagnostics |
 | macOS Undefined Behavior Sanitizer | 626 of 626 passed with no failures, skips, or sanitizer diagnostics |
 | Required integration tests | 19 of 19 passed with no failures or skips, including live-worker, real-model completion and profiling, RAG, and upscaling coverage |
-| Handwritten macOS production coverage (current 626-test calibration) | 15,852/16,232 lines (97.66%), 1,405/1,483 functions (94.74%), and 4,856/5,214 regions (93.13%) |
+| Handwritten macOS production coverage (current 626-test calibration) | 15,852/16,232 lines (97.66%), 1,405/1,483 functions (94.74%), and 4,857/5,214 regions (93.15%) |
 | Generated-source coverage (current 626-test calibration) | 3,533/3,936 lines (89.76%), 325/325 functions (100%), and 1,966/2,235 regions (87.96%) |
-| Combined macOS production coverage (current 626-test calibration) | 19,385/20,168 lines (96.12%), 1,730/1,808 functions (95.69%), and 6,822/7,449 regions (91.58%) |
+| Combined macOS production coverage (current 626-test calibration) | 19,385/20,168 lines (96.12%), 1,730/1,808 functions (95.69%), and 6,823/7,449 regions (91.60%) |
 | iOS platform coverage (patched r2 adapter) | 37 of 37 reviewed tests passed. `BareIPCTransport.swift` measured 779/810 lines (96.17%), 108/116 functions (93.10%), and 258/282 regions (91.49%); supplemental `QVACClient.swift` and handshake measurements bring the gated iOS sources to 1,320/2,571 lines (51.34%), 160/289 functions (55.36%), and 421/894 regions (47.09%). |
-| Native IPC stress (patched r2, regular simulator) | 2 of 2 reviewed tests passed: a byte-exact 16 MiB backpressured echo, 12 concurrent close/read races, and a 256 MiB sustained-memory run with 245,808 bytes retained growth after warm-up and a 0.001035 fitted slope |
+| Native IPC stress (patched r2, regular simulator) | 2 of 2 reviewed tests passed: a byte-exact 16 MiB backpressured echo with 153 native backpressure events, 12 of 12 forced close/read overlaps with all 15 follower closes waiting in every iteration, and a 256 MiB sustained-memory run with zero measured retained growth and zero fitted slope after warm-up. The enforced limits are 32 MiB and 0.05 bytes per transferred byte. |
 | Native IPC stress (patched r2, Thread Sanitizer) | The exact close/read race test passed with the Swift and native BareKit units instrumented and no Thread Sanitizer diagnostic |
 | iOS Simulator Thread Sanitizer | The 37-test inventory passed locally with Swift-side instrumentation against the public r1 BareKit binary. The non-publishing artifact gate separately instruments every native unit built from the pinned patched BareKit source; its three prebuilt archives are excluded from that claim. |
-| Historical physical iPhone calibration (r1 only) | An earlier local run passed 1 of 1 selected arm64 test on an iPhone 15 Pro running iOS 26.6.1. `QVACChatPhysicalDeviceTests/testLoadStreamAndUnloadOnPhysicalDevice()` completed worker startup, model load, streaming inference, and unload using the immutable public r1 BareKit artifact. This evidence does not validate the patched r2 artifact and is not bound to the final delivered commit; an exact-source r2 device run remains pending. |
+| Patched r2 physical-device evidence | `run-ios-native-stress.sh` covers native backpressure, close/read concurrency, and sustained memory. `run-ios-physical-lifecycle.sh` covers app launch, model load, completion with nonempty output, and unload. Both fail closed unless the result binds an exact clean source archive, independently regenerated Xcode project, reviewed 37-framework SDK closure, selected r2 BareKit binary, and arm64 physical iOS device. Final results are recorded outside the source tree. |
 | Package manifest | SwiftPM resolves one library product backed by 38 checksum-pinned binary targets |
 | Publication guard | Fails closed on any of the six license/privacy blockers and on the separate BareKit r2 activation gate |
 
@@ -75,6 +75,9 @@ bound to SHA-256
 Its sanitizer inventory contains the exact close/read race identity and is
 bound to SHA-256
 `fec0733bd30026410a7244b9aaa4129a6085cb2961657fb3ab6fdd45c2b1a6aa`.
+The physical lifecycle inventory contains the exact load, completion, and
+unload identity and is bound to SHA-256
+`379e621bd70d872dbbe30d3e73f1f975ffdd4a63a2d4fabc389fb9050804325b`.
 The required integration inventory contains 19 exact XCTest identities and is
 bound to SHA-256
 `36fd43ce30aa0d22e278cb7fd3f5ba6835f44cafba08112f576f0acad811e134`.
@@ -116,11 +119,12 @@ must have a clean hosted validation run that confirms:
 5. DocC, external SwiftPM URL-consumer, example-application, and iOS runtime
    checks.
 
-Physical-device validation is not currently claimed for the final r2
-candidate. If it is included in the final review package, the signed test
-result must bind both the delivered source revision and the exact patched r2
-BareKit artifact. The historical r1 calibration above must not be presented as
-r2 evidence.
+The source tree does not by itself claim a final physical-device result. Any
+physical evidence included in the review package must be emitted by the
+dedicated runners and bind the delivered source revision, exact patched r2
+BareKit artifact, physical device metadata, reviewed test inventories, and
+retained attachments. Historical r1 results must not be presented as r2
+evidence.
 
 The delivery record outside this source tree must identify the delivered commit
 and its matching hosted run. Calibration output from a dirty worktree must not

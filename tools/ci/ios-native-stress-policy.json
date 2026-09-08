@@ -3,6 +3,10 @@
   "scheme": "QVACChat-NativeStress",
   "testModule": "QVACChatNativeStressTests",
   "patchMarker": "qvac-bare-kit-2.3.0-ipc-hardening-1",
+  "artifactTreeLockPath": "tools/ci/ios-local-artifact-tree-lock.json",
+  "artifactTreeLockSHA256": "e65402fd2c00c7fa3bfe491367461b8e63f2168bf0a22d91ff8b99db60436aa0",
+  "xcodeGenVersion": "2.46.0",
+  "xcodeGenExecutableSHA256": "8774da746668bc18fe74e54cbaf10f2631a1fb05947cd374179aa912f14f99db",
   "regular": {
     "inventoryPath": "tools/ci/ios-native-stress-test-inventory.txt",
     "inventorySHA256": "abb66aa33315d7afed7d6789bfb24430fecd0fa1fc1481c9c5ae9b6fa124dddf",

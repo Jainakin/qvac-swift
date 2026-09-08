@@ -15,6 +15,12 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import {
+  pinnedXcodeGenExecutableSHA256,
+  pinnedXcodeGenVersion,
+  reviewedArtifactLockSHA256,
+  verifyIsolatedBuildInputs,
+} from './verify-ios-build-inputs.mjs'
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url))
 const repositoryRoot = resolve(scriptDirectory, '../..')
@@ -28,6 +34,15 @@ function fail(message) {
 
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex')
+}
+
+function exactKeys(value, expected, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail(`${label} must be an object`)
+  const actual = Object.keys(value).sort()
+  const wanted = [...expected].sort()
+  if (JSON.stringify(actual) !== JSON.stringify(wanted)) {
+    fail(`${label} keys differ: expected ${wanted.join(', ')}, got ${actual.join(', ')}`)
+  }
 }
 
 function regularFile(path, label, maximumBytes = Number.MAX_SAFE_INTEGER) {
@@ -51,10 +66,21 @@ function parseJSON(bytes, label) {
 }
 
 function loadPolicy() {
-  const policy = parseJSON(regularFile(policyPath, 'native stress policy', maximumMetadataBytes), 'native stress policy')
+  const bytes = regularFile(policyPath, 'native stress policy', maximumMetadataBytes)
+  const policy = parseJSON(bytes, 'native stress policy')
+  exactKeys(policy, [
+    'schemaVersion', 'scheme', 'testModule', 'patchMarker',
+    'artifactTreeLockPath', 'artifactTreeLockSHA256',
+    'xcodeGenVersion', 'xcodeGenExecutableSHA256',
+    'regular', 'threadSanitizer', 'echo', 'memory',
+  ], 'native stress policy')
   if (policy.schemaVersion !== 1 || policy.scheme !== 'QVACChat-NativeStress'
       || policy.testModule !== 'QVACChatNativeStressTests'
-      || typeof policy.patchMarker !== 'string' || policy.patchMarker.length === 0) {
+      || policy.patchMarker !== 'qvac-bare-kit-2.3.0-ipc-hardening-1'
+      || policy.artifactTreeLockPath !== 'tools/ci/ios-local-artifact-tree-lock.json'
+      || policy.artifactTreeLockSHA256 !== reviewedArtifactLockSHA256
+      || policy.xcodeGenVersion !== pinnedXcodeGenVersion
+      || policy.xcodeGenExecutableSHA256 !== pinnedXcodeGenExecutableSHA256) {
     fail('native stress policy has unsupported identity metadata')
   }
   if (typeof policy.echo?.testIdentity !== 'string'
@@ -70,7 +96,7 @@ function loadPolicy() {
         !== policy.echo?.concurrentCloseCallersPerIteration - 1) {
     fail('native stress policy has invalid echo/race metadata')
   }
-  return policy
+  return { policy, bytes }
 }
 
 function loadInventory(policy, mode) {
@@ -121,7 +147,7 @@ function normalizeIdentity(value) {
   return value.replace(/\(\)$/, '')
 }
 
-function validateResult(result, inventory, expectedPlatform) {
+function validateResult(result, inventory, expectedPlatform, expectedDeviceID) {
   const cases = collectTestCases(result)
   const identities = cases.map(normalizeTestIdentity).sort()
   const expected = [...inventory.entries].sort()
@@ -140,14 +166,86 @@ function validateResult(result, inventory, expectedPlatform) {
   if (expectedPlatform === 'device' && device.platform !== 'iOS') {
     fail(`physical evidence must report platform iOS, got ${device.platform}`)
   }
-  if (typeof device.deviceId !== 'string' || device.deviceId.length === 0
+  if (device.deviceId !== expectedDeviceID
       || typeof device.osVersion !== 'string' || !String(device.architecture).startsWith('arm64')) {
-    fail('xcresult device identity is incomplete or not arm64')
+    fail('xcresult device identity differs from the requested arm64 destination')
   }
   return { cases, device }
 }
 
-function validateLog(log, mode, inventory, policy) {
+function escapeRegularExpression(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function invocationBlock(log) {
+  const marker = 'Command line invocation:\n'
+  const first = log.indexOf(marker)
+  if (first < 0 || log.indexOf(marker, first + marker.length) >= 0) {
+    fail('xcodebuild log must contain exactly one command-line invocation')
+  }
+  const block = log.slice(first + marker.length).split('\n\n', 1)[0]
+    .split('\n').map(line => line.trim()).filter(Boolean).join(' ')
+  if (!/(?:^|\/)xcodebuild(?:\s|$)/.test(block)) {
+    fail('xcodebuild command-line invocation is malformed')
+  }
+  return block
+}
+
+function invocationSelectsExactlyOnce(invocation, flag, value) {
+  const escapedFlag = escapeRegularExpression(flag)
+  const escapedValue = escapeRegularExpression(value)
+  const flagCount = (invocation.match(new RegExp(
+    `(?:^|\\s)${escapedFlag}(?=\\s|$)`,
+    'g',
+  )) || []).length
+  return flagCount === 1 && new RegExp(
+    `(?:^|\\s)${escapedFlag}\\s+(?:"${escapedValue}"|'${escapedValue}'|${escapedValue})(?:\\s|$)`,
+  ).test(invocation)
+}
+
+function invocationAssignsExactlyOnce(invocation, setting, value) {
+  const escapedSetting = escapeRegularExpression(setting)
+  const escapedValue = escapeRegularExpression(value)
+  const assignmentCount = (invocation.match(new RegExp(
+    `(?:^|\\s)["']?${escapedSetting}\\s*=`,
+    'g',
+  )) || []).length
+  return assignmentCount === 1 && new RegExp(
+    `(?:^|\\s)["']?${escapedSetting}\\s*=\\s*${escapedValue}["']?(?:\\s|$)`,
+  ).test(invocation)
+}
+
+function invocationTokenCount(invocation, token) {
+  const escapedToken = escapeRegularExpression(token)
+  return (invocation.match(new RegExp(
+    `(?:^|\\s)["']?${escapedToken}["']?(?=\\s|$)`,
+    'g',
+  )) || []).length
+}
+
+function invocationAssignmentCount(invocation, setting) {
+  const escapedSetting = escapeRegularExpression(setting)
+  return (invocation.match(new RegExp(
+    `(?:^|\\s)["']?${escapedSetting}\\s*=`,
+    'g',
+  )) || []).length
+}
+
+function validateLog(
+  log,
+  mode,
+  expectedPlatform,
+  inventory,
+  policy,
+  expectedDeviceID,
+  expectedProject,
+  expectedResult,
+  expectedDerivedData,
+  expectedTeam,
+  allowProvisioningUpdates,
+  allowDeviceRegistration,
+) {
+  const invocation = invocationBlock(log)
   if ((log.match(/\*\* TEST(?: EXECUTE)? SUCCEEDED \*\*/g) || []).length !== 1) {
     fail('xcodebuild log must contain exactly one successful test-execution marker')
   }
@@ -157,21 +255,57 @@ function validateLog(log, mode, inventory, policy) {
       || /Executed 0 tests?/m.test(log)) {
     fail('xcodebuild log contains a failure, skip, or empty run')
   }
-  if (!log.includes(`-scheme ${policy.scheme}`) && !log.includes(`"${policy.scheme}"`)) {
+  if (!invocationSelectsExactlyOnce(invocation, '-scheme', policy.scheme)) {
     fail(`xcodebuild log does not select ${policy.scheme}`)
   }
-  if (!log.includes(`-only-testing:${policy.testModule}`)) {
-    fail(`xcodebuild log is not restricted to ${policy.testModule}`)
+  const expectedTestSelector = mode === 'thread-sanitizer'
+    ? `${policy.testModule}/${inventory.entries[0]}`
+    : policy.testModule
+  const onlyTesting = invocation.match(/-only-testing:[^\s"]+/g) || []
+  if (onlyTesting.length !== 1
+      || onlyTesting[0] !== `-only-testing:${expectedTestSelector}`
+      || /-skip-testing:/.test(invocation)) {
+    fail('xcodebuild invocation is not restricted to the exact reviewed test inventory')
+  }
+  const platform = expectedPlatform === 'simulator' ? 'iOS Simulator' : 'iOS'
+  if (!invocationSelectsExactlyOnce(invocation, '-destination', `platform=${platform},id=${expectedDeviceID}`)
+      || !invocationSelectsExactlyOnce(invocation, '-project', expectedProject)
+      || !invocationSelectsExactlyOnce(invocation, '-resultBundlePath', expectedResult)
+      || !invocationSelectsExactlyOnce(invocation, '-derivedDataPath', expectedDerivedData)) {
+    fail('xcodebuild invocation does not bind the requested destination and isolated output paths')
+  }
+  const provisioningUpdatesCount = invocationTokenCount(invocation, '-allowProvisioningUpdates')
+  const deviceRegistrationCount = invocationTokenCount(
+    invocation,
+    '-allowProvisioningDeviceRegistration',
+  )
+  if (expectedPlatform === 'simulator') {
+    if (expectedTeam !== 'none' || allowProvisioningUpdates || allowDeviceRegistration
+        || !invocationAssignsExactlyOnce(invocation, 'CODE_SIGNING_ALLOWED', 'NO')
+        || invocationAssignmentCount(invocation, 'CODE_SIGN_STYLE') !== 0
+        || invocationAssignmentCount(invocation, 'DEVELOPMENT_TEAM') !== 0
+        || provisioningUpdatesCount !== 0 || deviceRegistrationCount !== 0) {
+      fail('Simulator invocation contains unexpected device-signing configuration')
+    }
+  } else if (!/^[A-Z0-9]{10}$/.test(expectedTeam)
+      || !invocationAssignsExactlyOnce(invocation, 'CODE_SIGN_STYLE', 'Automatic')
+      || !invocationAssignsExactlyOnce(invocation, 'DEVELOPMENT_TEAM', expectedTeam)
+      || invocationAssignmentCount(invocation, 'CODE_SIGNING_ALLOWED') !== 0
+      || provisioningUpdatesCount !== Number(allowProvisioningUpdates)
+      || deviceRegistrationCount !== Number(allowDeviceRegistration)) {
+    fail('physical-device invocation does not bind the reviewed signing configuration')
   }
   if (!log.includes('QVAC_NATIVE_STRESS_TESTING')) {
     fail('native stress test-only compilation condition is absent')
   }
   if (mode === 'thread-sanitizer') {
     const race = inventory.entries[0]
-    if (!log.includes(`-only-testing:${policy.testModule}/${race}`)) {
+    if (!invocation.includes(`-only-testing:${policy.testModule}/${race}`)) {
       fail('Thread Sanitizer run is not restricted to the reviewed native race test')
     }
-    if (!/-enableThreadSanitizer\s+YES/.test(log)) fail('Thread Sanitizer is not enabled')
+    if (!invocationSelectsExactlyOnce(invocation, '-enableThreadSanitizer', 'YES')) {
+      fail('Thread Sanitizer is not enabled exactly once')
+    }
     validateThreadSanitizedSwiftTarget(log, 'QVACClient', 'QVACClient')
     validateThreadSanitizedSwiftTarget(
       log,
@@ -184,7 +318,7 @@ function validateLog(log, mode, inventory, policy) {
     if (/ThreadSanitizer:|(?:WARNING|SUMMARY): ThreadSanitizer|ThreadSanitizer is not supported/i.test(log)) {
       fail('Thread Sanitizer reported a diagnostic or was unavailable')
     }
-  } else if (/-enableThreadSanitizer\s+YES/.test(log)) {
+  } else if (invocation.includes('-enableThreadSanitizer')) {
     fail('regular memory evidence unexpectedly enabled Thread Sanitizer')
   }
 }
@@ -668,31 +802,103 @@ function syntheticDeviceMachO(linkeditVirtualSize) {
 }
 
 function selfTest() {
-  const policy = loadPolicy()
+  const { policy } = loadPolicy()
   const regular = loadInventory(policy, 'regular')
-  validateResult(syntheticResult(regular.entries), regular, 'simulator')
+  const deviceID = '11111111-2222-3333-4444-555555555555'
+  const project = '/tmp/qvac-source/Examples/QVACChat/QVACChat.xcodeproj'
+  const resultBundle = '/tmp/qvac-evidence/native-stress.xcresult'
+  const derivedData = '/tmp/qvac-derived-data'
+  const result = syntheticResult(regular.entries)
+  result.devices[0].deviceId = deviceID
+  validateResult(result, regular, 'simulator', deviceID)
   expectFailure(
-    () => validateResult(syntheticResult(regular.entries.slice(1)), regular, 'simulator'),
+    () => validateResult(syntheticResult(regular.entries.slice(1)), regular, 'simulator', 'SIM-1'),
     'an omitted reviewed test',
   )
   expectFailure(
-    () => validateResult(syntheticResult(regular.entries, 'Skipped'), regular, 'simulator'),
+    () => validateResult(syntheticResult(regular.entries, 'Skipped'), regular, 'simulator', 'SIM-1'),
     'a skipped reviewed test',
   )
   expectFailure(
-    () => validateResult(syntheticResult(regular.entries, 'Passed', 'iOS'), regular, 'simulator'),
+    () => validateResult(syntheticResult(regular.entries, 'Passed', 'iOS'), regular, 'simulator', 'SIM-1'),
     'a physical result presented as Simulator evidence',
   )
+  expectFailure(
+    () => validateResult(result, regular, 'simulator', 'AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE'),
+    'an xcresult from a different device',
+  )
+  const invocation = selector => [
+    'Command line invocation:',
+    `    /xcode/xcodebuild -project ${project} -scheme ${policy.scheme} -destination "platform=iOS Simulator,id=${deviceID}" -derivedDataPath ${derivedData} -resultBundlePath ${resultBundle} "-only-testing:${selector}" CODE_SIGNING_ALLOWED=NO`,
+    '',
+  ].join('\n')
   const regularLog = [
-    `xcodebuild -scheme ${policy.scheme}`,
+    invocation(policy.testModule),
     'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) QVAC_NATIVE_STRESS_TESTING',
-    `-only-testing:${policy.testModule}`,
     '** TEST SUCCEEDED **',
   ].join('\n')
-  validateLog(regularLog, 'regular', regular, policy)
+  const validateRegularLog = log => validateLog(
+    log, 'regular', 'simulator', regular, policy,
+    deviceID, project, resultBundle, derivedData,
+    'none', false, false,
+  )
+  validateRegularLog(regularLog)
   expectFailure(
-    () => validateLog(`${regularLog}\nTest Case synthetic skipped (0 seconds)`, 'regular', regular, policy),
+    () => validateRegularLog(`${regularLog}\nTest Case synthetic skipped (0 seconds)`),
     'a skipped xcodebuild log',
+  )
+  expectFailure(
+    () => validateRegularLog(regularLog.replace(project, '/tmp/other/QVACChat.xcodeproj')),
+    'a build log from a different project',
+  )
+  expectFailure(
+    () => validateRegularLog(regularLog.replace(resultBundle, '/tmp/other/result.xcresult')),
+    'a build log writing a different result bundle',
+  )
+  expectFailure(
+    () => validateRegularLog(regularLog.replace(derivedData, '/tmp/other/DerivedData')),
+    'a build log using different DerivedData',
+  )
+  expectFailure(
+    () => validateRegularLog(regularLog.replace(deviceID, 'AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE')),
+    'a build log selecting a different destination',
+  )
+  for (const [needle, override, label] of [
+    [`-project ${project}`, `-project ${project} -project /tmp/other/QVACChat.xcodeproj`, 'duplicate project'],
+    [`-scheme ${policy.scheme}`, `-scheme ${policy.scheme} -scheme OtherScheme`, 'duplicate scheme'],
+    [`-destination "platform=iOS Simulator,id=${deviceID}"`, `-destination "platform=iOS Simulator,id=${deviceID}" -destination "platform=iOS Simulator,id=OTHER-DEVICE"`, 'duplicate destination'],
+    [`-derivedDataPath ${derivedData}`, `-derivedDataPath ${derivedData} -derivedDataPath /tmp/other/DerivedData`, 'duplicate DerivedData path'],
+    [`-resultBundlePath ${resultBundle}`, `-resultBundlePath ${resultBundle} -resultBundlePath /tmp/other/result.xcresult`, 'duplicate result bundle path'],
+    ['CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_ALLOWED=NO CODE_SIGNING_ALLOWED=YES', 'duplicate signing setting'],
+  ]) {
+    expectFailure(
+      () => validateRegularLog(regularLog.replace(needle, override)),
+      `a build log with a ${label} override`,
+    )
+  }
+  const developmentTeam = 'ABCDEFGHIJ'
+  const deviceLog = regularLog
+    .replace(`platform=iOS Simulator,id=${deviceID}`, `platform=iOS,id=${deviceID}`)
+    .replace(
+      'CODE_SIGNING_ALLOWED=NO',
+      `CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=${developmentTeam} -allowProvisioningUpdates`,
+    )
+  validateLog(
+    deviceLog, 'regular', 'device', regular, policy,
+    deviceID, project, resultBundle, derivedData,
+    developmentTeam, true, false,
+  )
+  expectFailure(
+    () => validateLog(
+      deviceLog.replace(
+        `DEVELOPMENT_TEAM=${developmentTeam}`,
+        `DEVELOPMENT_TEAM=${developmentTeam} DEVELOPMENT_TEAM=ZZZZZZZZZZ`,
+      ),
+      'regular', 'device', regular, policy,
+      deviceID, project, resultBundle, derivedData,
+      developmentTeam, true, false,
+    ),
+    'a physical build log with a duplicate development-team override',
   )
   const race = loadInventory(policy, 'thread-sanitizer')
   const syntheticSwiftDriver = (target, project) => [
@@ -701,35 +907,35 @@ function selfTest() {
     `    builtin-SwiftDriver -- /xcode/swiftc -module-name ${target} -sanitize\\=thread -output-file-map /tmp/Objects-normal-tsan/arm64/${target}.json`,
   ].join('\n')
   const threadSanitizerLog = [
-    `xcodebuild -scheme ${policy.scheme} -enableThreadSanitizer YES`,
+    invocation(`${policy.testModule}/${race.entries[0]}`).replace(
+      ' -derivedDataPath',
+      ' -enableThreadSanitizer YES -derivedDataPath',
+    ),
     'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) QVAC_NATIVE_STRESS_TESTING',
-    `-only-testing:${policy.testModule}/${race.entries[0]}`,
     syntheticSwiftDriver('QVACClient', 'QVACClient'),
     syntheticSwiftDriver('QVACChatNativeStressTests', 'QVACChat'),
     'libclang_rt.tsan_iossim_dynamic.dylib',
     '** TEST SUCCEEDED **',
   ].join('\n')
-  validateLog(threadSanitizerLog, 'thread-sanitizer', race, policy)
+  const validateThreadSanitizerLog = log => validateLog(
+    log, 'thread-sanitizer', 'simulator', race, policy,
+    deviceID, project, resultBundle, derivedData,
+    'none', false, false,
+  )
+  validateThreadSanitizerLog(threadSanitizerLog)
   expectFailure(
-    () => validateLog([
-      `xcodebuild -scheme ${policy.scheme} -enableThreadSanitizer YES`,
-      'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) QVAC_NATIVE_STRESS_TESTING',
-      `-only-testing:${policy.testModule}/${race.entries[0]}`,
-      syntheticSwiftDriver('QVACChatNativeStressTests', 'QVACChat'),
-      'libclang_rt.tsan_iossim_dynamic.dylib',
-      '** TEST SUCCEEDED **',
-    ].join('\n'), 'thread-sanitizer', race, policy),
+    () => validateThreadSanitizerLog(
+      threadSanitizerLog.replace(syntheticSwiftDriver('QVACClient', 'QVACClient'), ''),
+    ),
     'Thread Sanitizer evidence without an instrumented QVACClient target',
   )
   expectFailure(
-    () => validateLog([
-      `xcodebuild -scheme ${policy.scheme} -enableThreadSanitizer YES`,
-      'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) QVAC_NATIVE_STRESS_TESTING',
-      `-only-testing:${policy.testModule}/${race.entries[0]}`,
-      syntheticSwiftDriver('QVACClient', 'QVACClient'),
-      'libclang_rt.tsan_iossim_dynamic.dylib',
-      '** TEST SUCCEEDED **',
-    ].join('\n'), 'thread-sanitizer', race, policy),
+    () => validateThreadSanitizerLog(
+      threadSanitizerLog.replace(
+        syntheticSwiftDriver('QVACChatNativeStressTests', 'QVACChat'),
+        '',
+      ),
+    ),
     'Thread Sanitizer evidence without an instrumented native stress test target',
   )
 
@@ -927,7 +1133,9 @@ function parseArguments(argv) {
   }
   const expected = [
     '--mode', '--platform', '--xcresult', '--log', '--derived-data', '--candidate',
-    '--source-sha', '--output',
+    '--device-id', '--development-team', '--allow-provisioning-updates',
+    '--allow-provisioning-device-registration', '--source-archive', '--source-root',
+    '--source-sha', '--xcodegen', '--output',
   ]
   if (values.size !== expected.length || expected.some(key => !values.has(key))) {
     fail(`usage: ${expected.join(' <value> ')} <value>`)
@@ -942,10 +1150,30 @@ try {
     const args = parseArguments(process.argv.slice(2))
     if (!['regular', 'thread-sanitizer'].includes(args.mode)) fail('mode must be regular or thread-sanitizer')
     if (!['simulator', 'device'].includes(args.platform)) fail('platform must be simulator or device')
+    if (!/^[A-Za-z0-9-]{8,64}$/.test(args['device-id'])) fail('device ID has invalid syntax')
+    if (!['true', 'false'].includes(args['allow-provisioning-updates'])
+        || !['true', 'false'].includes(args['allow-provisioning-device-registration'])) {
+      fail('provisioning policy arguments must be true or false')
+    }
+    const allowProvisioningUpdates = args['allow-provisioning-updates'] === 'true'
+    const allowDeviceRegistration = args['allow-provisioning-device-registration'] === 'true'
+    if (args.platform === 'simulator') {
+      if (args['development-team'] !== 'none'
+          || allowProvisioningUpdates || allowDeviceRegistration) {
+        fail('Simulator evidence cannot request physical-device signing')
+      }
+    } else if (!/^[A-Z0-9]{10}$/.test(args['development-team'])) {
+      fail('physical-device evidence requires a valid development team')
+    } else if (allowDeviceRegistration && !allowProvisioningUpdates) {
+      fail('device registration requires provisioning updates')
+    }
     if (args.mode === 'thread-sanitizer' && args.platform !== 'simulator') {
       fail('Thread Sanitizer evidence is Simulator-only')
     }
     if (!/^[0-9a-f]{40}$/.test(args['source-sha'])) fail('source SHA must be a full lowercase Git commit')
+    for (const key of ['source-archive', 'source-root', 'xcodegen']) {
+      if (!args[key].startsWith('/')) fail(`${key} must be absolute`)
+    }
     const repositoryHead = run(
       'git',
       ['-C', repositoryRoot, 'rev-parse', '--verify', 'HEAD'],
@@ -964,19 +1192,45 @@ try {
     const logPath = resolve(args.log)
     const derivedData = resolve(args['derived-data'])
     const candidate = resolve(args.candidate)
+    const sourceRoot = resolve(args['source-root'])
     const output = resolve(args.output)
     realDirectory(xcresult, 'xcresult bundle')
     realDirectory(derivedData, 'DerivedData')
+    realDirectory(sourceRoot, 'isolated source root')
     const logBytes = regularFile(logPath, 'xcodebuild log', maximumLogBytes)
     const log = logBytes.toString('utf8')
-    const policy = loadPolicy()
+    const { policy, bytes: policyBytes } = loadPolicy()
     const inventory = loadInventory(policy, args.mode)
-    validateLog(log, args.mode, inventory, policy)
+    const buildInputs = verifyIsolatedBuildInputs({
+      sourceArchive: resolve(args['source-archive']),
+      sourceRoot,
+      sourceCommit: args['source-sha'],
+      xcodegen: resolve(args.xcodegen),
+    })
+    validateLog(
+      log,
+      args.mode,
+      args.platform,
+      inventory,
+      policy,
+      args['device-id'],
+      join(sourceRoot, 'Examples', 'QVACChat', 'QVACChat.xcodeproj'),
+      xcresult,
+      derivedData,
+      args['development-team'],
+      allowProvisioningUpdates,
+      allowDeviceRegistration,
+    )
 
     const resultText = run('xcrun', [
       'xcresulttool', 'get', 'test-results', 'tests', '--path', xcresult, '--format', 'json',
     ], 'xcresult test extraction')
-    const { cases, device } = validateResult(JSON.parse(resultText), inventory, args.platform)
+    const { cases, device } = validateResult(
+      JSON.parse(resultText),
+      inventory,
+      args.platform,
+      args['device-id'],
+    )
     const candidateEvidence = validateEmbeddedCandidate(
       candidate,
       derivedData,
@@ -1000,6 +1254,20 @@ try {
       mode: args.mode,
       platform: args.platform,
       sourceCommit: args['source-sha'],
+      sourceArchiveSHA256: buildInputs.sourceArchive.sha256,
+      buildInputs: {
+        effectiveSourceTree: buildInputs.effectiveSourceTree,
+        generatedProject: buildInputs.generatedProject,
+        xcodeGen: buildInputs.xcodeGen,
+        artifactClosure: buildInputs.artifactClosure,
+      },
+      policySHA256: sha256(policyBytes),
+      signing: args.platform === 'device' ? {
+        style: 'Automatic',
+        developmentTeam: args['development-team'],
+        allowProvisioningUpdates,
+        allowProvisioningDeviceRegistration: allowDeviceRegistration,
+      } : { codeSigningAllowed: false },
       candidate: {
         patchMarker: policy.patchMarker,
         selectedBinarySHA256: candidateEvidence.expectedSHA256,

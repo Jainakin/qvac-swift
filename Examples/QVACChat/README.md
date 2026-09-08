@@ -30,7 +30,28 @@ and storage for that download. Subsequent runs can use the worker's local cache.
 For release validation, select the `QVACChat-PhysicalDevice` scheme and run its
 UI test on a provisioned, unlocked device. The test fails if it is launched on a
 simulator. It records screenshots while it loads the immutable model revision,
-receives streamed completion output, and unloads the model.
+finishes a completion with nonempty output, and unloads the model.
+
+Final r2 evidence must use the dedicated runner rather than the generated project
+directly. It builds an exact clean commit with all 38 local artifacts, replaces
+BareKit with the selected candidate, checks that the device is unlocked before
+building, and validates the one-test result and four screenshots:
+
+```bash
+tools/ci/run-ios-physical-lifecycle.sh --self-test
+QVAC_XCODEGEN=/absolute/path/to/xcodegen-2.46.0 \
+tools/ci/run-ios-physical-lifecycle.sh \
+  --source-sha <full-commit-sha> \
+  --destination 'platform=iOS,id=<device-udid>' \
+  --candidate /absolute/path/to/BareKit.xcframework \
+  --evidence-dir /absolute/new/path/outside/the/repository \
+  --development-team <team-identifier> \
+  --allow-provisioning-updates
+```
+
+Keep the device connected, trusted, paired, in Developer Mode, and unlocked for
+the entire run. The test may use the worker's existing model cache; it does not
+attest a cold model download or incremental token timing.
 
 ## Native IPC stress validation
 
@@ -44,8 +65,9 @@ selected binary and stores the validated results and build-log digest.
 
 The runner requires a clean checkout, all 38 development XCFrameworks staged by
 `tools/runtime/link-ios-artifacts.sh`, the patched r2 `BareKit.xcframework`, and
-XcodeGen 2.46.0 selected with `QVAC_XCODEGEN`. Run its argument and negative-gate
-self-tests with:
+XcodeGen 2.46.0 selected with `QVAC_XCODEGEN`. It independently reproduces the
+source archive and generated project, and verifies the canonical 37-framework
+SDK lock before and after the build. Run its negative-gate self-tests with:
 
 ```bash
 tools/ci/run-ios-native-stress.sh --self-test
@@ -74,8 +96,8 @@ tools/ci/run-ios-native-stress.sh \
   --destination 'platform=iOS,id=<device-identifier>' \
   --candidate /absolute/path/to/BareKit.xcframework \
   --evidence-dir /absolute/path/outside/the/repository \
-  -- DEVELOPMENT_TEAM=<team-identifier> CODE_SIGN_STYLE=Automatic \
-     -allowProvisioningUpdates
+  --development-team <team-identifier> \
+  --allow-provisioning-updates
 ```
 
 Thread Sanitizer is intentionally a separate simulator-only run restricted to

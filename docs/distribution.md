@@ -114,6 +114,68 @@ The runtime closure contains the 37 addons referenced by the worker plus BareKit
 Staged frameworks that are not referenced by the worker or by a Mach-O dependency
 are excluded.
 
+### Reviewed XCFramework tree lock
+
+[`ios-local-artifact-tree-lock.json`](../tools/ci/ios-local-artifact-tree-lock.json)
+binds every non-BareKit target in the development manifest to a reviewed,
+cross-runner canonical tree digest. Packaging verifies all 37 entries against
+that lock, verifies BareKit independently, and requires the packaged target set
+to equal the reviewed 38-target closure. Every generated ZIP is then extracted
+to a new temporary directory and compared with its staged XCFramework before it
+can enter a release candidate.
+
+The canonical artifact-tree algorithm has these invariants:
+
+- Relative paths are visited in sorted depth-first order. Directories, including
+  empty directories, and regular files are distinct entry types.
+- Directory and file permission bits are bound. XCFramework roots must be mode
+  `0755`; setuid, setgid, sticky bits, symbolic links, and special filesystem
+  entries are rejected.
+- Regular-file sizes and SHA-256 digests are bound. User/group ownership,
+  timestamps, ACLs, and extended attributes are excluded because they are
+  checkout and archive-extraction metadata rather than package semantics.
+- The device binary must be thin arm64. The Simulator binary must contain arm64
+  and x86_64 slices in the reviewed topology.
+- The XCFramework and nested frameworks must have valid strict ad-hoc signatures
+  with no team, internal requirement, or entitlements. Signature-envelope types
+  and modes are validated before their host-specific bytes are excluded.
+- Mach-O signatures are removed only in a temporary copy with
+  `/usr/bin/codesign`. The remaining `__LINKEDIT` virtual size is derived from
+  its bound file extent using the architecture page size; all other normalized
+  Mach-O bytes remain covered by the digest.
+
+Raw signed XCFrameworks are not expected to be byte-identical across macOS and
+Xcode signing implementations. Ad-hoc signature envelopes and signing-induced
+`__LINKEDIT` padding can differ even when the executable payload is identical.
+Do not edit or strip the staged inputs to make them match. The canonical lock is
+the cross-runner semantic comparison; the published ZIP and its SwiftPM checksum
+still bind the exact signed bytes delivered to consumers.
+
+Regenerate the lock only during an explicitly reviewed SDK or artifact update.
+Produce candidate documents from two independently staged raw roots, preferably
+one local build and one clean hosted `macos-15` build:
+
+```bash
+node tools/ci/verify-ios-build-inputs.mjs \
+  --generate-artifact-lock \
+  --artifact-root /absolute/path/to/local/artifacts \
+  > /tmp/ios-artifact-lock.local.json
+
+node tools/ci/verify-ios-build-inputs.mjs \
+  --generate-artifact-lock \
+  --artifact-root /absolute/path/to/hosted/artifacts \
+  > /tmp/ios-artifact-lock.hosted.json
+
+cmp /tmp/ios-artifact-lock.local.json /tmp/ios-artifact-lock.hosted.json
+shasum -a 256 /tmp/ios-artifact-lock.local.json
+```
+
+Review any difference as an artifact or canonicalization change; do not accept a
+new digest merely because a build completed. After review, replace the committed
+lock, update `reviewedArtifactLockSHA256` and both iOS evidence-policy lock pins,
+then run the verifier self-test and verify both raw roots again. Algorithm changes
+require a new algorithm identifier as well as new reviewed digests.
+
 ## 2. Prepare an artifact candidate
 
 Run the **Build SDK 0.17 Artifacts** workflow on `main` with a new revision number

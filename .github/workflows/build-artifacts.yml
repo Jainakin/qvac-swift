@@ -262,6 +262,7 @@ jobs:
       - name: Validate native IPC backpressure, close/read races, and memory stability
         run: |
           tools/ci/run-ios-native-stress.sh --self-test
+          tools/ci/run-ios-physical-lifecycle.sh --self-test
           tools/ci/run-ios-native-stress.sh \
             --mode regular \
             --platform simulator \
