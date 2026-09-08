@@ -364,6 +364,13 @@ fi
 XCODEBUILD+=(test)
 "${XCODEBUILD[@]}" 2>&1 | tee "$TEST_LOG"
 
+# Xcode resolves the local package during the build and recreates `.swiftpm`
+# inside the isolated source archive. It is build state, not source input; remove
+# only this already-validated path before the post-build source attestation.
+rm -rf "$SWIFTPM_STATE"
+[[ ! -e "$SWIFTPM_STATE" && ! -L "$SWIFTPM_STATE" ]] \
+    || fail "could not remove post-build SwiftPM source-tree state"
+
 diff --recursive --brief "$CANDIDATE" "$TEMP_BARE_KIT" >/dev/null \
     || fail "selected BareKit candidate changed during physical lifecycle validation"
 node "$VERIFIER" \
