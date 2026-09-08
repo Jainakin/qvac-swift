@@ -326,8 +326,11 @@ cp "$SOURCE_COPY/Package.swift.dev" "$SOURCE_COPY/Package.swift"
     swift package dump-package >/dev/null
 )
 SWIFTPM_STATE="$SOURCE_COPY/.swiftpm"
+XCODE_WORKSPACE_STATE="$SOURCE_COPY/Examples/QVACChat/QVACChat.xcodeproj/project.xcworkspace/xcshareddata"
 [[ "$SWIFTPM_STATE" == "$WORK_ROOT/"* ]] \
     || fail "internal SwiftPM state path escaped work root"
+[[ "$XCODE_WORKSPACE_STATE" == "$WORK_ROOT/"* ]] \
+    || fail "internal Xcode workspace state path escaped work root"
 rm -rf "$SWIFTPM_STATE"
 [[ ! -e "$SWIFTPM_STATE" && ! -L "$SWIFTPM_STATE" ]] \
     || fail "could not remove generated SwiftPM source-tree state"
@@ -388,11 +391,15 @@ else
 fi
 
 # Xcode resolves the local package during the build and recreates `.swiftpm`
-# inside the isolated source archive. It is build state, not source input; remove
-# only this already-validated path before the post-build source attestation.
+# plus workspace-shared SwiftPM state inside the isolated source archive. These
+# exact paths are build outputs, not source inputs; remove only them before the
+# post-build source attestation.
 rm -rf "$SWIFTPM_STATE"
+rm -rf "$XCODE_WORKSPACE_STATE"
 [[ ! -e "$SWIFTPM_STATE" && ! -L "$SWIFTPM_STATE" ]] \
     || fail "could not remove post-build SwiftPM source-tree state"
+[[ ! -e "$XCODE_WORKSPACE_STATE" && ! -L "$XCODE_WORKSPACE_STATE" ]] \
+    || fail "could not remove post-build Xcode workspace state"
 
 node "$VERIFIER" \
     --mode "$MODE" \
