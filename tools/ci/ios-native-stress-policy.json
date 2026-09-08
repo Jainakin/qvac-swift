@@ -4,7 +4,7 @@
   "testModule": "QVACChatNativeStressTests",
   "patchMarker": "qvac-bare-kit-2.3.0-ipc-hardening-1",
   "artifactTreeLockPath": "tools/ci/ios-local-artifact-tree-lock.json",
-  "artifactTreeLockSHA256": "e65402fd2c00c7fa3bfe491367461b8e63f2168bf0a22d91ff8b99db60436aa0",
+  "artifactTreeLockSHA256": "3943408b1d6485b6a376c28ab79b744ffc4fd03fe54fb6b561b19ea15e6f137d",
   "xcodeGenVersion": "2.46.0",
   "xcodeGenExecutableSHA256": "8774da746668bc18fe74e54cbaf10f2631a1fb05947cd374179aa912f14f99db",
   "regular": {

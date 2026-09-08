@@ -31,15 +31,18 @@ const maximumMetadataBytes = 1024 * 1024
 const maximumSourceArchiveBytes = 512 * 1024 * 1024
 const hashBuffer = Buffer.allocUnsafe(1024 * 1024)
 const sourceTreeAlgorithm = 'qvac-canonical-source-tree-v1'
-const artifactTreeAlgorithm = 'qvac-canonical-signed-xcframework-v1'
+const artifactTreeAlgorithm = 'qvac-canonical-signed-xcframework-v2'
 const artifactMapAlgorithm = 'qvac-canonical-ios-artifact-map-v1'
-const maximumResidualSigningVirtualBytes = 1024n * 1024n
 const codeSignPath = '/usr/bin/codesign'
+const maximumCodeSignatureBytes = 1024n * 1024n
+const maximumSignatureEnvelopeEntries = 64
+const maximumSignatureEnvelopeDepth = 4
+const maximumSignatureEnvelopeTotalBytes = 4 * 1024 * 1024
 
 // Updated together with ios-local-artifact-tree-lock.json after an explicit
 // review of a newly staged SDK closure.
 export const reviewedArtifactLockSHA256 =
-  'e65402fd2c00c7fa3bfe491367461b8e63f2168bf0a22d91ff8b99db60436aa0'
+  '3943408b1d6485b6a376c28ab79b744ffc4fd03fe54fb6b561b19ea15e6f137d'
 export const pinnedXcodeGenVersion = '2.46.0'
 export const pinnedXcodeGenExecutableSHA256 =
   '8774da746668bc18fe74e54cbaf10f2631a1fb05947cd374179aa912f14f99db'
@@ -114,7 +117,7 @@ function validateAdHocSignatureMetadata(metadata, entitlementDisplay, label) {
   if (!/^Signature=adhoc$/m.test(metadata)
       || !/^TeamIdentifier=not set$/m.test(metadata)
       || !/^Internal requirements count=0(?:\s|$)/m.test(metadata)
-      || !/^CodeDirectory .*flags=.*\(adhoc\)/m.test(metadata)) {
+      || !/^CodeDirectory [^\r\n]*\bflags=0x2\(adhoc\)(?:\s|$)/m.test(metadata)) {
     fail(`${label} must use the reviewed ad-hoc, no-team signature identity`)
   }
   const entitlementLines = entitlementDisplay.split('\n')
@@ -125,15 +128,22 @@ function validateAdHocSignatureMetadata(metadata, entitlementDisplay, label) {
   }
 }
 
-function verifyAdHocSignature(path, label) {
-  const display = spawnSync(codeSignPath, ['-d', '--verbose=4', path], {
+function verifyAdHocSignature(path, label, architecture) {
+  const architectureArguments = architecture === undefined
+    ? []
+    : ['--architecture', architecture]
+  const display = spawnSync(codeSignPath, [
+    '-d', '--verbose=4', ...architectureArguments, path,
+  ], {
     encoding: 'utf8',
     maxBuffer: 1024 * 1024,
   })
   if (display.status !== 0) {
     fail(`${label} signature metadata inspection failed`)
   }
-  const entitlements = spawnSync(codeSignPath, ['-d', '--entitlements', '-', path], {
+  const entitlements = spawnSync(codeSignPath, [
+    '-d', ...architectureArguments, '--entitlements', '-', path,
+  ], {
     encoding: 'utf8',
     maxBuffer: 1024 * 1024,
   })
@@ -237,10 +247,17 @@ function machOSlices(bytes, label) {
     fail(`${label} uses an unsupported byte-swapped fat header`)
   }
   if (bigEndianMagic !== 0xcafebabe) {
+    if (bytes.length < 32) fail(`${label} has a truncated 64-bit Mach-O header`)
     if (bytes.readUInt32LE(0) !== 0xfeedfacf) {
       fail(`${label} must contain only little-endian MH_MAGIC_64 slices`)
     }
-    return [{ offset: 0, size: bytes.length, cpuType: bytes.readInt32LE(4) }]
+    return [{
+      offset: 0,
+      size: bytes.length,
+      cpuType: bytes.readInt32LE(4),
+      cpuSubtype: bytes.readInt32LE(8),
+      alignment: null,
+    }]
   }
 
   if (bytes.length < 8) fail(`${label} has a truncated fat header`)
@@ -250,9 +267,11 @@ function machOSlices(bytes, label) {
   }
   const tableEnd = 8 + count * 20
   const slices = []
+  const architectureTuples = new Set()
   for (let index = 0; index < count; index++) {
     const entry = 8 + index * 20
     const cpuType = bytes.readInt32BE(entry)
+    const cpuSubtype = bytes.readInt32BE(entry + 4)
     const offset = bytes.readUInt32BE(entry + 8)
     const size = bytes.readUInt32BE(entry + 12)
     const alignment = bytes.readUInt32BE(entry + 16)
@@ -262,16 +281,40 @@ function machOSlices(bytes, label) {
       fail(`${label} has an invalid fat slice extent`)
     }
     if (bytes.readUInt32LE(offset) !== 0xfeedfacf
-        || bytes.readInt32LE(offset + 4) !== cpuType) {
+        || bytes.readInt32LE(offset + 4) !== cpuType
+        || bytes.readInt32LE(offset + 8) !== cpuSubtype) {
       fail(`${label} fat metadata disagrees with its MH_MAGIC_64 slice`)
     }
-    slices.push({ offset, size, cpuType })
+    const architectureTuple = `${cpuType}:${cpuSubtype}`
+    if (architectureTuples.has(architectureTuple)) {
+      fail(`${label} contains a duplicate fat architecture tuple`)
+    }
+    architectureTuples.add(architectureTuple)
+    slices.push({ offset, size, cpuType, cpuSubtype, alignment })
   }
   const ordered = [...slices].sort((left, right) => left.offset - right.offset)
+  if (ordered.some((slice, index) => slice !== slices[index])) {
+    fail(`${label} fat architecture table is not in slice order`)
+  }
+  let previousEnd = tableEnd
   for (let index = 1; index < ordered.length; index++) {
     if (ordered[index - 1].offset + ordered[index - 1].size > ordered[index].offset) {
       fail(`${label} contains overlapping fat slices`)
     }
+  }
+  for (const slice of ordered) {
+    const alignmentBytes = 2 ** slice.alignment
+    const minimalOffset = Math.ceil(previousEnd / alignmentBytes) * alignmentBytes
+    if (slice.offset !== minimalOffset) {
+      fail(`${label} contains a non-minimal fat-slice offset`)
+    }
+    for (let offset = previousEnd; offset < slice.offset; offset++) {
+      if (bytes[offset] !== 0) fail(`${label} contains non-zero fat-slice padding`)
+    }
+    previousEnd = slice.offset + slice.size
+  }
+  if (previousEnd !== bytes.length) {
+    fail(`${label} contains trailing fat padding`)
   }
   return slices
 }
@@ -282,167 +325,342 @@ function machOPageSize(cpuType, label) {
   fail(`${label} contains an unsupported Mach-O CPU type`)
 }
 
-function validateSignedMachO(bytes, label) {
-  for (const slice of machOSlices(bytes, label)) {
-    const commandCount = bytes.readUInt32LE(slice.offset + 16)
-    const commandBytes = bytes.readUInt32LE(slice.offset + 20)
-    let commandOffset = slice.offset + 32
-    const commandEnd = commandOffset + commandBytes
-    const sliceEnd = slice.offset + slice.size
-    if (commandCount > 16_384 || commandEnd > sliceEnd) {
-      fail(`${label} has an invalid signed Mach-O load-command table`)
+function codeSignArchitecture(cpuType, label) {
+  if (cpuType === 0x0100000c) return 'arm64'
+  if (cpuType === 0x01000007) return 'x86_64'
+  fail(`${label} contains an unsupported code-signing architecture`)
+}
+
+function roundedUp(value, alignment) {
+  return ((value + alignment - 1n) / alignment) * alignment
+}
+
+function linkeditRanges(command, label) {
+  const type = command.readUInt32LE(0)
+  const ranges = []
+  function add(offset, size, description) {
+    if (size === 0n) return
+    ranges.push({ offset, size, description })
+  }
+  function uint32(offset) {
+    return BigInt(command.readUInt32LE(offset))
+  }
+
+  if (type === 0x2) { // LC_SYMTAB
+    if (command.length !== 24) fail(`${label} has malformed LC_SYMTAB metadata`)
+    add(uint32(8), uint32(12) * 16n, 'symbol table')
+    add(uint32(16), uint32(20), 'string table')
+  } else if (type === 0xb) { // LC_DYSYMTAB
+    if (command.length !== 80) fail(`${label} has malformed LC_DYSYMTAB metadata`)
+    add(uint32(32), uint32(36) * 8n, 'table of contents')
+    add(uint32(40), uint32(44) * 56n, '64-bit module table')
+    add(uint32(48), uint32(52) * 4n, 'external reference table')
+    add(uint32(56), uint32(60) * 4n, 'indirect symbol table')
+    add(uint32(64), uint32(68) * 8n, 'external relocation table')
+    add(uint32(72), uint32(76) * 8n, 'local relocation table')
+  } else if (type === 0x22 || type === 0x80000022) { // LC_DYLD_INFO[_ONLY]
+    if (command.length !== 48) fail(`${label} has malformed LC_DYLD_INFO metadata`)
+    for (let offset = 8; offset <= 40; offset += 8) {
+      add(uint32(offset), uint32(offset + 4), 'dyld info')
     }
-    let linkedit = null
-    let codeSignature = null
-    for (let index = 0; index < commandCount; index++) {
-      if (commandOffset + 8 > commandEnd) fail(`${label} has truncated signed load commands`)
-      const command = bytes.readUInt32LE(commandOffset)
-      const commandSize = bytes.readUInt32LE(commandOffset + 4)
-      if (commandSize < 8 || commandOffset + commandSize > commandEnd) {
-        fail(`${label} has an invalid signed Mach-O load command`)
+  } else if (type === 0x16) { // LC_TWOLEVEL_HINTS
+    if (command.length !== 16) fail(`${label} has malformed LC_TWOLEVEL_HINTS metadata`)
+    add(uint32(8), uint32(12) * 4n, 'two-level hints')
+  } else if ([
+    0x1e, // LC_SEGMENT_SPLIT_INFO
+    0x26, // LC_FUNCTION_STARTS
+    0x29, // LC_DATA_IN_CODE
+    0x2b, // LC_DYLIB_CODE_SIGN_DRS
+    0x2e, // LC_LINKER_OPTIMIZATION_HINT
+    0x36, // LC_ATOM_INFO
+    0x37, // LC_FUNCTION_VARIANTS
+    0x38, // LC_FUNCTION_VARIANT_FIXUPS
+    0x3a, // LC_LAZY_LOAD_DYLIB_INFO
+    0x80000033, // LC_DYLD_EXPORTS_TRIE
+    0x80000034, // LC_DYLD_CHAINED_FIXUPS
+  ].includes(type)) {
+    if (command.length !== 16) fail(`${label} has malformed linkedit-data metadata`)
+    add(uint32(8), uint32(12), 'linkedit data')
+  } else if (![
+    0x19, // LC_SEGMENT_64
+    0x1b, // LC_UUID
+    0x1d, // LC_CODE_SIGNATURE
+    0x2a, // LC_SOURCE_VERSION
+    0x2c, // LC_ENCRYPTION_INFO_64
+    0x32, // LC_BUILD_VERSION
+    0xc, // LC_LOAD_DYLIB
+    0xd, // LC_ID_DYLIB
+    0x8000001c, // LC_RPATH
+  ].includes(type)) {
+    fail(`${label} has unsupported load command 0x${type.toString(16)}`)
+  }
+  return ranges
+}
+
+function parseSignedMachOSlice(bytes, slice, label) {
+  if (bytes.readUInt32LE(slice.offset + 12) !== 6) {
+    fail(`${label} must be an MH_DYLIB`)
+  }
+  const sliceEnd = slice.offset + slice.size
+  const commandCount = bytes.readUInt32LE(slice.offset + 16)
+  const commandBytes = bytes.readUInt32LE(slice.offset + 20)
+  let commandOffset = slice.offset + 32
+  const commandEnd = commandOffset + commandBytes
+  if (commandCount < 2 || commandCount > 16_384 || commandEnd > sliceEnd) {
+    fail(`${label} has an invalid signed Mach-O load-command table`)
+  }
+  const commands = []
+  let linkeditIndex = -1
+  let linkedit = null
+  let codeSignatureIndex = -1
+  let codeSignature = null
+  const segments = []
+  for (let index = 0; index < commandCount; index++) {
+    if (commandOffset + 8 > commandEnd) fail(`${label} has truncated signed load commands`)
+    const command = bytes.readUInt32LE(commandOffset)
+    const commandSize = bytes.readUInt32LE(commandOffset + 4)
+    if (commandSize < 8 || commandSize % 8 !== 0
+        || commandOffset + commandSize > commandEnd) {
+      fail(`${label} has an invalid signed Mach-O load command`)
+    }
+    commands.push(Buffer.from(bytes.subarray(commandOffset, commandOffset + commandSize)))
+    if (command === 0x19) {
+      if (commandSize < 72) fail(`${label} has a truncated signed LC_SEGMENT_64`)
+      const segment = bytes.subarray(commandOffset + 8, commandOffset + 24)
+        .toString('ascii').replace(/\0.*$/, '')
+      const sectionCount = bytes.readUInt32LE(commandOffset + 64)
+      if (commandSize !== 72 + sectionCount * 80) {
+        fail(`${label} has inconsistent LC_SEGMENT_64 section metadata`)
       }
-      if (command === 0x19) {
-        if (commandSize < 72) fail(`${label} has a truncated signed LC_SEGMENT_64`)
-        const segment = bytes.subarray(commandOffset + 8, commandOffset + 24)
-          .toString('ascii').replace(/\0.*$/, '')
-        if (segment === '__LINKEDIT') {
-          if (linkedit !== null) fail(`${label} has multiple signed __LINKEDIT segments`)
-          linkedit = {
-            virtualSize: bytes.readBigUInt64LE(commandOffset + 32),
-            fileOffset: bytes.readBigUInt64LE(commandOffset + 40),
-            fileSize: bytes.readBigUInt64LE(commandOffset + 48),
-          }
+      const segmentMetadata = {
+        name: segment,
+        fileOffset: bytes.readBigUInt64LE(commandOffset + 40),
+        fileSize: bytes.readBigUInt64LE(commandOffset + 48),
+      }
+      if (segmentMetadata.fileOffset + segmentMetadata.fileSize > BigInt(slice.size)) {
+        fail(`${label} has an LC_SEGMENT_64 outside its slice`)
+      }
+      segments.push(segmentMetadata)
+      if (segment === '__LINKEDIT') {
+        if (linkedit !== null) fail(`${label} has multiple signed __LINKEDIT segments`)
+        if (commandSize !== 72 || sectionCount !== 0) {
+          fail(`${label} __LINKEDIT must be a sectionless 72-byte LC_SEGMENT_64`)
         }
-      } else if (command === 0x1d) {
-        if (commandSize !== 16 || codeSignature !== null) {
-          fail(`${label} has an invalid or duplicate LC_CODE_SIGNATURE`)
-        }
-        codeSignature = {
-          dataOffset: BigInt(bytes.readUInt32LE(commandOffset + 8)),
-          dataSize: BigInt(bytes.readUInt32LE(commandOffset + 12)),
+        linkeditIndex = index
+        linkedit = {
+          virtualSize: bytes.readBigUInt64LE(commandOffset + 32),
+          fileOffset: segmentMetadata.fileOffset,
+          fileSize: segmentMetadata.fileSize,
         }
       }
-      commandOffset += commandSize
+    } else if (command === 0x1d) {
+      if (commandSize !== 16 || codeSignature !== null) {
+        fail(`${label} has an invalid or duplicate LC_CODE_SIGNATURE`)
+      }
+      codeSignatureIndex = index
+      codeSignature = {
+        dataOffset: BigInt(bytes.readUInt32LE(commandOffset + 8)),
+        dataSize: BigInt(bytes.readUInt32LE(commandOffset + 12)),
+      }
     }
-    if (commandOffset !== commandEnd || linkedit === null || codeSignature === null) {
-      fail(`${label} must contain exactly one signed __LINKEDIT and LC_CODE_SIGNATURE per slice`)
+    commandOffset += commandSize
+  }
+  if (commandOffset !== commandEnd || linkedit === null || codeSignature === null) {
+    fail(`${label} must contain exactly one signed __LINKEDIT and LC_CODE_SIGNATURE per slice`)
+  }
+  const fileSegments = segments
+    .filter(segment => segment.fileSize > 0n)
+    .sort((left, right) => Number(left.fileOffset - right.fileOffset))
+  for (let index = 1; index < fileSegments.length; index++) {
+    const previous = fileSegments[index - 1]
+    if (previous.fileOffset + previous.fileSize > fileSegments[index].fileOffset) {
+      fail(`${label} contains overlapping LC_SEGMENT_64 file extents`)
     }
-    // codesign lays out these iOS device and Simulator signatures on 16 KiB
-    // pages for both arm64 and x86_64 slices. The unsigned canonical form below
-    // uses each architecture's runtime page size after the signature is gone.
-    machOPageSize(slice.cpuType, label)
-    const signingPageSize = 0x4000n
-    const canonicalVirtualSize = (
-      (linkedit.fileSize + signingPageSize - 1n) / signingPageSize
-    ) * signingPageSize
-    const signatureEnd = codeSignature.dataOffset + codeSignature.dataSize
-    if (codeSignature.dataSize === 0n
-        || linkedit.virtualSize !== canonicalVirtualSize
-        || linkedit.fileOffset + linkedit.fileSize !== BigInt(slice.size)
-        || codeSignature.dataOffset < linkedit.fileOffset
-        || signatureEnd !== BigInt(slice.size)
-        || signatureEnd > linkedit.fileOffset + linkedit.fileSize) {
-      fail(`${label} has non-canonical signed __LINKEDIT or code-signature extents`)
+  }
+  if (segments.some(segment => segment.name !== '__LINKEDIT'
+      && segment.fileOffset + segment.fileSize > linkedit.fileOffset)) {
+    fail(`${label} __LINKEDIT is not the terminal file segment`)
+  }
+
+  let linkeditContentEnd = linkedit.fileOffset
+  for (const command of commands) {
+    for (const range of linkeditRanges(command, label)) {
+      const end = range.offset + range.size
+      if (range.offset < linkedit.fileOffset || end > codeSignature.dataOffset) {
+        fail(`${label} ${range.description} lies outside unsigned __LINKEDIT content`)
+      }
+      if (end > linkeditContentEnd) linkeditContentEnd = end
     }
+  }
+
+  // These ad-hoc iOS signatures use a 16 KiB signing page on both device and
+  // Simulator slices. Canonicalization below removes that envelope and derives
+  // the unsigned architecture-specific virtual extent itself.
+  machOPageSize(slice.cpuType, label)
+  const signingPageSize = 0x4000n
+  const signedVirtualSize = roundedUp(linkedit.fileSize, signingPageSize)
+  const signatureEnd = codeSignature.dataOffset + codeSignature.dataSize
+  if (codeSignature.dataSize === 0n
+      || codeSignature.dataSize > maximumCodeSignatureBytes
+      || linkedit.virtualSize !== signedVirtualSize
+      || linkedit.fileOffset + linkedit.fileSize !== BigInt(slice.size)
+      || linkedit.fileOffset < BigInt(commandEnd - slice.offset)
+      || codeSignature.dataOffset < linkedit.fileOffset
+      || codeSignature.dataOffset < BigInt(commandEnd - slice.offset)
+      || codeSignature.dataOffset !== roundedUp(linkeditContentEnd, 16n)
+      || signatureEnd !== BigInt(slice.size)
+      || signatureEnd > linkedit.fileOffset + linkedit.fileSize) {
+    fail(`${label} has non-canonical signed __LINKEDIT or code-signature extents`)
+  }
+  for (let offset = Number(linkeditContentEnd); offset < Number(codeSignature.dataOffset); offset++) {
+    if (bytes[slice.offset + offset] !== 0) {
+      fail(`${label} contains non-zero code-signature alignment padding`)
+    }
+  }
+  return {
+    commandBytes,
+    commandCount,
+    commands,
+    linkedit,
+    linkeditIndex,
+    codeSignature,
+    codeSignatureIndex,
+    linkeditContentEnd,
   }
 }
 
-function normalizeUnsignedMachOLinkedit(bytes, label) {
-  const normalized = Buffer.from(bytes)
-  for (const slice of machOSlices(normalized, label)) {
-    const sliceEnd = slice.offset + slice.size
-    const commandCount = normalized.readUInt32LE(slice.offset + 16)
-    const commandBytes = normalized.readUInt32LE(slice.offset + 20)
-    let commandOffset = slice.offset + 32
-    const commandEnd = commandOffset + commandBytes
-    if (commandCount > 16_384 || commandEnd > sliceEnd) {
-      fail(`${label} has an invalid Mach-O load-command table`)
-    }
-    let linkeditCount = 0
-    for (let index = 0; index < commandCount; index++) {
-      if (commandOffset + 8 > commandEnd) fail(`${label} has truncated Mach-O load commands`)
-      const command = normalized.readUInt32LE(commandOffset)
-      const commandSize = normalized.readUInt32LE(commandOffset + 4)
-      if (commandSize < 8 || commandOffset + commandSize > commandEnd) {
-        fail(`${label} has an invalid Mach-O load command`)
-      }
-      if (command === 0x1d) {
-        fail(`${label} still contains LC_CODE_SIGNATURE after signature removal`)
-      }
-      if (command === 0x19) {
-        if (commandSize < 72) fail(`${label} has a truncated LC_SEGMENT_64`)
-        const segment = normalized.subarray(commandOffset + 8, commandOffset + 24)
-          .toString('ascii').replace(/\0.*$/, '')
-        if (segment === '__LINKEDIT') {
-          linkeditCount += 1
-          const fileOffset = normalized.readBigUInt64LE(commandOffset + 40)
-          const fileSize = normalized.readBigUInt64LE(commandOffset + 48)
-          const virtualSize = normalized.readBigUInt64LE(commandOffset + 32)
-          const pageSize = machOPageSize(slice.cpuType, label)
-          const canonicalVirtualSize = ((fileSize + pageSize - 1n) / pageSize) * pageSize
-          if (fileSize > virtualSize
-              || virtualSize < canonicalVirtualSize
-              || virtualSize - canonicalVirtualSize > maximumResidualSigningVirtualBytes
-              || virtualSize % pageSize !== 0n
-              || fileOffset + fileSize !== BigInt(slice.size)) {
-            fail(`${label} has invalid unsigned __LINKEDIT extents`)
-          }
-          // Apple signing can retain a page-rounded virtual-size increment after
-          // signature removal. Re-derive the minimum valid unsigned extent from
-          // the still-bound file size rather than ignoring this dyld field.
-          normalized.writeBigUInt64LE(canonicalVirtualSize, commandOffset + 32)
-        }
-      }
-      commandOffset += commandSize
-    }
-    if (commandOffset !== commandEnd || linkeditCount !== 1) {
-      fail(`${label} must contain exactly one well-formed __LINKEDIT segment per slice`)
-    }
+function validateSignedMachO(bytes, label) {
+  const slices = machOSlices(bytes, label)
+  for (const slice of slices) parseSignedMachOSlice(bytes, slice, label)
+  return slices
+}
+
+function canonicalizeSignedMachOSlice(bytes, slice, label) {
+  const parsed = parseSignedMachOSlice(bytes, slice, label)
+  const unsignedSize = Number(parsed.linkeditContentEnd)
+  const normalized = Buffer.from(bytes.subarray(slice.offset, slice.offset + unsignedSize))
+  normalized.writeUInt32LE(parsed.commandCount - 1, 16)
+  normalized.writeUInt32LE(parsed.commandBytes - 16, 20)
+
+  // Rebuild the load-command table without LC_CODE_SIGNATURE. Its position is
+  // not stable across linker outputs, so merely zeroing the command would leave
+  // otherwise equivalent binaries with different bytes.
+  let commandOffset = 32
+  let linkeditOffset = -1
+  normalized.fill(0, commandOffset, commandOffset + parsed.commandBytes)
+  for (let index = 0; index < parsed.commands.length; index++) {
+    if (index === parsed.codeSignatureIndex) continue
+    if (index === parsed.linkeditIndex) linkeditOffset = commandOffset
+    parsed.commands[index].copy(normalized, commandOffset)
+    commandOffset += parsed.commands[index].length
   }
+  if (commandOffset !== 32 + parsed.commandBytes - 16 || linkeditOffset < 0) {
+    fail(`${label} could not rebuild its unsigned load-command table`)
+  }
+
+  const unsignedLinkeditSize = parsed.linkeditContentEnd - parsed.linkedit.fileOffset
+  const pageSize = machOPageSize(slice.cpuType, label)
+  const canonicalVirtualSize = roundedUp(unsignedLinkeditSize, pageSize)
+  normalized.writeBigUInt64LE(canonicalVirtualSize, linkeditOffset + 32)
+  normalized.writeBigUInt64LE(unsignedLinkeditSize, linkeditOffset + 48)
   return normalized
 }
 
-function canonicalMachO(path, label, temporaryDirectory, index) {
+function canonicalizeSignedMachO(bytes, label) {
+  const slices = validateSignedMachO(bytes, label)
+  const normalizedSlices = slices.map((slice, index) => ({
+    ...slice,
+    bytes: canonicalizeSignedMachOSlice(bytes, slice, `${label} slice ${index}`),
+  }))
+  if (normalizedSlices.length === 1 && normalizedSlices[0].alignment === null) {
+    return { bytes: normalizedSlices[0].bytes, cpuTypes: [normalizedSlices[0].cpuType] }
+  }
+
+  const headerSize = 8 + normalizedSlices.length * 20
+  let canonicalSize = headerSize
+  for (const slice of normalizedSlices) {
+    const alignmentBytes = 2 ** slice.alignment
+    canonicalSize = Math.ceil(canonicalSize / alignmentBytes) * alignmentBytes
+    slice.canonicalOffset = canonicalSize
+    canonicalSize += slice.bytes.length
+  }
+  if (canonicalSize > 512 * 1024 * 1024) fail(`${label} canonical Mach-O exceeds 512 MiB`)
+  const normalized = Buffer.alloc(canonicalSize)
+  normalized.writeUInt32BE(0xcafebabe, 0)
+  normalized.writeUInt32BE(normalizedSlices.length, 4)
+  for (let index = 0; index < normalizedSlices.length; index++) {
+    const slice = normalizedSlices[index]
+    const entry = 8 + index * 20
+    normalized.writeInt32BE(slice.cpuType, entry)
+    normalized.writeInt32BE(slice.cpuSubtype, entry + 4)
+    normalized.writeUInt32BE(slice.canonicalOffset, entry + 8)
+    normalized.writeUInt32BE(slice.bytes.length, entry + 12)
+    normalized.writeUInt32BE(slice.alignment, entry + 16)
+    slice.bytes.copy(normalized, slice.canonicalOffset)
+  }
+  return { bytes: normalized, cpuTypes: normalizedSlices.map(slice => slice.cpuType) }
+}
+
+function canonicalMachO(path, label) {
   const { bytes: signedBytes } = regularFile(path, `signed ${label}`, 512 * 1024 * 1024)
-  validateSignedMachO(signedBytes, label)
-  const temporary = join(temporaryDirectory, `mach-o-${index}`)
-  copyFileSync(path, temporary)
-  run(codeSignPath, ['--remove-signature', temporary], `${label} signature removal`)
-  const { bytes } = regularFile(temporary, `signature-stripped ${label}`, 512 * 1024 * 1024)
-  const normalized = normalizeUnsignedMachOLinkedit(bytes, label)
-  const cpuTypes = machOSlices(normalized, label).map(slice => slice.cpuType)
+  const normalized = canonicalizeSignedMachO(signedBytes, label)
   return {
-    byteCount: normalized.length,
-    sha256: sha256(normalized),
-    cpuTypes,
+    byteCount: normalized.bytes.length,
+    sha256: sha256(normalized.bytes),
+    cpuTypes: normalized.cpuTypes,
   }
 }
 
-function validateSignatureEnvelope(directory, relativePath, label) {
+function validateSignatureEnvelope(
+  directory,
+  relativePath,
+  label,
+  state = { entryCount: 0, totalBytes: 0 },
+  depth = 0,
+) {
+  if (depth > maximumSignatureEnvelopeDepth) {
+    fail(`${label} signature envelope nesting exceeds ${maximumSignatureEnvelopeDepth}`)
+  }
   const directoryStat = lstatSync(directory)
   if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()
       || portablePermissions(directoryStat, `${label} ${relativePath}`) !== 0o755) {
     fail(`${label} signature envelope directories must be real mode-0755 directories`)
   }
   for (const name of readdirSync(directory).sort()) {
+    state.entryCount += 1
+    if (state.entryCount > maximumSignatureEnvelopeEntries) {
+      fail(`${label} signature envelope exceeds ${maximumSignatureEnvelopeEntries} entries`)
+    }
     const entryPath = join(directory, name)
     const entryRelativePath = `${relativePath}/${name}`
     const stat = lstatSync(entryPath)
     if (stat.isSymbolicLink()) fail(`${label} contains a symlink: ${entryRelativePath}`)
     const permissions = portablePermissions(stat, `${label} ${entryRelativePath}`)
     if (stat.isDirectory()) {
-      validateSignatureEnvelope(entryPath, entryRelativePath, label)
+      validateSignatureEnvelope(entryPath, entryRelativePath, label, state, depth + 1)
     } else if (!stat.isFile() || permissions !== 0o644) {
       fail(`${label} signature envelope files must be regular mode-0644 files`)
+    } else if (stat.size > maximumMetadataBytes) {
+      fail(`${label} signature envelope file exceeds ${maximumMetadataBytes} bytes`)
+    } else {
+      state.totalBytes += stat.size
+      if (state.totalBytes > maximumSignatureEnvelopeTotalBytes) {
+        fail(
+          `${label} signature envelope exceeds ${maximumSignatureEnvelopeTotalBytes} total bytes`,
+        )
+      }
     }
   }
 }
 
 export function snapshotCanonicalArtifactTree(root, label = 'iOS artifact') {
   const canonicalRoot = realDirectory(resolve(root), label)
-  run(codeSignPath, ['--verify', '--strict', canonicalRoot], `${label} signature verification`)
+  run(
+    codeSignPath,
+    ['--verify', '--strict', '--all-architectures', canonicalRoot],
+    `${label} signature verification`,
+  )
   verifyAdHocSignature(canonicalRoot, label)
-  const temporary = mkdtempSync(join(tmpdir(), 'qvac-artifact-canonicalization.'))
   const rootStat = lstatSync(canonicalRoot)
   if (portablePermissions(rootStat, label) !== 0o755) {
     fail(`${label} root directory must have mode 0755`)
@@ -466,8 +684,11 @@ export function snapshotCanonicalArtifactTree(root, label = 'iOS artifact') {
       }
       if (stat.isDirectory()) {
         if (name.endsWith('.framework')) {
-          run(codeSignPath, ['--verify', '--strict', path], `${label} framework signature verification`)
-          verifyAdHocSignature(path, `${label} framework`)
+          run(
+            codeSignPath,
+            ['--verify', '--strict', '--all-architectures', path],
+            `${label} framework signature verification`,
+          )
           verifiedFrameworks.add(path)
         }
         entries.push({
@@ -491,7 +712,15 @@ export function snapshotCanonicalArtifactTree(root, label = 'iOS artifact') {
           if (!basename(framework).endsWith('.framework') || !verifiedFrameworks.has(framework)) {
             fail(`${label} contains a Mach-O outside a verified framework: ${relativePath}`)
           }
-          digest = canonicalMachO(path, `${label} ${relativePath}`, temporary, machOCount)
+          digest = canonicalMachO(path, `${label} ${relativePath}`)
+          for (const cpuType of digest.cpuTypes) {
+            const architecture = codeSignArchitecture(cpuType, `${label} ${relativePath}`)
+            verifyAdHocSignature(
+              framework,
+              `${label} framework ${architecture} slice`,
+              architecture,
+            )
+          }
           machOTopology.push({ path: relativePath, cpuTypes: digest.cpuTypes })
           delete digest.cpuTypes
           machOCount += 1
@@ -510,33 +739,29 @@ export function snapshotCanonicalArtifactTree(root, label = 'iOS artifact') {
     }
   }
 
-  try {
-    visit(canonicalRoot, '')
-    const target = basename(canonicalRoot).replace(/\.xcframework$/, '')
-    const expectedTopology = [
-      {
-        path: `ios-arm64/${target}.framework/${target}`,
-        cpuTypes: [0x0100000c],
-      },
-      {
-        path: `ios-arm64_x86_64-simulator/${target}.framework/${target}`,
-        cpuTypes: [0x0100000c, 0x01000007],
-      },
-    ]
-    machOTopology.sort((left, right) => left.path.localeCompare(right.path))
-    expectedTopology.sort((left, right) => left.path.localeCompare(right.path))
-    if (JSON.stringify(machOTopology) !== JSON.stringify(expectedTopology)) {
-      fail(`${label} Mach-O topology differs from the reviewed device/Simulator closure`)
-    }
-    return {
-      root: canonicalRoot,
-      entries,
-      machOCount,
-      algorithm: artifactTreeAlgorithm,
-      treeSHA256: canonicalEntriesSHA256(entries, artifactTreeAlgorithm),
-    }
-  } finally {
-    rmSync(temporary, { recursive: true, force: true })
+  visit(canonicalRoot, '')
+  const target = basename(canonicalRoot).replace(/\.xcframework$/, '')
+  const expectedTopology = [
+    {
+      path: `ios-arm64/${target}.framework/${target}`,
+      cpuTypes: [0x0100000c],
+    },
+    {
+      path: `ios-arm64_x86_64-simulator/${target}.framework/${target}`,
+      cpuTypes: [0x0100000c, 0x01000007],
+    },
+  ]
+  machOTopology.sort((left, right) => left.path.localeCompare(right.path))
+  expectedTopology.sort((left, right) => left.path.localeCompare(right.path))
+  if (JSON.stringify(machOTopology) !== JSON.stringify(expectedTopology)) {
+    fail(`${label} Mach-O topology differs from the reviewed device/Simulator closure`)
+  }
+  return {
+    root: canonicalRoot,
+    entries,
+    machOCount,
+    algorithm: artifactTreeAlgorithm,
+    treeSHA256: canonicalEntriesSHA256(entries, artifactTreeAlgorithm),
   }
 }
 
@@ -818,40 +1043,98 @@ function expectFailure(action, label) {
   fail(`self-test accepted ${label}`)
 }
 
-function syntheticSignedMachO(virtualSize = 0x8000n) {
-  const bytes = Buffer.alloc(0x6000)
+function syntheticSignedMachO({
+  cpuType = 0x0100000c,
+  cpuSubtype = 0,
+  signatureSize = 0x800,
+  signatureFill = 0xa5,
+  signatureCommandIndex = 1,
+  virtualSize,
+} = {}) {
+  const linkeditOffset = 0x1000
+  const contentEnd = 0x57f8
+  const signatureOffset = 0x5800
+  const totalSize = signatureOffset + signatureSize
+  const bytes = Buffer.alloc(totalSize)
   bytes.writeUInt32LE(0xfeedfacf, 0)
-  bytes.writeInt32LE(0x0100000c, 4)
-  bytes.writeUInt32LE(2, 16)
-  bytes.writeUInt32LE(88, 20)
-  const segment = 32
-  bytes.writeUInt32LE(0x19, segment)
-  bytes.writeUInt32LE(72, segment + 4)
-  bytes.write('__LINKEDIT', segment + 8, 'ascii')
-  bytes.writeBigUInt64LE(virtualSize, segment + 32)
-  bytes.writeBigUInt64LE(0x1000n, segment + 40)
-  bytes.writeBigUInt64LE(0x5000n, segment + 48)
-  const signature = segment + 72
-  bytes.writeUInt32LE(0x1d, signature)
-  bytes.writeUInt32LE(16, signature + 4)
-  bytes.writeUInt32LE(0x5800, signature + 8)
-  bytes.writeUInt32LE(0x800, signature + 12)
+  bytes.writeInt32LE(cpuType, 4)
+  bytes.writeInt32LE(cpuSubtype, 8)
+  bytes.writeUInt32LE(6, 12)
+  bytes.writeUInt32LE(3, 16)
+  bytes.writeUInt32LE(112, 20)
+  bytes[0x800] = 0x42
+  bytes.fill(0x31, 0x5010, contentEnd)
+  bytes.fill(signatureFill, signatureOffset)
+
+  const segment = Buffer.alloc(72)
+  segment.writeUInt32LE(0x19, 0)
+  segment.writeUInt32LE(72, 4)
+  segment.write('__LINKEDIT', 8, 'ascii')
+  const signedFileSize = BigInt(totalSize - linkeditOffset)
+  segment.writeBigUInt64LE(virtualSize ?? roundedUp(signedFileSize, 0x4000n), 32)
+  segment.writeBigUInt64LE(BigInt(linkeditOffset), 40)
+  segment.writeBigUInt64LE(signedFileSize, 48)
+
+  const symbols = Buffer.alloc(24)
+  symbols.writeUInt32LE(0x2, 0)
+  symbols.writeUInt32LE(24, 4)
+  symbols.writeUInt32LE(0x5000, 8)
+  symbols.writeUInt32LE(1, 12)
+  symbols.writeUInt32LE(0x5010, 16)
+  symbols.writeUInt32LE(contentEnd - 0x5010, 20)
+
+  const signature = Buffer.alloc(16)
+  signature.writeUInt32LE(0x1d, 0)
+  signature.writeUInt32LE(16, 4)
+  signature.writeUInt32LE(signatureOffset, 8)
+  signature.writeUInt32LE(signatureSize, 12)
+
+  if (signatureCommandIndex !== 1 && signatureCommandIndex !== 2) {
+    fail('synthetic signature command index is invalid')
+  }
+  const commands = signatureCommandIndex === 1
+    ? [segment, signature, symbols]
+    : [segment, symbols, signature]
+  let commandOffset = 32
+  for (const command of commands) {
+    command.copy(bytes, commandOffset)
+    commandOffset += command.length
+  }
   return bytes
 }
 
-function syntheticUnsignedMachO(virtualSize = 0x8000n) {
-  const bytes = Buffer.alloc(0x4000)
-  bytes.writeUInt32LE(0xfeedfacf, 0)
-  bytes.writeInt32LE(0x0100000c, 4)
-  bytes.writeUInt32LE(1, 16)
-  bytes.writeUInt32LE(72, 20)
-  const segment = 32
-  bytes.writeUInt32LE(0x19, segment)
-  bytes.writeUInt32LE(72, segment + 4)
-  bytes.write('__LINKEDIT', segment + 8, 'ascii')
-  bytes.writeBigUInt64LE(virtualSize, segment + 32)
-  bytes.writeBigUInt64LE(0x1000n, segment + 40)
-  bytes.writeBigUInt64LE(0x3000n, segment + 48)
+function syntheticFatMachO(signedSlices, alignments = signedSlices.map(() => 14)) {
+  if (signedSlices.length !== alignments.length || signedSlices.length < 1) {
+    fail('synthetic fat Mach-O input is invalid')
+  }
+  const headerSize = 8 + signedSlices.length * 20
+  let size = headerSize
+  const slices = signedSlices.map((slice, index) => {
+    const alignment = alignments[index]
+    size = Math.ceil(size / (2 ** alignment)) * (2 ** alignment)
+    const offset = size
+    size += slice.length
+    return {
+      alignment,
+      bytes: slice,
+      cpuType: slice.readInt32LE(4),
+      cpuSubtype: slice.readInt32LE(8),
+      offset,
+    }
+  })
+  const bytes = Buffer.alloc(size)
+  bytes.writeUInt32BE(0xcafebabe, 0)
+  bytes.writeUInt32BE(slices.length, 4)
+  for (let index = 0; index < slices.length; index++) {
+    const slice = slices[index]
+    const entry = 8 + index * 20
+    bytes.writeInt32BE(slice.cpuType, entry)
+    bytes.writeInt32BE(slice.cpuSubtype, entry + 4)
+    bytes.writeUInt32BE(slice.offset, entry + 8)
+    bytes.writeUInt32BE(slice.bytes.length, entry + 12)
+    bytes.writeUInt32BE(slice.alignment, entry + 16)
+    slice.bytes.copy(bytes, slice.offset)
+  }
   return bytes
 }
 
@@ -879,29 +1162,280 @@ function selfTest() {
     )
     expectFailure(
       () => validateAdHocSignatureMetadata(
+        adHocMetadata.replace('flags=0x2(adhoc)', 'flags=0x10002(adhoc)'),
+        'Executable=/tmp/Example',
+        'synthetic signature',
+      ),
+      'additional code-signing flags on an ad-hoc signature',
+    )
+    expectFailure(
+      () => validateAdHocSignatureMetadata(
         adHocMetadata,
         'Executable=/tmp/Example\n<plist><dict><key>application-identifier</key></dict></plist>',
         'synthetic signature',
       ),
       'artifact signature entitlements',
     )
-    validateSignedMachO(syntheticSignedMachO(), 'synthetic signed Mach-O')
+    if (codeSignArchitecture(0x0100000c, 'synthetic arm64') !== 'arm64'
+        || codeSignArchitecture(0x01000007, 'synthetic x86_64') !== 'x86_64') {
+      fail('Mach-O CPU types did not map to explicit code-signing architectures')
+    }
     expectFailure(
-      () => validateSignedMachO(syntheticSignedMachO(0xc000n), 'inflated synthetic signed Mach-O'),
+      () => codeSignArchitecture(0x01000012, 'synthetic unsupported CPU'),
+      'an unsupported code-signing CPU type',
+    )
+    const oversizedSignatureEnvelope = join(fixture, 'oversized-signature-envelope')
+    mkdirSync(oversizedSignatureEnvelope)
+    writeFileSync(
+      join(oversizedSignatureEnvelope, 'CodeResources'),
+      Buffer.alloc(maximumMetadataBytes + 1),
+    )
+    expectFailure(
+      () => validateSignatureEnvelope(
+        oversizedSignatureEnvelope,
+        '_CodeSignature',
+        'oversized synthetic signature envelope',
+      ),
+      'an oversized excluded signature-envelope file',
+    )
+    rmSync(oversizedSignatureEnvelope, { recursive: true })
+    const aggregateSignatureEnvelope = join(fixture, 'aggregate-signature-envelope')
+    mkdirSync(aggregateSignatureEnvelope)
+    const maximumEnvelopeFile = Buffer.alloc(maximumMetadataBytes)
+    for (let index = 0; index < 5; index++) {
+      writeFileSync(join(aggregateSignatureEnvelope, `CodeResource-${index}`), maximumEnvelopeFile)
+    }
+    expectFailure(
+      () => validateSignatureEnvelope(
+        aggregateSignatureEnvelope,
+        '_CodeSignature',
+        'aggregate-oversized synthetic signature envelope',
+      ),
+      'an aggregate-oversized excluded signature envelope',
+    )
+    rmSync(aggregateSignatureEnvelope, { recursive: true })
+    const excessiveEntryEnvelope = join(fixture, 'excessive-entry-signature-envelope')
+    mkdirSync(excessiveEntryEnvelope)
+    for (let index = 0; index <= maximumSignatureEnvelopeEntries; index++) {
+      writeFileSync(join(excessiveEntryEnvelope, `CodeResource-${index}`), '')
+    }
+    expectFailure(
+      () => validateSignatureEnvelope(
+        excessiveEntryEnvelope,
+        '_CodeSignature',
+        'excessive-entry synthetic signature envelope',
+      ),
+      'an excluded signature envelope with excessive entries',
+    )
+    rmSync(excessiveEntryEnvelope, { recursive: true })
+    const deeplyNestedEnvelope = join(fixture, 'deep-signature-envelope')
+    let nestedEnvelope = deeplyNestedEnvelope
+    mkdirSync(nestedEnvelope)
+    for (let depth = 0; depth <= maximumSignatureEnvelopeDepth; depth++) {
+      nestedEnvelope = join(nestedEnvelope, `nested-${depth}`)
+      mkdirSync(nestedEnvelope)
+    }
+    expectFailure(
+      () => validateSignatureEnvelope(
+        deeplyNestedEnvelope,
+        '_CodeSignature',
+        'deeply nested synthetic signature envelope',
+      ),
+      'an excessively nested excluded signature envelope',
+    )
+    rmSync(deeplyNestedEnvelope, { recursive: true })
+    const compactSignature = syntheticSignedMachO({
+      signatureSize: 0x800,
+      signatureFill: 0xa5,
+      signatureCommandIndex: 1,
+    })
+    const expandedSignature = syntheticSignedMachO({
+      signatureSize: 0x5000,
+      signatureFill: 0x3c,
+      signatureCommandIndex: 2,
+    })
+    validateSignedMachO(compactSignature, 'synthetic signed Mach-O')
+    const compactCanonical = canonicalizeSignedMachO(
+      compactSignature,
+      'compact-signature synthetic Mach-O',
+    )
+    const expandedCanonical = canonicalizeSignedMachO(
+      expandedSignature,
+      'expanded-signature synthetic Mach-O',
+    )
+    if (!compactCanonical.bytes.equals(expandedCanonical.bytes)) {
+      fail('canonical Mach-O depends on signature size, bytes, or load-command position')
+    }
+    if (compactCanonical.bytes.length !== 0x57f8
+        || compactCanonical.bytes.readUInt32LE(16) !== 2
+        || compactCanonical.bytes.readUInt32LE(20) !== 96) {
+      fail('canonical Mach-O did not remove signature metadata and alignment padding')
+    }
+
+    const signatureMutation = Buffer.from(compactSignature)
+    signatureMutation[signatureMutation.length - 1] ^= 0xff
+    if (!canonicalizeSignedMachO(
+      signatureMutation,
+      'signature-byte-mutated synthetic Mach-O',
+    ).bytes.equals(compactCanonical.bytes)) {
+      fail('canonical Mach-O depends on signature-envelope bytes')
+    }
+    const payloadMutation = Buffer.from(compactSignature)
+    payloadMutation[0x800] ^= 0xff
+    if (canonicalizeSignedMachO(
+      payloadMutation,
+      'payload-mutated synthetic Mach-O',
+    ).bytes.equals(compactCanonical.bytes)) {
+      fail('canonical Mach-O ignored executable payload mutation')
+    }
+    const loadCommandMutation = Buffer.from(compactSignature)
+    loadCommandMutation[32 + 56] ^= 0x1
+    if (canonicalizeSignedMachO(
+      loadCommandMutation,
+      'load-command-mutated synthetic Mach-O',
+    ).bytes.equals(compactCanonical.bytes)) {
+      fail('canonical Mach-O ignored retained load-command mutation')
+    }
+    const thinSubtypeMutation = syntheticSignedMachO({ cpuSubtype: 1 })
+    if (canonicalizeSignedMachO(
+      thinSubtypeMutation,
+      'CPU-subtype-mutated thin Mach-O',
+    ).bytes.equals(compactCanonical.bytes)) {
+      fail('canonical thin Mach-O ignored CPU-subtype mutation')
+    }
+
+    const x86Compact = syntheticSignedMachO({
+      cpuType: 0x01000007,
+      cpuSubtype: 3,
+      signatureSize: 0x800,
+      signatureCommandIndex: 1,
+    })
+    const x86Expanded = syntheticSignedMachO({
+      cpuType: 0x01000007,
+      cpuSubtype: 3,
+      signatureSize: 0x1000,
+      signatureFill: 0x6d,
+      signatureCommandIndex: 2,
+    })
+    const compactFat = syntheticFatMachO([compactSignature, x86Compact])
+    const expandedFat = syntheticFatMachO([expandedSignature, x86Expanded])
+    const compactFatCanonical = canonicalizeSignedMachO(
+      compactFat,
+      'compact-layout synthetic fat Mach-O',
+    )
+    if (!compactFatCanonical.bytes.equals(canonicalizeSignedMachO(
+      expandedFat,
+      'expanded-layout synthetic fat Mach-O',
+    ).bytes)) {
+      fail('canonical fat Mach-O depends on signed slice sizes or offsets')
+    }
+    expectFailure(
+      () => validateSignedMachO(
+        syntheticSignedMachO({ virtualSize: 0xc000n }),
+        'inflated synthetic signed Mach-O',
+      ),
       'an aligned but inflated signed __LINKEDIT virtual size',
     )
-    const nonterminalSignature = syntheticSignedMachO()
+    const nonterminalSignature = Buffer.from(compactSignature)
     nonterminalSignature.writeUInt32LE(0x400, 32 + 72 + 12)
     expectFailure(
       () => validateSignedMachO(nonterminalSignature, 'nonterminal synthetic signature'),
       'a nonterminal LC_CODE_SIGNATURE extent',
     )
-    const normalizedUnsigned = normalizeUnsignedMachOLinkedit(
-      syntheticUnsignedMachO(),
-      'synthetic unsigned Mach-O',
+    const malformedCommandSize = Buffer.from(compactSignature)
+    malformedCommandSize.writeUInt32LE(12, 32 + 72 + 4)
+    expectFailure(
+      () => validateSignedMachO(malformedCommandSize, 'malformed-command synthetic Mach-O'),
+      'a non-8-byte-aligned Mach-O command size',
     )
-    if (normalizedUnsigned.readBigUInt64LE(32 + 32) !== 0x4000n) {
-      fail('unsigned Mach-O normalization did not derive __LINKEDIT virtual size from file size')
+    const malformedCommandCount = Buffer.from(compactSignature)
+    malformedCommandCount.writeUInt32LE(4, 16)
+    expectFailure(
+      () => validateSignedMachO(malformedCommandCount, 'malformed-count synthetic Mach-O'),
+      'a Mach-O command count inconsistent with sizeofcmds',
+    )
+    const malformedLinkeditSections = Buffer.from(compactSignature)
+    malformedLinkeditSections.writeUInt32LE(1, 32 + 64)
+    expectFailure(
+      () => validateSignedMachO(
+        malformedLinkeditSections,
+        'sectioned-linkedit synthetic Mach-O',
+      ),
+      'a sectioned or inconsistently sized __LINKEDIT segment',
+    )
+    const overlappingLinkedit = Buffer.from(compactSignature)
+    overlappingLinkedit.writeBigUInt64LE(0n, 32 + 40)
+    overlappingLinkedit.writeBigUInt64LE(BigInt(overlappingLinkedit.length), 32 + 48)
+    expectFailure(
+      () => validateSignedMachO(overlappingLinkedit, 'overlapping-linkedit synthetic Mach-O'),
+      'a __LINKEDIT segment overlapping the load-command table',
+    )
+    const nonDylib = Buffer.from(compactSignature)
+    nonDylib.writeUInt32LE(2, 12)
+    expectFailure(
+      () => validateSignedMachO(nonDylib, 'non-dylib synthetic Mach-O'),
+      'a signed Mach-O that is not MH_DYLIB',
+    )
+    const unsupportedCommand = Buffer.from(compactSignature)
+    unsupportedCommand.writeUInt32LE(0x40, 32 + 72 + 16)
+    expectFailure(
+      () => validateSignedMachO(unsupportedCommand, 'unsupported-command synthetic Mach-O'),
+      'an unsupported Mach-O load command',
+    )
+    const nonzeroSignaturePadding = Buffer.from(compactSignature)
+    nonzeroSignaturePadding[0x57f8] = 1
+    expectFailure(
+      () => validateSignedMachO(nonzeroSignaturePadding, 'nonzero-padding synthetic Mach-O'),
+      'non-zero signature-alignment padding',
+    )
+    const nonzeroFatGap = Buffer.from(compactFat)
+    nonzeroFatGap[48] = 1
+    expectFailure(
+      () => validateSignedMachO(nonzeroFatGap, 'nonzero-gap synthetic fat Mach-O'),
+      'non-zero fat-slice padding',
+    )
+    const nonzeroFatTrailing = Buffer.concat([compactFat, Buffer.from([1])])
+    expectFailure(
+      () => validateSignedMachO(nonzeroFatTrailing, 'trailing-byte synthetic fat Mach-O'),
+      'trailing fat padding',
+    )
+    const zeroFatTrailing = Buffer.concat([compactFat, Buffer.alloc(16)])
+    expectFailure(
+      () => validateSignedMachO(zeroFatTrailing, 'zero-trailing synthetic fat Mach-O'),
+      'zero trailing fat padding',
+    )
+    const duplicateArchitecture = Buffer.from(compactFat)
+    const secondSliceOffset = duplicateArchitecture.readUInt32BE(28 + 8)
+    duplicateArchitecture.writeInt32BE(0x0100000c, 28)
+    duplicateArchitecture.writeInt32BE(0, 28 + 4)
+    duplicateArchitecture.writeInt32LE(0x0100000c, secondSliceOffset + 4)
+    duplicateArchitecture.writeInt32LE(0, secondSliceOffset + 8)
+    expectFailure(
+      () => validateSignedMachO(duplicateArchitecture, 'duplicate-architecture fat Mach-O'),
+      'a duplicate fat architecture tuple',
+    )
+    const subtypeMismatch = Buffer.from(compactFat)
+    subtypeMismatch.writeInt32BE(1, 8 + 4)
+    expectFailure(
+      () => validateSignedMachO(subtypeMismatch, 'subtype-mismatched fat Mach-O'),
+      'fat metadata that disagrees with its slice CPU subtype',
+    )
+    const alignmentMutation = syntheticFatMachO([compactSignature, x86Compact], [13, 14])
+    if (canonicalizeSignedMachO(
+      alignmentMutation,
+      'alignment-mutated synthetic fat Mach-O',
+    ).bytes.equals(compactFatCanonical.bytes)) {
+      fail('canonical fat Mach-O ignored architecture alignment mutation')
+    }
+    const subtypeMutationFat = syntheticFatMachO([
+      syntheticSignedMachO({ cpuSubtype: 1 }),
+      x86Compact,
+    ])
+    if (canonicalizeSignedMachO(
+      subtypeMutationFat,
+      'subtype-mutated synthetic fat Mach-O',
+    ).bytes.equals(compactFatCanonical.bytes)) {
+      fail('canonical fat Mach-O ignored CPU-subtype mutation')
     }
     const first = join(fixture, 'first')
     const second = join(fixture, 'second')

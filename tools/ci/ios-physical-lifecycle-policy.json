@@ -9,7 +9,7 @@
   "artifactManifestSHA256": "66e2298a6abf2c19b2af9c0411aea5d6c77c5a81a4a9b70d7e89447c51ed708b",
   "expectedArtifactCount": 38,
   "artifactTreeLockPath": "tools/ci/ios-local-artifact-tree-lock.json",
-  "artifactTreeLockSHA256": "e65402fd2c00c7fa3bfe491367461b8e63f2168bf0a22d91ff8b99db60436aa0",
+  "artifactTreeLockSHA256": "3943408b1d6485b6a376c28ab79b744ffc4fd03fe54fb6b561b19ea15e6f137d",
   "xcodeGenVersion": "2.46.0",
   "xcodeGenExecutableSHA256": "8774da746668bc18fe74e54cbaf10f2631a1fb05947cd374179aa912f14f99db",
   "workerBundlePath": "Sources/QVACClient/Resources/worker.mobile.bundle",

@@ -139,10 +139,11 @@ The canonical artifact-tree algorithm has these invariants:
 - The XCFramework and nested frameworks must have valid strict ad-hoc signatures
   with no team, internal requirement, or entitlements. Signature-envelope types
   and modes are validated before their host-specific bytes are excluded.
-- Mach-O signatures are removed only in a temporary copy with
-  `/usr/bin/codesign`. The remaining `__LINKEDIT` virtual size is derived from
-  its bound file extent using the architecture page size; all other normalized
-  Mach-O bytes remain covered by the digest.
+- Mach-O signatures are verified with `/usr/bin/codesign`, then excluded by a
+  platform-independent parser. It validates the signed slice and linkedit-data
+  ranges, removes `LC_CODE_SIGNATURE`, discards only verified signature and
+  alignment bytes, reconstructs fat-slice offsets, and derives `__LINKEDIT`
+  sizes from the covered content. All other Mach-O bytes remain bound.
 
 Raw signed XCFrameworks are not expected to be byte-identical across macOS and
 Xcode signing implementations. Ad-hoc signature envelopes and signing-induced
