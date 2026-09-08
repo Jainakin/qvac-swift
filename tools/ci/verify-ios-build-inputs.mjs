@@ -790,7 +790,11 @@ export function verifyNonBareArtifactClosure(root, { requireExactRoot = true } =
     const path = join(canonicalRoot, name)
     const snapshot = snapshotCanonicalArtifactTree(path, `iOS artifact ${name}`)
     if (snapshot.treeSHA256 !== expected.treeSHA256) {
-      fail(`iOS artifact ${name} differs from its reviewed canonical tree digest`)
+      fail(
+        `iOS artifact ${name} differs from its reviewed canonical tree digest: `
+        + `expected=${expected.treeSHA256} actual=${snapshot.treeSHA256} `
+        + `actualEntries=${JSON.stringify(snapshot.entries)}`,
+      )
     }
     return {
       target: expected.target,
