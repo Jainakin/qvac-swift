@@ -1,8 +1,8 @@
 # Coverage gate
 
-The coverage job runs the complete reviewed 621-test `QVACClientUnitTests`
+The coverage job runs the complete reviewed 626-test `QVACClientUnitTests`
 inventory on macOS with LLVM instrumentation. The inventory is bound by SHA-256
-`5441645de16ac6a4950a5f44b28e38db1e47827aca177ca7d704a645f534d109`.
+`aaf162771f7cef0803ae9cc30d7ac2051a6a7f882e1ecb19e724b718b301f813`.
 The job fails if discovery changes, a required test is skipped, the executed
 identities differ from the inventory, or any macOS-compiled handwritten or
 generated-source threshold regresses.
@@ -57,15 +57,15 @@ it catches deletion of previously covered behavior.
 
 | Scope | Metric | Minimum | Covered floor | Total floor | Uncovered ceiling |
 |---|---|---:|---:|---:|---:|
-| Handwritten | Lines | 95% | 14,000 | 14,500 | 750 |
-| Handwritten | Functions | 92% | 1,250 | 1,330 | 120 |
-| Handwritten | Regions | 89% | 4,200 | 4,650 | 570 |
-| Generated | Lines | 85% | 3,350 | 3,900 | 600 |
-| Generated | Functions | 98% | 320 | 320 | 10 |
-| Generated | Regions | 84% | 1,850 | 2,200 | 350 |
+| Handwritten | Lines | 97% | 15,750 | 16,232 | 500 |
+| Handwritten | Functions | 94% | 1,385 | 1,483 | 95 |
+| Handwritten | Regions | 92% | 4,800 | 5,214 | 425 |
+| Generated | Lines | 89% | 3,500 | 3,936 | 450 |
+| Generated | Functions | 100% | 325 | 325 | 0 |
+| Generated | Regions | 87% | 1,940 | 2,235 | 300 |
 
-Every macOS-compiled handwritten file must also retain at least 90% line, 60%
-function, and 80% region coverage. Every reviewed generated file has an 80%
+Every macOS-compiled handwritten file must also retain at least 91% line, 65%
+function, and 83% region coverage. Every reviewed generated file has an 80%
 line, 95% function, and 5% region floor. The generated region floor remains low
 because the generated error-code switch maps declaration-only cases as regions:
 that file's reviewed minimum is 6.25%, while the other three generated files
@@ -73,13 +73,17 @@ measure at least 93.70%. The line and function floors prevent the much larger
 generated types file from hiding an untested generated peer.
 
 Thirteen security- and reliability-critical handwritten files have additional
-file-specific percentage and absolute ratchets in `criticalFiles`. They cover
+file-specific percentage and absolute ratchets in `criticalFiles`, including
+exact executable-element total floors and narrowly buffered covered/uncovered
+limits. They cover
 BareRPC state and framing, runtime handshake, compact decoding, checked wire
 sizing, media validation, NDJSON framing, pull-stream mapping, result-memory
 accounting, transport buffering and lifecycle, public stream buffering, and the
-client control plane. Each configured path must remain in the macOS-compiled
-handwritten inventory, and every check appears in the JSON and Markdown
-evidence. `policy.json` is the source of truth for their exact thresholds.
+client control plane. Reductions below the configured floors require an explicit
+reviewed baseline update. Each configured path must remain
+in the macOS-compiled handwritten inventory, and every check appears in the JSON
+and Markdown evidence. `policy.json` is the source of truth for their exact
+thresholds.
 
 The source digest and pull-request review remain the backstop against deliberate
 metric gaming. Legitimate source refactors can update a reviewed baseline only
@@ -180,14 +184,16 @@ node tools/ci/verify-ios-test-log.mjs --self-test
 
 ## Reviewed calibration
 
-The 621-test local calibration on Xcode 26.6 measured 15,812/16,232 handwritten
-lines (97.41%), 1,404/1,483 functions (94.67%), and 4,846/5,214 regions
-(92.94%) across 38 files. The four generated files measured 3,533/3,936 lines
+Two completion-attested 626-test local calibrations on Xcode 26.6 agreed on
+15,852/16,232 handwritten lines (97.66%), 1,405/1,483 functions (94.74%), and
+4,856/5,214 regions (93.13%) across 38 files. The four generated files measured
+3,533/3,936 lines
 (89.76%), 325/325 functions (100%), and 1,966/2,235 regions (87.96%). Combined
-macOS production coverage was 19,345/20,168 lines (95.92%), 1,729/1,808
-functions (95.63%), and 6,812/7,449 regions (91.45%). The channel's
+macOS production coverage was 19,385/20,168 lines (96.12%), 1,730/1,808
+functions (95.69%), and 6,822/7,449 regions (91.58%). The channel's
 post-registration cancellation fallback is exercised through a deterministic
-internal seam, so that safety branch no longer depends on scheduler timing.
+internal transport seam, so that safety branch no longer depends on scheduler
+timing.
 
 The separate iOS platform gate binds its exact test inventory and SHA-256 in
 `ios-transport-policy.json` and `../ci/ios-smoke-test-inventory.txt`. Its
@@ -199,25 +205,24 @@ readable-callback barriers, bounded FIFO write pump, close/error quiescence, iOS
 factory, and runtime handshake cannot disappear behind percentage-only
 coverage.
 
-The 37-test local iOS calibration measured `BareIPCTransport.swift` at 782/806
-lines (97.02%), 108/115 functions (93.91%), and 258/281 regions (91.81%). The
+The 37-test local iOS calibration against the patched r2 adapter measured
+`BareIPCTransport.swift` at 779/810 lines (96.17%), 108/116 functions (93.10%),
+and 258/282 regions (91.49%). The
 supplemental `QVACClient.swift` measurement was 484/1,690 lines (28.64%), 42/162
 functions (25.93%), and 134/563 regions (23.80%); `Handshake.swift` measured
 57/71 lines (80.28%), 10/11 functions (90.91%), and 29/49 regions (59.18%).
-Across the three gated iOS sources, that is 1,323/2,567 lines (51.54%), 160/288
-functions (55.56%), and 421/893 regions (47.14%).
+Across the three gated iOS sources, that is 1,320/2,571 lines (51.34%), 160/289
+functions (55.36%), and 421/894 regions (47.09%).
 
-That calibration uses the immutable r1 adapter. Under the same 37-test
-inventory on hosted Xcode 16.4, the patched r2 adapter measures 775/806 lines
-(96.15%), 107/115 functions (93.04%), and 257/281 regions (91.46%). The
-seven-line difference is the intentionally unexecuted r1 fallback closure.
+The immutable r1 adapter historically measured seven more transport lines and
+one more function and region because it executes the legacy-reader fallback.
 The shared uncovered-line ceiling is calibrated to the stricter r2 result,
-while mode-specific required lines independently prove that r1 executed the
-legacy reader and r2 selected `readWithError:`.
+while mode-specific required lines independently prove that r1 executes the
+legacy reader and r2 selects `readWithError:`.
 
 The hosted workflow pins its toolchain independently of this local Xcode 26.6
-calibration. Aggregate, per-file, and critical-file limits retain deliberate
-compiler-mapping tolerance while rejecting a material loss of covered behavior
-or growth in uncovered behavior. A release claim must use a passing,
+calibration. Percentage and covered/uncovered ratchets include run-to-run
+headroom; reductions below the total-element floors or any loss of generated
+function coverage require a reviewed baseline update. A release claim must use a passing,
 completion-attested run from the final committed source and policy; these
 calibration figures alone are not release evidence.

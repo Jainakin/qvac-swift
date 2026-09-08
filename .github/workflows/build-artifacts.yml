@@ -259,6 +259,21 @@ jobs:
           restore_package_manifest
           trap - EXIT
           git diff --exit-code -- Package.swift
+      - name: Validate native IPC backpressure, close/read races, and memory stability
+        run: |
+          tools/ci/run-ios-native-stress.sh --self-test
+          tools/ci/run-ios-native-stress.sh \
+            --mode regular \
+            --platform simulator \
+            --destination "platform=iOS Simulator,id=$QVAC_SIMULATOR_UDID" \
+            --candidate "$GITHUB_WORKSPACE/tools/native/bare-kit/.build/BareKit.xcframework" \
+            --evidence-dir "$RUNNER_TEMP/qvac-candidate-native-stress"
+          {
+            echo '### Native IPC stress evidence'
+            echo '```json'
+            jq . "$RUNNER_TEMP/qvac-candidate-native-stress/native-stress-evidence.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Tear down the artifact-candidate simulator
         if: always()
         run: |
@@ -284,6 +299,7 @@ jobs:
             ${{ runner.temp }}/qvac-candidate-ios.xcresult
             ${{ runner.temp }}/qvac-candidate-ios-coverage
             ${{ runner.temp }}/qvac-candidate-example.log
+            ${{ runner.temp }}/qvac-candidate-native-stress
           if-no-files-found: error
           retention-days: 30
       - name: Verify third-party notices

@@ -74,6 +74,23 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.qvac.example.qvacchat.physicaluitests
         IPHONEOS_DEPLOYMENT_TARGET: "17.0"
 
+  QVACChatNativeStressTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: NativeTests
+    dependencies:
+      - target: QVACChat-iOS
+      - package: QVACSwift
+        product: QVACClient
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+        PRODUCT_BUNDLE_IDENTIFIER: com.qvac.example.qvacchat.nativestresstests
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/QVACChat-iOS.app/QVACChat-iOS"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
 schemes:
   QVACChat-iOS:
     build:
@@ -92,5 +109,18 @@ schemes:
       gatherCoverageData: false
       targets:
         - name: QVACChatPhysicalDeviceTests
+          parallelizable: false
+          randomExecutionOrder: false
+
+  QVACChat-NativeStress:
+    build:
+      targets:
+        QVACChat-iOS: all
+        QVACChatNativeStressTests:
+          - test
+    test:
+      gatherCoverageData: false
+      targets:
+        - name: QVACChatNativeStressTests
           parallelizable: false
           randomExecutionOrder: false

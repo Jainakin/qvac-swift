@@ -37,36 +37,44 @@ worker contract. The delivered client intentionally supports only QVAC SDK
 | 3 | Handle profiling-trailer lines | The incremental NDJSON decoder separates profiling records from typed responses. Server-stream and duplex adapters drain terminal metadata before returning success or the retained worker error. |
 | 4 | Pin code generation | The npm tarball, source commit, contract inputs, Node dependencies, and generated outputs are locked to the published 0.17.0 package provenance and checked by deterministic generation tooling. |
 | 5 | Repair real-model tests | Fixtures reference valid repositories and immutable revisions, with expected sizes and SHA-256 checksums. Required suites fail on missing configuration, unexpected skips, test substitution, or inventory drift. |
-| 6 | Add upscaling and URL installation | The 0.17 upscaling operation exposes typed progress and `Data` output. The public package manifest uses checksum-pinned XCFramework URLs and resolves through the repository URL. |
+| 6 | Add upscaling and URL installation | The 0.17 upscaling operation exposes typed stream responses, validated `Data` outputs, and statistics. The public package manifest uses checksum-pinned XCFramework URLs and resolves through the repository URL. |
 | 7 | Update to SDK 0.17.0 | Generated types and public operations cover the complete 0.17.0 contract. No legacy 0.10 API or migration behavior is included. |
 
 ## Recorded local validation
 
-The latest local validation produced the following results. These measurements
-are calibration evidence for the reviewed source and test inputs; they do not
-replace clean hosted validation of the delivered commit.
+The table records current working-tree calibration for the complete 626-test
+inventory. These local measurements do not replace clean hosted validation of
+the delivered commit.
 
 | Gate | Result |
 |---|---|
-| Unit tests | 621 of 621 passed with no failures or skips |
-| macOS Thread Sanitizer | The same 621-test inventory passed |
-| macOS Address Sanitizer | The same 621-test inventory passed |
-| macOS Undefined Behavior Sanitizer | The same 621-test inventory passed |
+| Unit tests (current) | 626 of 626 passed with no failures or skips |
+| macOS Thread Sanitizer | 626 of 626 passed with no failures, skips, or sanitizer diagnostics |
+| macOS Address Sanitizer | 626 of 626 passed with no failures, skips, or sanitizer diagnostics |
+| macOS Undefined Behavior Sanitizer | 626 of 626 passed with no failures, skips, or sanitizer diagnostics |
 | Required integration tests | 19 of 19 passed with no failures or skips, including live-worker, real-model completion and profiling, RAG, and upscaling coverage |
-| Handwritten macOS production coverage | 15,812/16,232 lines (97.41%), 1,404/1,483 functions (94.67%), and 4,846/5,214 regions (92.94%) |
-| Generated-source coverage | 3,533/3,936 lines (89.76%), 325/325 functions (100%), and 1,966/2,235 regions (87.96%) |
-| Combined macOS production coverage | 19,345/20,168 lines (95.92%), 1,729/1,808 functions (95.63%), and 6,812/7,449 regions (91.45%) |
-| iOS platform coverage | 37 of 37 reviewed tests passed. `BareIPCTransport.swift` measured 782/806 lines (97.02%), 108/115 functions (93.91%), and 258/281 regions (91.81%); supplemental `QVACClient.swift` and handshake measurements bring the gated iOS sources to 1,323/2,567 lines (51.54%), 160/288 functions (55.56%), and 421/893 regions (47.14%). |
-| iOS Simulator Thread Sanitizer | The 37-test inventory passed locally with Swift-side instrumentation against the public r1 BareKit binary. The final hosted gate separately instruments every native unit built from the pinned patched BareKit source, while correctly excluding its three prebuilt archives from that claim. |
-| Physical iPhone validation | 1 of 1 selected arm64 tests passed on an iPhone 15 Pro running iOS 26.6.1. `QVACChatPhysicalDeviceTests/testLoadStreamAndUnloadOnPhysicalDevice()` launched the signed app and completed worker startup, model load, streaming inference, and model unload. |
+| Handwritten macOS production coverage (current 626-test calibration) | 15,852/16,232 lines (97.66%), 1,405/1,483 functions (94.74%), and 4,856/5,214 regions (93.13%) |
+| Generated-source coverage (current 626-test calibration) | 3,533/3,936 lines (89.76%), 325/325 functions (100%), and 1,966/2,235 regions (87.96%) |
+| Combined macOS production coverage (current 626-test calibration) | 19,385/20,168 lines (96.12%), 1,730/1,808 functions (95.69%), and 6,822/7,449 regions (91.58%) |
+| iOS platform coverage (patched r2 adapter) | 37 of 37 reviewed tests passed. `BareIPCTransport.swift` measured 779/810 lines (96.17%), 108/116 functions (93.10%), and 258/282 regions (91.49%); supplemental `QVACClient.swift` and handshake measurements bring the gated iOS sources to 1,320/2,571 lines (51.34%), 160/289 functions (55.36%), and 421/894 regions (47.09%). |
+| Native IPC stress (patched r2, regular simulator) | 2 of 2 reviewed tests passed: a byte-exact 16 MiB backpressured echo, 12 concurrent close/read races, and a 256 MiB sustained-memory run with 245,808 bytes retained growth after warm-up and a 0.001035 fitted slope |
+| Native IPC stress (patched r2, Thread Sanitizer) | The exact close/read race test passed with the Swift and native BareKit units instrumented and no Thread Sanitizer diagnostic |
+| iOS Simulator Thread Sanitizer | The 37-test inventory passed locally with Swift-side instrumentation against the public r1 BareKit binary. The non-publishing artifact gate separately instruments every native unit built from the pinned patched BareKit source; its three prebuilt archives are excluded from that claim. |
+| Historical physical iPhone calibration (r1 only) | An earlier local run passed 1 of 1 selected arm64 test on an iPhone 15 Pro running iOS 26.6.1. `QVACChatPhysicalDeviceTests/testLoadStreamAndUnloadOnPhysicalDevice()` completed worker startup, model load, streaming inference, and unload using the immutable public r1 BareKit artifact. This evidence does not validate the patched r2 artifact and is not bound to the final delivered commit; an exact-source r2 device run remains pending. |
 | Package manifest | SwiftPM resolves one library product backed by 38 checksum-pinned binary targets |
 | Publication guard | Fails closed on any of the six license/privacy blockers and on the separate BareKit r2 activation gate |
 
 The unit inventory is bound to SHA-256
-`5441645de16ac6a4950a5f44b28e38db1e47827aca177ca7d704a645f534d109`.
+`aaf162771f7cef0803ae9cc30d7ac2051a6a7f882e1ecb19e724b718b301f813`.
 The iOS platform inventory contains 37 exact XCTest identities and is bound to
 SHA-256
 `406d901b69476eafa308f691cfa2284abb0a1acbbeda90aa3d4f0eee00f55108`.
+The regular native-stress inventory contains two exact XCTest identities and is
+bound to SHA-256
+`abb66aa33315d7afed7d6789bfb24430fecd0fa1fc1481c9c5ae9b6fa124dddf`.
+Its sanitizer inventory contains the exact close/read race identity and is
+bound to SHA-256
+`fec0733bd30026410a7244b9aaa4129a6085cb2961657fb3ab6fdd45c2b1a6aa`.
 The required integration inventory contains 19 exact XCTest identities and is
 bound to SHA-256
 `36fd43ce30aa0d22e278cb7fd3f5ba6835f44cafba08112f576f0acad811e134`.
@@ -108,9 +116,11 @@ must have a clean hosted validation run that confirms:
 5. DocC, external SwiftPM URL-consumer, example-application, and iOS runtime
    checks.
 
-If physical-device evidence is included in the final review package, its
-signed test result must identify the same delivered source revision separately
-from the hosted run.
+Physical-device validation is not currently claimed for the final r2
+candidate. If it is included in the final review package, the signed test
+result must bind both the delivered source revision and the exact patched r2
+BareKit artifact. The historical r1 calibration above must not be presented as
+r2 evidence.
 
 The delivery record outside this source tree must identify the delivered commit
 and its matching hosted run. Calibration output from a dirty worktree must not

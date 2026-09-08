@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "scheme": "QVACChat-NativeStress",
+  "testModule": "QVACChatNativeStressTests",
+  "patchMarker": "qvac-bare-kit-2.3.0-ipc-hardening-1",
+  "regular": {
+    "inventoryPath": "tools/ci/ios-native-stress-test-inventory.txt",
+    "inventorySHA256": "abb66aa33315d7afed7d6789bfb24430fecd0fa1fc1481c9c5ae9b6fa124dddf",
+    "expectedCount": 2
+  },
+  "threadSanitizer": {
+    "inventoryPath": "tools/ci/ios-native-race-test-inventory.txt",
+    "inventorySHA256": "fec0733bd30026410a7244b9aaa4129a6085cb2961657fb3ab6fdd45c2b1a6aa",
+    "expectedCount": 1
+  },
+  "echo": {
+    "testIdentity": "QVACNativeIPCStressTests/testPatchedNativeIPCBackpressureOrderingAndConcurrentCloseRace",
+    "transferredBytes": 16777216,
+    "chunkBytes": 65536,
+    "uniqueChunkCount": 256,
+    "sha256": "c9e77904d4198fb6b70b6556e0d0229139bd3aa7dee40d70b8c7cddfdd1d537f",
+    "minimumNativeWriteWouldBlockCount": 1,
+    "raceIterations": 12,
+    "concurrentCloseCallersPerIteration": 16,
+    "requiredCloseReadOverlapIterations": 12,
+    "requiredFollowerCloseWaitersPerIteration": 15
+  },
+  "memory": {
+    "testIdentity": "QVACNativeIPCStressTests/testPatchedNativeIPCSustainedMemoryPlateausAfterWarmup",
+    "transferredBytes": 268435456,
+    "sha256": "dd35184592035e35706106862e5f431a5a1f9868354055b970e2d4bb6f18ba05",
+    "warmupBytes": 33554432,
+    "sampleCount": 8,
+    "sampleIntervalBytes": 33554432,
+    "maximumRetainedGrowthBytes": 33554432,
+    "maximumFootprintBytesPerTransferredByte": 0.05
+  }
+}

@@ -4418,6 +4418,40 @@ final class QVACSDK017OperationSemanticsTests: XCTestCase {
         await streamClient.close()
     }
 
+    func test_rag_reindex_preserves_details_object() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let run = try await client.ragReindex(
+            modelId: "embed-model",
+            workspace: "docs"
+        )
+        let frames = try await Self.waitForFrames(1, on: transport)
+        let (id, request) = try Self.request(in: frames)
+        XCTAssertEqual(request["operation"] as? String, "reindex")
+        XCTAssertNil(request["withProgress"])
+        let details: [String: JSONValue] = [
+            "clusters": .number(4),
+            "strategy": .string("k-means"),
+        ]
+        try await Self.feedReply(
+            id: id,
+            response: .rag(.init(
+                operation: "reindex",
+                success: true,
+                result: .object([
+                    "reindexed": .bool(true),
+                    "details": .object(details),
+                ])
+            )),
+            to: transport
+        )
+
+        let result = try await run.result.value
+        XCTAssertTrue(result.reindexed)
+        XCTAssertEqual(result.details, details)
+        await client.close()
+    }
+
     func test_rag_rich_results_use_exact_017_content_shapes_and_search_defaults() async throws {
         let transport = MockTransport()
         let client = QVACClient(testing: transport)

@@ -261,7 +261,7 @@ final class BareIPCTransport: BareTransport, @unchecked Sendable {
             let result = Self.drainReadable(
                 read: { try self.backend.read() },
                 shouldContinue: { self.readableDrainMayContinue() },
-                onChunk: { self.inbound.yield($0) == nil },
+                onChunk: { self.publishInboundChunk($0) },
                 onEOF: {
                     // Stop poll delivery before publishing EOF. The bare-rpc
                     // feeder drains any chunks already queued above, observes
@@ -520,6 +520,9 @@ final class BareIPCTransport: BareTransport, @unchecked Sendable {
                 let writeErrno = errno
                 endNativeWriteCall()
                 if written == 0 {
+                    #if QVAC_NATIVE_STRESS_TESTING
+                    lock.withLock { self.nativeWriteWouldBlockCount += 1 }
+                    #endif
                     do { try await Task.sleep(for: .milliseconds(retryMilliseconds)) }
                     catch {
                         await failWriteAndClose(identifier, error: error)
@@ -690,6 +693,51 @@ final class BareIPCTransport: BareTransport, @unchecked Sendable {
             if completed { continuation.resume() }
         }
     }
+
+    @inline(__always)
+    private func publishInboundChunk(_ chunk: Data) -> Bool {
+        let accepted = inbound.yield(chunk) == nil
+        #if QVAC_NATIVE_STRESS_TESTING
+        if accepted { holdNativeReadableDrainForStressTestIfConfigured() }
+        #endif
+        return accepted
+    }
+
+    #if QVAC_NATIVE_STRESS_TESTING
+    private var nativeWriteWouldBlockCount = 0
+    private var nativeReadableDrainBarrier: (@Sendable () -> Void)?
+
+    func __testNativeWriteWouldBlockCount() -> Int {
+        lock.withLock { nativeWriteWouldBlockCount }
+    }
+
+    func __testInstallNativeReadableDrainBarrier(
+        _ barrier: @escaping @Sendable () -> Void
+    ) {
+        let installed = lock.withLock { () -> Bool in
+            guard nativeReadableDrainBarrier == nil, !closed else { return false }
+            nativeReadableDrainBarrier = barrier
+            return true
+        }
+        precondition(installed, "native readable-drain barrier must be installed exactly once")
+    }
+
+    func __testNativeCloseReadOverlapState() -> (
+        closeStarted: Bool,
+        activeNativeReadableDrains: Int
+    ) {
+        lock.withLock { (closed, activeReadableDrains) }
+    }
+
+    private func holdNativeReadableDrainForStressTestIfConfigured() {
+        let barrier = lock.withLock { () -> (@Sendable () -> Void)? in
+            guard activeReadableDrains > 0 else { return nil }
+            defer { nativeReadableDrainBarrier = nil }
+            return nativeReadableDrainBarrier
+        }
+        barrier?()
+    }
+    #endif
 }
 
 #endif

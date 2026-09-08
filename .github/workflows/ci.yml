@@ -91,6 +91,7 @@ jobs:
           node tools/release/validate-release-version.mjs --self-test
           tools/ci/run-required-suite.sh --self-test
           tools/ci/run-unit-tests.sh --self-test
+          tools/ci/run-ios-native-stress.sh --self-test
           node tools/ci/package-manifest-mode.mjs --self-test
           node tools/release/generate-third-party-notices.mjs --self-test
           node tools/release/verify-privacy-manifests.mjs --check
@@ -231,6 +232,20 @@ jobs:
           restore_package_manifest
           trap - EXIT
           git diff --exit-code -- Package.swift
+      - name: Validate native IPC backpressure, close/read races, and memory stability
+        run: |
+          tools/ci/run-ios-native-stress.sh \
+            --mode regular \
+            --platform simulator \
+            --destination "platform=iOS Simulator,id=$QVAC_SIMULATOR_UDID" \
+            --candidate "$GITHUB_WORKSPACE/tools/native/bare-kit/.build/BareKit.xcframework" \
+            --evidence-dir "$RUNNER_TEMP/qvac-barekit-r2-native-stress"
+          {
+            echo '### Native IPC stress evidence'
+            echo '```json'
+            jq . "$RUNNER_TEMP/qvac-barekit-r2-native-stress/native-stress-evidence.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Tear down the candidate test simulator
         if: always()
         run: |
@@ -253,6 +268,7 @@ jobs:
             ${{ runner.temp }}/qvac-barekit-r2-ios.xcresult
             ${{ runner.temp }}/qvac-barekit-r2-ios-coverage
             ${{ runner.temp }}/qvac-barekit-r2-example.log
+            ${{ runner.temp }}/qvac-barekit-r2-native-stress
           if-no-files-found: error
           retention-days: 30
 
@@ -277,6 +293,27 @@ jobs:
         run: |
           node tools/native/bare-kit/verify.mjs --self-test
           node tools/ci/verify-ios-test-log.mjs --self-test
+          tools/ci/run-ios-native-stress.sh --self-test
+      - name: Install checksum-pinned XcodeGen
+        run: |
+          XCODEGEN_VERSION=2.46.0
+          XCODEGEN_SHA256=4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
+          XCODEGEN_ARCHIVE="$RUNNER_TEMP/xcodegen-$XCODEGEN_VERSION.zip"
+          XCODEGEN_ROOT="$RUNNER_TEMP/xcodegen-$XCODEGEN_VERSION"
+          curl --fail --location --silent --show-error \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --max-time 300 \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/$XCODEGEN_VERSION/xcodegen.zip" \
+            --output "$XCODEGEN_ARCHIVE"
+          printf '%s  %s\n' "$XCODEGEN_SHA256" "$XCODEGEN_ARCHIVE" | shasum -a 256 -c -
+          mkdir -p "$XCODEGEN_ROOT"
+          ditto -x -k "$XCODEGEN_ARCHIVE" "$XCODEGEN_ROOT"
+          QVAC_XCODEGEN="$XCODEGEN_ROOT/xcodegen/bin/xcodegen"
+          test -x "$QVAC_XCODEGEN"
+          test "$("$QVAC_XCODEGEN" --version)" = "Version: $XCODEGEN_VERSION"
+          echo "QVAC_XCODEGEN=$QVAC_XCODEGEN" >> "$GITHUB_ENV"
       - name: Stage the pinned runtime dependency closure
         run: tools/runtime/link-ios-artifacts.sh
       - name: Build the simulator-only native Thread Sanitizer artifact
@@ -361,6 +398,22 @@ jobs:
           restore_package_manifest
           trap - EXIT
           git diff --exit-code -- Package.swift
+      - name: Run native IPC race test under Thread Sanitizer
+        run: |
+          tools/ci/run-ios-native-stress.sh \
+            --mode thread-sanitizer \
+            --platform simulator \
+            --destination "platform=iOS Simulator,id=$QVAC_SIMULATOR_UDID" \
+            --candidate "$GITHUB_WORKSPACE/tools/native/bare-kit/.build/tsan/BareKit.xcframework" \
+            --compile-commands "$GITHUB_WORKSPACE/tools/native/bare-kit/.build/tsan/source/build/compile_commands.json" \
+            --source-root "$GITHUB_WORKSPACE/tools/native/bare-kit/.build/tsan/source" \
+            --evidence-dir "$RUNNER_TEMP/qvac-barekit-r2-native-stress-tsan"
+          {
+            echo '### Native IPC Thread Sanitizer evidence'
+            echo '```json'
+            jq . "$RUNNER_TEMP/qvac-barekit-r2-native-stress-tsan/native-stress-evidence.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Tear down the native TSan test simulator
         if: always()
         run: |
@@ -384,6 +437,7 @@ jobs:
             ${{ runner.temp }}/qvac-barekit-r2-ios-tsan.log
             ${{ runner.temp }}/qvac-barekit-r2-ios-tsan.xcresult
             ${{ runner.temp }}/qvac-barekit-r2-ios-tsan-verification.txt
+            ${{ runner.temp }}/qvac-barekit-r2-native-stress-tsan
           if-no-files-found: error
           retention-days: 30
 

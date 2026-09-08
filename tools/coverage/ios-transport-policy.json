@@ -9,29 +9,29 @@
   "sources": [
     {
       "path": "Sources/QVACClient/Internal/Transport/BareIPCTransport.swift",
-      "requiredCoveredLines": [89, 180, 209, 247, 254, 262, 264, 273, 278, 303, 304, 308, 310, 377, 381, 390, 401, 406, 419, 423, 453, 464, 471, 492, 494, 500, 512, 522, 531, 538, 559, 566, 573, 589, 603, 612, 624, 634, 645, 655, 665, 675, 686],
+      "requiredCoveredLines": [89, 180, 209, 247, 254, 262, 264, 273, 278, 303, 304, 308, 310, 377, 381, 390, 401, 406, 419, 423, 453, 464, 471, 492, 494, 500, 512, 522, 534, 541, 562, 569, 576, 592, 606, 615, 627, 637, 648, 658, 668, 678, 689],
       "requiredCoveredLinesByNativeReadAdapter": {
         "checked": [95],
         "legacy": [91]
       },
       "gate": {
         "lines": {
-          "minimumPercentBasisPoints": 9000,
-          "minimumCovered": 670,
-          "minimumTotal": 680,
-          "maximumUncovered": 31
+          "minimumPercentBasisPoints": 9500,
+          "minimumCovered": 770,
+          "minimumTotal": 810,
+          "maximumUncovered": 35
         },
         "functions": {
-          "minimumPercentBasisPoints": 8000,
-          "minimumCovered": 90,
-          "minimumTotal": 96,
-          "maximumUncovered": 12
+          "minimumPercentBasisPoints": 9200,
+          "minimumCovered": 105,
+          "minimumTotal": 116,
+          "maximumUncovered": 11
         },
         "regions": {
-          "minimumPercentBasisPoints": 8200,
-          "minimumCovered": 215,
-          "minimumTotal": 235,
-          "maximumUncovered": 30
+          "minimumPercentBasisPoints": 9000,
+          "minimumCovered": 250,
+          "minimumTotal": 282,
+          "maximumUncovered": 32
         }
       }
     },
@@ -40,22 +40,22 @@
       "requiredCoveredLines": [232, 279, 581, 585, 608, 658, 720, 739],
       "gate": {
         "lines": {
-          "minimumPercentBasisPoints": 2000,
-          "minimumCovered": 380,
-          "minimumTotal": 1500,
-          "maximumUncovered": 1250
+          "minimumPercentBasisPoints": 2800,
+          "minimumCovered": 475,
+          "minimumTotal": 1690,
+          "maximumUncovered": 1220
         },
         "functions": {
-          "minimumPercentBasisPoints": 2000,
-          "minimumCovered": 35,
-          "minimumTotal": 140,
-          "maximumUncovered": 120
+          "minimumPercentBasisPoints": 2500,
+          "minimumCovered": 40,
+          "minimumTotal": 162,
+          "maximumUncovered": 125
         },
         "regions": {
-          "minimumPercentBasisPoints": 1800,
-          "minimumCovered": 105,
-          "minimumTotal": 500,
-          "maximumUncovered": 430
+          "minimumPercentBasisPoints": 2300,
+          "minimumCovered": 130,
+          "minimumTotal": 563,
+          "maximumUncovered": 440
         }
       }
     },
@@ -64,22 +64,22 @@
       "requiredCoveredLines": [92, 99, 102, 103, 104, 117, 118, 121, 122, 123],
       "gate": {
         "lines": {
-          "minimumPercentBasisPoints": 7500,
-          "minimumCovered": 52,
-          "minimumTotal": 65,
-          "maximumUncovered": 20
+          "minimumPercentBasisPoints": 7800,
+          "minimumCovered": 55,
+          "minimumTotal": 71,
+          "maximumUncovered": 16
         },
         "functions": {
           "minimumPercentBasisPoints": 8000,
           "minimumCovered": 9,
-          "minimumTotal": 10,
-          "maximumUncovered": 3
+          "minimumTotal": 11,
+          "maximumUncovered": 2
         },
         "regions": {
-          "minimumPercentBasisPoints": 5000,
-          "minimumCovered": 25,
-          "minimumTotal": 44,
-          "maximumUncovered": 25
+          "minimumPercentBasisPoints": 5500,
+          "minimumCovered": 27,
+          "minimumTotal": 49,
+          "maximumUncovered": 22
         }
       }
     }

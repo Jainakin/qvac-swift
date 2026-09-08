@@ -347,6 +347,37 @@ final class QVACAdvancedStreamCoverageTests: XCTestCase {
         await client.close()
     }
 
+    func test_untyped_plugin_invocation_returns_raw_result() async throws {
+        let transport = MockTransport()
+        let client = QVACClient(testing: transport)
+        let expected: JSONValue = .object([
+            "items": .array([.string("first"), .number(2)]),
+            "metadata": .object(["cached": .bool(true)]),
+        ])
+        let task = Task { () throws -> JSONValue in
+            try await client.invokePlugin(
+                modelId: "plugin-model",
+                handler: "raw-result",
+                params: PluginParameters(prompt: "hello", limit: 2)
+            )
+        }
+
+        let (id, request) = try Self.request(
+            in: try await Self.waitForFrames(1, on: transport)
+        )
+        XCTAssertEqual(request["type"] as? String, "pluginInvoke")
+        XCTAssertEqual(request["handler"] as? String, "raw-result")
+        try await Self.feedReply(
+            id: id,
+            response: .pluginInvoke(.init(result: expected)),
+            to: transport
+        )
+
+        let result = try await task.value
+        XCTAssertEqual(result, expected)
+        await client.close()
+    }
+
     func test_plugin_unary_result_budget_accepts_exact_and_rejects_one_byte_over_before_decode_or_publication() async throws {
         let result: JSONValue = .object([
             "text": .string(String(repeating: "x", count: 64)),
@@ -793,6 +824,63 @@ final class QVACAdvancedStreamCoverageTests: XCTestCase {
         let outbound = await transport.outbound()
         XCTAssertTrue(outbound.isEmpty)
         await client.close()
+    }
+
+    func test_transcribe_stream_accepts_whisper_end_of_turn_and_rejects_invalid_duration() async throws {
+        do {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let session = try await client.transcribeStream(
+                modelId: "whisper",
+                rpcOptions: .init(timeout: nil)
+            )
+            let (id, _) = try Self.duplexRequest(
+                in: try await Self.waitForFrames(3, on: transport)
+            )
+            await Self.feedDuplex(
+                id: id,
+                records: [
+                    #"{"type":"transcribeStream","done":true,"endOfTurn":{"source":"whisper","silenceDurationMs":375.5}}"#,
+                ],
+                to: transport
+            )
+
+            var events: [QVACClient.TranscribeStreamEvent] = []
+            for try await event in session.events { events.append(event) }
+            XCTAssertEqual(events, [
+                .endOfTurn(.object([
+                    "source": .string("whisper"),
+                    "silenceDurationMs": .number(375.5),
+                ])),
+                .done,
+            ])
+            await client.close()
+        }
+
+        let malformedRecords = [
+            #"{"type":"transcribeStream","done":true,"endOfTurn":{"source":"whisper"}}"#,
+            #"{"type":"transcribeStream","done":true,"endOfTurn":{"source":"whisper","silenceDurationMs":"375"}}"#,
+        ]
+        for record in malformedRecords {
+            let transport = MockTransport()
+            let client = QVACClient(testing: transport)
+            let session = try await client.transcribeStream(
+                modelId: "whisper",
+                rpcOptions: .init(timeout: nil)
+            )
+            let (id, _) = try Self.duplexRequest(
+                in: try await Self.waitForFrames(3, on: transport)
+            )
+            await Self.feedDuplex(id: id, records: [record], to: transport)
+
+            do {
+                for try await _ in session.events {}
+                XCTFail("invalid Whisper silenceDurationMs must reject")
+            } catch {
+                assertProtocolViolation(error, containing: "silenceDurationMs")
+            }
+            await client.close()
+        }
     }
 
     func test_transcribe_stream_writes_audio_and_fans_out_complete_terminal_payload() async throws {

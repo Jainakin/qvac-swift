@@ -6,8 +6,8 @@
 set -euo pipefail
 
 readonly MODULE="QVACClientUnitTests"
-readonly EXPECTED_TEST_COUNT=621
-readonly EXPECTED_INVENTORY_SHA256="5441645de16ac6a4950a5f44b28e38db1e47827aca177ca7d704a645f534d109"
+readonly EXPECTED_TEST_COUNT=626
+readonly EXPECTED_INVENTORY_SHA256="aaf162771f7cef0803ae9cc30d7ac2051a6a7f882e1ecb19e724b718b301f813"
 readonly SWIFTC_FLAGS=(
     -Xswiftc -warnings-as-errors
     -Xswiftc -strict-concurrency=complete

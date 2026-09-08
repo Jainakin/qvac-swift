@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPOSITORY_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd -P)"
+VERIFIER="$SCRIPT_DIR/verify-ios-native-stress-evidence.mjs"
+BARE_KIT_VERIFIER="$REPOSITORY_ROOT/tools/native/bare-kit/verify.mjs"
+STAGED_ARTIFACTS="$REPOSITORY_ROOT/tools/runtime/.build/artifacts"
+REQUIRED_XCODEGEN_VERSION="2.46.0"
+
+usage() {
+    cat >&2 <<'USAGE'
+usage:
+  run-ios-native-stress.sh \
+    --mode regular \
+    --platform <simulator|device> \
+    --destination 'platform=iOS...,id=...' \
+    --candidate /absolute/BareKit.xcframework \
+    --evidence-dir /absolute/new-or-empty-directory \
+    [-- <additional xcodebuild signing options>]
+
+  run-ios-native-stress.sh \
+    --mode thread-sanitizer \
+    --platform simulator \
+    --destination 'platform=iOS Simulator,id=...' \
+    --candidate /absolute/BareKit.xcframework \
+    --compile-commands /absolute/compile_commands.json \
+    --source-root /absolute/patched-native-source \
+    --evidence-dir /absolute/new-or-empty-directory
+
+  run-ios-native-stress.sh --self-test
+USAGE
+    exit 2
+}
+
+fail() {
+    echo "[ios-native-stress] $*" >&2
+    exit 1
+}
+
+WORK_ROOT=""
+RUN_COMPLETED=false
+cleanup() {
+    local command_status="$?"
+    local cleanup_status=0
+    trap - EXIT
+    if [[ -n "$WORK_ROOT" ]]; then
+        rm -rf "$WORK_ROOT" || cleanup_status=$?
+    fi
+    if (( command_status != 0 )); then
+        exit "$command_status"
+    fi
+    if (( cleanup_status != 0 )); then
+        exit "$cleanup_status"
+    fi
+    if [[ "$RUN_COMPLETED" != true ]]; then
+        # Apple Bash 3.2 enters EXIT with status zero after some expansion
+        # failures (including an unset empty-array expansion under `set -u`).
+        # Only the explicit success marker may therefore produce a zero exit.
+        exit 1
+    fi
+    exit 0
+}
+
+# Private subprocess mode used by --self-test. On Apple Bash 3.2 the empty
+# array expansion aborts with an EXIT-trap status of zero; newer Bash versions
+# reach the explicit zero exit. Both paths must be converted to failure because
+# RUN_COMPLETED was never set.
+if [[ "${1:-}" == "--internal-self-test-nounset-cleanup" ]]; then
+    [[ "$#" -eq 1 ]] || exit 2
+    WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/qvac-native-stress-cleanup-test.XXXXXX")"
+    trap cleanup EXIT
+    SELF_TEST_EMPTY_OPTIONS=()
+    SELF_TEST_COMMAND=("${SELF_TEST_EMPTY_OPTIONS[@]}")
+    exit 0
+fi
+
+if [[ "${1:-}" == "--self-test" ]]; then
+    [[ "$#" -eq 1 ]] || usage
+    node "$VERIFIER" --self-test
+    bash -n "$0"
+    set +e
+    /bin/bash "$0" --internal-self-test-nounset-cleanup >/dev/null 2>&1
+    CLEANUP_SELF_TEST_STATUS=$?
+    set -e
+    [[ "$CLEANUP_SELF_TEST_STATUS" -eq 1 ]] \
+        || fail "cleanup must fail closed after a Bash nounset expansion abort"
+    EMPTY_OPTIONS=()
+    EMPTY_OPTION_COUNT=0
+    TEST_COMMAND=(xcodebuild)
+    if (( EMPTY_OPTION_COUNT > 0 )); then
+        TEST_COMMAND+=("${EMPTY_OPTIONS[@]}")
+    fi
+    TEST_COMMAND+=(test)
+    [[ "${TEST_COMMAND[*]}" == "xcodebuild test" ]] \
+        || fail "empty additional xcodebuild options were not handled safely"
+    echo "[ios-native-stress-self-test] argument-independent gates verified"
+    exit 0
+fi
+
+MODE=""
+PLATFORM=""
+DESTINATION=""
+CANDIDATE=""
+EVIDENCE=""
+COMPILE_COMMANDS=""
+SOURCE_ROOT=""
+XCODEBUILD_OPTIONS=()
+XCODEBUILD_OPTION_COUNT=0
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --mode|--platform|--destination|--candidate|--evidence-dir|--compile-commands|--source-root)
+            [[ "$#" -ge 2 && -n "$2" ]] || usage
+            case "$1" in
+                --mode) MODE="$2" ;;
+                --platform) PLATFORM="$2" ;;
+                --destination) DESTINATION="$2" ;;
+                --candidate) CANDIDATE="$2" ;;
+                --evidence-dir) EVIDENCE="$2" ;;
+                --compile-commands) COMPILE_COMMANDS="$2" ;;
+                --source-root) SOURCE_ROOT="$2" ;;
+            esac
+            shift 2
+            ;;
+        --)
+            shift
+            XCODEBUILD_OPTIONS=("$@")
+            XCODEBUILD_OPTION_COUNT="$#"
+            break
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+[[ "$MODE" == "regular" || "$MODE" == "thread-sanitizer" ]] || usage
+[[ "$PLATFORM" == "simulator" || "$PLATFORM" == "device" ]] || usage
+[[ "$CANDIDATE" == /* && "$EVIDENCE" == /* ]] || usage
+[[ -d "$CANDIDATE" && ! -L "$CANDIDATE" ]] \
+    || fail "candidate must be an existing, non-symlinked absolute directory"
+CANDIDATE="$(cd -P "$CANDIDATE" && pwd -P)"
+[[ "$(basename "$CANDIDATE")" == "BareKit.xcframework" ]] \
+    || fail "candidate must be named BareKit.xcframework"
+
+if [[ "$PLATFORM" == "simulator" ]]; then
+    [[ "$DESTINATION" =~ ^platform=iOS\ Simulator,id=[A-Za-z0-9-]{8,64}$ ]] || usage
+else
+    [[ "$DESTINATION" =~ ^platform=iOS,id=[A-Za-z0-9-]{8,64}$ ]] || usage
+fi
+if [[ "$MODE" == "thread-sanitizer" ]]; then
+    [[ "$PLATFORM" == "simulator" ]] || fail "Thread Sanitizer is Simulator-only"
+    [[ "$COMPILE_COMMANDS" == /* && -f "$COMPILE_COMMANDS" && ! -L "$COMPILE_COMMANDS" ]] \
+        || fail "Thread Sanitizer compile_commands.json must be an absolute regular file"
+    [[ "$SOURCE_ROOT" == /* && -d "$SOURCE_ROOT" && ! -L "$SOURCE_ROOT" ]] \
+        || fail "Thread Sanitizer source root must be an absolute real directory"
+    COMPILE_COMMANDS="$(cd -P "$(dirname "$COMPILE_COMMANDS")" && pwd -P)/$(basename "$COMPILE_COMMANDS")"
+    SOURCE_ROOT="$(cd -P "$SOURCE_ROOT" && pwd -P)"
+else
+    [[ -z "$COMPILE_COMMANDS" && -z "$SOURCE_ROOT" ]] \
+        || fail "native compile evidence is accepted only in Thread Sanitizer mode"
+fi
+
+if [[ -e "$EVIDENCE" ]]; then
+    [[ -d "$EVIDENCE" && ! -L "$EVIDENCE" ]] \
+        || fail "evidence path must be a real directory"
+    EVIDENCE="$(cd -P "$EVIDENCE" && pwd -P)"
+    [[ -z "$(find "$EVIDENCE" -mindepth 1 -print -quit)" ]] \
+        || fail "evidence directory must be empty"
+else
+    EVIDENCE_PARENT="$(dirname "$EVIDENCE")"
+    EVIDENCE_NAME="$(basename "$EVIDENCE")"
+    [[ "$EVIDENCE_NAME" != "." && "$EVIDENCE_NAME" != ".." ]] || usage
+    [[ -d "$EVIDENCE_PARENT" && ! -L "$EVIDENCE_PARENT" ]] \
+        || fail "evidence parent must be an existing real directory"
+    EVIDENCE_PARENT="$(cd -P "$EVIDENCE_PARENT" && pwd -P)"
+    EVIDENCE="$EVIDENCE_PARENT/$EVIDENCE_NAME"
+    mkdir "$EVIDENCE"
+fi
+case "$EVIDENCE/" in
+    "$REPOSITORY_ROOT/"*) fail "evidence directory must be outside the source repository" ;;
+esac
+
+SOURCE_SHA="$(git -C "$REPOSITORY_ROOT" rev-parse --verify HEAD)"
+[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "could not resolve a full source commit"
+SOURCE_STATUS="$(git -C "$REPOSITORY_ROOT" status --porcelain --untracked-files=all)"
+[[ -z "$SOURCE_STATUS" ]] || {
+    echo "$SOURCE_STATUS" >&2
+    fail "final evidence requires a clean checkout; dirty runs are calibration-only"
+}
+
+XCODEGEN="${QVAC_XCODEGEN:-}"
+if [[ -z "$XCODEGEN" ]]; then
+    XCODEGEN="$(command -v xcodegen || true)"
+fi
+[[ -n "$XCODEGEN" && -x "$XCODEGEN" ]] || fail "set QVAC_XCODEGEN to pinned XcodeGen"
+[[ "$("$XCODEGEN" --version)" == "Version: $REQUIRED_XCODEGEN_VERSION" ]] \
+    || fail "XcodeGen $REQUIRED_XCODEGEN_VERSION is required"
+command -v xcodebuild >/dev/null || fail "xcodebuild is required"
+command -v xcrun >/dev/null || fail "xcrun is required"
+
+[[ -d "$STAGED_ARTIFACTS" && ! -L "$STAGED_ARTIFACTS" ]] \
+    || fail "run tools/runtime/link-ios-artifacts.sh before native stress validation"
+EXPECTED_TARGET_COUNT="$(
+    node -e '
+      const value = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))
+      if (!Array.isArray(value.targets)) process.exit(2)
+      process.stdout.write(String(value.targets.length))
+    ' "$REPOSITORY_ROOT/tools/release/artifacts.development.json"
+)"
+[[ "$EXPECTED_TARGET_COUNT" == "38" ]] || fail "development artifact closure must contain 38 targets"
+while IFS= read -r TARGET; do
+    ARTIFACT="$STAGED_ARTIFACTS/$TARGET.xcframework"
+    [[ -d "$ARTIFACT" && ! -L "$ARTIFACT" ]] \
+        || fail "staged artifact closure is missing $TARGET.xcframework"
+done < <(
+    node -e '
+      const value = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))
+      for (const target of value.targets) process.stdout.write(target + "\n")
+    ' "$REPOSITORY_ROOT/tools/release/artifacts.development.json"
+)
+
+echo "[ios-native-stress] non-publishing validation source=$SOURCE_SHA mode=$MODE platform=$PLATFORM" \
+    | tee "$EVIDENCE/run-metadata.log"
+if [[ "$MODE" == "regular" ]]; then
+    node "$BARE_KIT_VERIFIER" --artifact "$CANDIDATE" \
+        2>&1 | tee "$EVIDENCE/candidate-verification.log"
+else
+    node "$BARE_KIT_VERIFIER" \
+        --thread-sanitizer-artifact "$CANDIDATE" \
+        --compile-commands "$COMPILE_COMMANDS" \
+        --source-root "$SOURCE_ROOT" \
+        2>&1 | tee "$EVIDENCE/candidate-verification.log"
+fi
+
+WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/qvac-native-stress.XXXXXX")"
+trap cleanup EXIT
+SOURCE_COPY="$WORK_ROOT/source"
+DERIVED_DATA="$WORK_ROOT/DerivedData"
+mkdir "$SOURCE_COPY"
+git -C "$REPOSITORY_ROOT" archive --format=tar "$SOURCE_SHA" \
+    | tar -xf - -C "$SOURCE_COPY"
+
+mkdir -p "$SOURCE_COPY/tools/runtime/.build"
+ditto "$STAGED_ARTIFACTS" "$SOURCE_COPY/tools/runtime/.build/artifacts"
+TEMP_BARE_KIT="$SOURCE_COPY/tools/runtime/.build/artifacts/BareKit.xcframework"
+[[ "$TEMP_BARE_KIT" == "$WORK_ROOT/"* ]] || fail "internal BareKit destination escaped work root"
+rm -rf "$TEMP_BARE_KIT"
+ditto "$CANDIDATE" "$TEMP_BARE_KIT"
+diff --recursive --brief "$CANDIDATE" "$TEMP_BARE_KIT" >/dev/null \
+    || fail "isolated BareKit copy differs from selected candidate"
+cp "$SOURCE_COPY/Package.swift.dev" "$SOURCE_COPY/Package.swift"
+(
+    cd "$SOURCE_COPY"
+    swift package dump-package >/dev/null
+)
+(
+    cd "$SOURCE_COPY/Examples/QVACChat"
+    "$XCODEGEN" generate
+)
+
+RESULT_BUNDLE="$EVIDENCE/native-stress.xcresult"
+TEST_LOG="$EVIDENCE/native-stress-xcodebuild.log"
+[[ ! -e "$RESULT_BUNDLE" && ! -e "$TEST_LOG" ]] \
+    || fail "evidence outputs unexpectedly exist"
+
+ONLY_TESTING="-only-testing:QVACChatNativeStressTests"
+if [[ "$MODE" == "thread-sanitizer" ]]; then
+    ONLY_TESTING+="/QVACNativeIPCStressTests/testPatchedNativeIPCBackpressureOrderingAndConcurrentCloseRace"
+fi
+XCODEBUILD=(
+    xcodebuild
+    -project "$SOURCE_COPY/Examples/QVACChat/QVACChat.xcodeproj"
+    -scheme QVACChat-NativeStress
+    -destination "$DESTINATION"
+    -destination-timeout 180
+    -derivedDataPath "$DERIVED_DATA"
+    -parallel-testing-enabled NO
+    SWIFT_SUPPRESS_WARNINGS=NO
+    SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
+    OTHER_SWIFT_FLAGS=-strict-concurrency=complete
+    'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) QVAC_NATIVE_STRESS_TESTING'
+    -resultBundlePath "$RESULT_BUNDLE"
+    "$ONLY_TESTING"
+)
+if [[ "$PLATFORM" == "simulator" ]]; then
+    XCODEBUILD+=(CODE_SIGNING_ALLOWED=NO)
+fi
+if [[ "$MODE" == "thread-sanitizer" ]]; then
+    XCODEBUILD+=(-enableThreadSanitizer YES)
+fi
+if (( XCODEBUILD_OPTION_COUNT > 0 )); then
+    XCODEBUILD+=("${XCODEBUILD_OPTIONS[@]}")
+fi
+XCODEBUILD+=(test)
+
+if [[ "$MODE" == "thread-sanitizer" ]]; then
+    TSAN_OPTIONS='halt_on_error=1:exitcode=66' "${XCODEBUILD[@]}" 2>&1 | tee "$TEST_LOG"
+else
+    "${XCODEBUILD[@]}" 2>&1 | tee "$TEST_LOG"
+fi
+
+node "$VERIFIER" \
+    --mode "$MODE" \
+    --platform "$PLATFORM" \
+    --xcresult "$RESULT_BUNDLE" \
+    --log "$TEST_LOG" \
+    --derived-data "$DERIVED_DATA" \
+    --candidate "$CANDIDATE" \
+    --source-sha "$SOURCE_SHA" \
+    --output "$EVIDENCE/native-stress-evidence.json"
+
+FINAL_STATUS="$(git -C "$REPOSITORY_ROOT" status --porcelain --untracked-files=all)"
+[[ -z "$FINAL_STATUS" ]] || fail "source checkout changed during native stress validation"
+echo "[ios-native-stress] PASS evidence=$EVIDENCE/native-stress-evidence.json"
+RUN_COMPLETED=true

@@ -1139,6 +1139,75 @@ final class QVACOperationProtocolHardeningTests: XCTestCase {
         }
     }
 
+    func test_transcribe_accumulates_segment_from_terminal_frame() async throws {
+        let peer = ScriptedPeer()
+        let client = QVACClient(testing: peer)
+        let run = try await client.transcribeWithMetadata(
+            modelId: "transcriber",
+            audioPath: "/audio.wav"
+        )
+        let request = try await Self.waitForRequest(on: peer)
+        XCTAssertEqual(request.body["metadata"] as? Bool, true)
+        await Self.feedServerStream(
+            id: request.id,
+            records: [
+                #"{"type":"transcribe","text":"prefix "}"#,
+                #"{"type":"transcribe","done":true,"text":"tail","segment":{"id":9,"text":"terminal segment","startMs":100,"endMs":240,"append":false},"stats":{"segments":1}}"#,
+            ],
+            to: peer
+        )
+
+        let result = try await run.result.value
+        XCTAssertEqual(result.text, "prefix tail")
+        XCTAssertEqual(result.segments.count, 1)
+        let segment = try XCTUnwrap(result.segments.first)
+        XCTAssertEqual(segment.id, 9)
+        XCTAssertEqual(segment.text, "terminal segment")
+        XCTAssertEqual(segment.startMs, 100)
+        XCTAssertEqual(segment.endMs, 240)
+        XCTAssertFalse(segment.append)
+        XCTAssertEqual(result.stats, .object(["segments": .number(1)]))
+        await client.close()
+    }
+
+    func test_text_to_speech_publishes_terminal_audio_and_sentence_chunk() async throws {
+        let peer = ScriptedPeer()
+        let client = QVACClient(testing: peer)
+        let run = try await client.textToSpeech(
+            modelId: "tts",
+            text: "Terminal sentence.",
+            sentenceStream: true
+        )
+        let request = try await Self.waitForRequest(on: peer)
+        XCTAssertEqual(request.body["stream"] as? Bool, true)
+        XCTAssertEqual(request.body["sentenceStream"] as? Bool, true)
+        await Self.feedServerStream(
+            id: request.id,
+            records: [
+                #"{"type":"textToSpeech","buffer":[0.5,-0.25],"chunkIndex":0,"sentenceChunk":"Terminal sentence.","done":true}"#,
+            ],
+            to: peer
+        )
+
+        let didFinish = try await run.done.value
+        let aggregated = try await run.buffer.value
+        XCTAssertTrue(didFinish)
+        XCTAssertEqual(aggregated, [])
+        var samples: [Double] = []
+        for try await sample in run.bufferStream { samples.append(sample) }
+        XCTAssertEqual(samples, [0.5, -0.25])
+
+        let chunkUpdates = try XCTUnwrap(run.chunkUpdates)
+        var chunks: [QVACClient.TtsSentenceChunkUpdate] = []
+        for try await chunk in chunkUpdates { chunks.append(chunk) }
+        XCTAssertEqual(chunks, [.init(
+            buffer: [0.5, -0.25],
+            chunkIndex: 0,
+            sentenceChunk: "Terminal sentence."
+        )])
+        await client.close()
+    }
+
     func test_text_to_speech_rejects_wrong_response_type_and_eof_without_done() async throws {
         enum Fixture: CaseIterable {
             case wrongType
