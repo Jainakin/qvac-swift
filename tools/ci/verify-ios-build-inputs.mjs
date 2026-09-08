@@ -33,6 +33,7 @@ const hashBuffer = Buffer.allocUnsafe(1024 * 1024)
 const sourceTreeAlgorithm = 'qvac-canonical-source-tree-v1'
 const artifactTreeAlgorithm = 'qvac-canonical-signed-xcframework-v2'
 const artifactMapAlgorithm = 'qvac-canonical-ios-artifact-map-v1'
+const isolatedSourceRootName = 'source'
 const codeSignPath = '/usr/bin/codesign'
 const maximumCodeSignatureBytes = 1024n * 1024n
 const maximumSignatureEnvelopeEntries = 64
@@ -87,6 +88,15 @@ function realDirectory(path, label) {
   }
   portablePermissions(stat, label)
   return realpathSync(path)
+}
+
+function validateIsolatedSourceRootName(path) {
+  if (basename(path) !== isolatedSourceRootName) {
+    fail(
+      `isolated source root must be named ${isolatedSourceRootName}; `
+      + 'XcodeGen records the local package directory name in project.pbxproj',
+    )
+  }
 }
 
 function regularFile(path, label, maximumBytes = Number.MAX_SAFE_INTEGER) {
@@ -823,6 +833,7 @@ export function verifyIsolatedBuildInputs({
       || canonicalSourceRoot.startsWith(`${repositoryRoot}/`)) {
     fail('isolated source root must be outside the repository')
   }
+  validateIsolatedSourceRootName(canonicalSourceRoot)
   const xcodeGenEvidence = verifyPinnedXcodeGen(xcodegen)
   const runtimeBuild = realDirectory(
     join(canonicalSourceRoot, 'tools', 'runtime', '.build'),
@@ -1554,6 +1565,12 @@ function selfTest() {
     if (sameSnapshot(expectedSourceSnapshot, actualSourceSnapshot)) {
       fail('full-source comparison ignored generated-project mutation')
     }
+
+    validateIsolatedSourceRootName(join(fixture, isolatedSourceRootName))
+    expectFailure(
+      () => validateIsolatedSourceRootName(join(fixture, 'qvac-swift')),
+      'a noncanonical isolated source-root name',
+    )
 
     let rejectedUnpinnedGenerator = false
     try { verifyPinnedXcodeGen(process.execPath) } catch { rejectedUnpinnedGenerator = true }

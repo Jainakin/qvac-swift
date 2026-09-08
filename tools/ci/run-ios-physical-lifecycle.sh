@@ -307,7 +307,10 @@ fi
 WORK_ROOT="$(canonical_directory "$WORK_ROOT")" \
     || fail "could not canonicalize physical lifecycle work root"
 trap cleanup EXIT
-SOURCE_COPY="$WORK_ROOT/qvac-swift"
+# XcodeGen records the local package directory name in project.pbxproj. Use the
+# same canonical name as the verifier's independent regeneration and the native
+# stress runner so their generated-project digests are reproducible.
+SOURCE_COPY="$WORK_ROOT/source"
 DERIVED_DATA="$WORK_ROOT/DerivedData"
 SOURCE_ARCHIVE="$EVIDENCE/source.tar"
 mkdir "$SOURCE_COPY"
