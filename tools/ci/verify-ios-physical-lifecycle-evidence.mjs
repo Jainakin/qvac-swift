@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import {
+  isolatedSourceRootName,
   pinnedXcodeGenExecutableSHA256,
   pinnedXcodeGenVersion,
   reviewedArtifactLockSHA256,
@@ -374,9 +375,9 @@ function validateWorkspaceState(derivedData, sourceRoot, artifactInventory) {
   for (const artifact of artifacts) {
     if (!artifact || typeof artifact !== 'object'
         || artifact.source?.type !== 'local'
-        || artifact.packageRef?.identity !== 'qvac-swift'
+        || artifact.packageRef?.identity !== isolatedSourceRootName
         || artifact.packageRef?.kind !== 'root'
-        || artifact.packageRef?.name !== 'qvac-swift'
+        || artifact.packageRef?.name !== isolatedSourceRootName
         || artifact.kind?.xcframework === undefined) {
       fail(`resolved artifact ${artifact?.targetName ?? '<unknown>'} is not a local root-package XCFramework`)
     }
@@ -840,6 +841,44 @@ function syntheticLockState(deviceID, overrides = {}) {
   }
 }
 
+function syntheticWorkspaceStateFixture(root, artifactInventory) {
+  const unresolvedSourceRoot = join(root, isolatedSourceRootName)
+  const derivedData = join(root, 'DerivedData')
+  mkdirSync(unresolvedSourceRoot, { recursive: true })
+  const sourceRoot = realpathSync(unresolvedSourceRoot)
+  const stagedRoot = join(sourceRoot, 'tools', 'runtime', '.build', 'artifacts')
+  const workspaceStatePath = join(derivedData, 'SourcePackages', 'workspace-state.json')
+  mkdirSync(stagedRoot, { recursive: true })
+  mkdirSync(dirname(workspaceStatePath), { recursive: true })
+
+  const artifacts = artifactInventory.targets.map(targetName => {
+    const path = join(stagedRoot, `${targetName}.xcframework`)
+    mkdirSync(path)
+    return {
+      kind: { xcframework: {} },
+      packageRef: {
+        identity: isolatedSourceRootName,
+        kind: 'root',
+        location: sourceRoot,
+        name: isolatedSourceRootName,
+      },
+      path,
+      source: { type: 'local' },
+      targetName,
+    }
+  })
+  const state = {
+    object: { artifacts, dependencies: [], prebuilts: [] },
+    version: 7,
+  }
+  const write = document => writeFileSync(
+    workspaceStatePath,
+    `${JSON.stringify(document)}\n`,
+  )
+  write(state)
+  return { derivedData, sourceRoot, state, write }
+}
+
 function pngChunk(type, data) {
   const chunk = Buffer.alloc(12 + data.length)
   chunk.writeUInt32BE(data.length, 0)
@@ -912,7 +951,7 @@ function syntheticDeviceMachO(linkeditVirtualSize) {
 function selfTest() {
   const { policy } = loadPolicy()
   const inventory = loadInventory(policy)
-  loadArtifactInventory(policy)
+  const artifactInventory = loadArtifactInventory(policy)
   const deviceID = '00000000-0000000000000001'
   const identity = inventory.entries[0]
   validateTestResults(syntheticTestResults(identity, deviceID), inventory, deviceID)
@@ -1018,6 +1057,67 @@ function selfTest() {
     'lock evidence for another destination',
   )
 
+  const workspaceFixtureRoot = mkdtempSync(join(tmpdir(), 'qvac-workspace-state-verifier.'))
+  try {
+    const fixture = syntheticWorkspaceStateFixture(workspaceFixtureRoot, artifactInventory)
+    validateWorkspaceState(fixture.derivedData, fixture.sourceRoot, artifactInventory)
+    const expectWorkspaceFailure = (mutate, label) => {
+      const state = structuredClone(fixture.state)
+      mutate(state)
+      fixture.write(state)
+      expectFailure(
+        () => validateWorkspaceState(fixture.derivedData, fixture.sourceRoot, artifactInventory),
+        label,
+      )
+    }
+    expectWorkspaceFailure(
+      state => { state.object.artifacts[0].packageRef.identity = 'qvac-swift' },
+      'the pre-isolation package identity',
+    )
+    expectWorkspaceFailure(
+      state => { state.object.artifacts[0].packageRef.name = 'qvac-swift' },
+      'the pre-isolation package name',
+    )
+    expectWorkspaceFailure(
+      state => { state.object.artifacts[0].source.type = 'remote' },
+      'a non-local artifact source',
+    )
+    expectWorkspaceFailure(
+      state => { state.object.artifacts[0].packageRef.kind = 'remoteSourceControl' },
+      'a non-root package reference',
+    )
+    expectWorkspaceFailure(
+      state => { state.object.artifacts[0].kind = { artifactBundle: {} } },
+      'a non-XCFramework artifact',
+    )
+    expectWorkspaceFailure(
+      state => { state.object.dependencies = [{ identity: 'unreviewed' }] },
+      'an external SwiftPM dependency',
+    )
+    expectWorkspaceFailure(
+      state => { state.object.prebuilts = [{ identity: 'unreviewed' }] },
+      'an external SwiftPM prebuilt',
+    )
+    expectWorkspaceFailure(
+      state => { state.object.artifacts[0].targetName = 'unreviewed-target' },
+      'an artifact outside the reviewed target inventory',
+    )
+    const otherPackage = join(workspaceFixtureRoot, 'other-package')
+    mkdirSync(otherPackage)
+    expectWorkspaceFailure(
+      state => { state.object.artifacts[0].packageRef.location = otherPackage },
+      'an artifact attributed to another package checkout',
+    )
+    const outsideArtifact = join(workspaceFixtureRoot, 'outside.xcframework')
+    mkdirSync(outsideArtifact)
+    expectWorkspaceFailure(
+      state => { state.object.artifacts[0].path = outsideArtifact },
+      'an artifact outside the isolated staged closure',
+    )
+  } finally {
+    rmSync(workspaceFixtureRoot, { recursive: true, force: true })
+  }
+
   const fixture = mkdtempSync(join(tmpdir(), 'qvac-physical-lifecycle-verifier.'))
   try {
     const manifest = syntheticAttachmentFixture(fixture, policy, inventory, deviceID)
@@ -1118,7 +1218,7 @@ function selfTest() {
   validateSourceState(sourceSHA, sourceSHA, '')
   expectFailure(() => validateSourceState(sourceSHA, 'b'.repeat(40), ''), 'a spoofed source commit')
   expectFailure(() => validateSourceState(sourceSHA, sourceSHA, ' M Package.swift'), 'a dirty source tree')
-  console.log('[ios-physical-lifecycle-evidence-self-test] exact test/device/screenshots, lock state, source binding, and signing normalization verified')
+  console.log('[ios-physical-lifecycle-evidence-self-test] exact test/device/screenshots, lock state, SwiftPM closure, source binding, and signing normalization verified')
 }
 
 function validateLockStateFile(path, expectedDeviceID) {
