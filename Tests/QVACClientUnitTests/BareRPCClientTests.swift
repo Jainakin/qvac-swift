@@ -3065,9 +3065,9 @@ final class BareRPCClientTests: XCTestCase {
         }
 
         let serverError = BareRPCError(
-            message: "model is not loaded",
+            message: "Model with ID \"missing-model\" not found",
             code: "MODEL_NOT_FOUND",
-            errno: 40002
+            errno: 52002
         )
         await mock.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
             id: id,
@@ -3094,7 +3094,56 @@ final class BareRPCClientTests: XCTestCase {
             XCTFail("unexpected response error: \(error)")
         }
 
+        let isOpenAfterRemoteError = await rpc.isOpen()
+        XCTAssertTrue(
+            isOpenAfterRemoteError,
+            "a settled duplex application error is operation-local"
+        )
         await rpc.close()
+
+        // QVAC 0.17's rejected duplex handlers can destroy their request half before
+        // serializing the JSON application error on the response direction. With no
+        // local write in flight, that ordering must remain operation-local and retain
+        // the response bytes for the consumer.
+        let halfClosedMock = MockTransport()
+        let halfClosedRPC = BareRPCClient(transport: halfClosedMock)
+        let (halfClosedSession, halfClosedFrames) = try await Self.openDuplex(
+            command: 18,
+            initialPayload: Data("metadata-2".utf8),
+            on: halfClosedRPC,
+            transport: halfClosedMock
+        )
+        guard case .request(let halfClosedID, _, _, _) = halfClosedFrames[0] else {
+            return XCTFail("expected second request frame")
+        }
+        await halfClosedMock.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+            id: halfClosedID,
+            flags: [.request, .destroy]
+        ))
+        let responseData = Data(
+            #"{"type":"error","code":52002,"message":"Model with ID \"missing-model\" not found"}"#.utf8
+        )
+        await halfClosedMock.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+            id: halfClosedID,
+            flags: [.response, .data],
+            payload: .data(responseData)
+        ))
+        await halfClosedMock.feedInbound(BareRPCCodec.__testEncodeStreamFrame(
+            id: halfClosedID,
+            flags: [.response, .end]
+        ))
+        try await Self.waitForNoInFlight(halfClosedRPC)
+
+        var retained: [Data] = []
+        for try await chunk in halfClosedSession.chunks { retained.append(chunk) }
+        XCTAssertEqual(retained, [responseData])
+        let isOpenAfterHalfClose = await halfClosedRPC.isOpen()
+        XCTAssertTrue(
+            isOpenAfterHalfClose,
+            "peer request-half teardown before a response must not poison an idle generation"
+        )
+
+        await halfClosedRPC.close()
     }
 
     func test_duplex_nil_and_finite_timeouts_share_remote_open_readiness() async throws {

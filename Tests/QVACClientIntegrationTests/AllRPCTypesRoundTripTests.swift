@@ -13,6 +13,114 @@ import Darwin
 
 final class AllRPCTypesRoundTripTests: XCTestCase {
 
+    private struct DuplexProbeTimeout: Error, Sendable, CustomStringConvertible {
+        let operation: String
+        let timeout: Duration
+
+        var description: String {
+            "\(operation) did not return its missing-model response within \(timeout)"
+        }
+    }
+
+    private struct DuplexProbeFailure: Error, Sendable, CustomStringConvertible {
+        let operation: String
+        let diagnostic: String
+
+        var description: String {
+            "\(operation) failed with an unexpected error: \(diagnostic)"
+        }
+    }
+
+    private enum DuplexProbeOutcome: Sendable {
+        case completed
+        case failed(QVACError)
+        case failedUnexpectedly(String)
+        case timedOut
+        case cancelled
+    }
+
+    /// A single-consumer race whose first resolution resumes the waiter exactly once.
+    /// The lock is the synchronization boundary for both the buffered outcome and the
+    /// continuation. Losing unstructured tasks may finish later, but the caller does not
+    /// await them and subsequent resolutions are ignored.
+    private final class DuplexProbeRace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var outcome: DuplexProbeOutcome?
+        private var continuation: CheckedContinuation<DuplexProbeOutcome, Never>?
+
+        func wait() async -> DuplexProbeOutcome {
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    let immediate: DuplexProbeOutcome? = lock.withLock {
+                        if let outcome { return outcome }
+                        self.continuation = continuation
+                        return nil
+                    }
+                    if let immediate {
+                        continuation.resume(returning: immediate)
+                    }
+                }
+            } onCancel: {
+                self.resolve(.cancelled)
+            }
+        }
+
+        func resolve(_ outcome: DuplexProbeOutcome) {
+            let continuation: CheckedContinuation<DuplexProbeOutcome, Never>? = lock.withLock {
+                guard self.outcome == nil else { return nil }
+                self.outcome = outcome
+                let continuation = self.continuation
+                self.continuation = nil
+                return continuation
+            }
+            continuation?.resume(returning: outcome)
+        }
+    }
+
+    /// Cancellation-oblivious one-shot gate used to prove that the probe deadline never
+    /// waits for a losing drain task. Tests explicitly open every gate before returning.
+    private final class DuplexProbeGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var isOpen = false
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        var hasOpened: Bool { lock.withLock { isOpen } }
+
+        func wait() async {
+            await withCheckedContinuation { continuation in
+                let resumeImmediately: Bool = lock.withLock {
+                    guard !isOpen else { return true }
+                    precondition(self.continuation == nil, "DuplexProbeGate supports one waiter")
+                    self.continuation = continuation
+                    return false
+                }
+                if resumeImmediately { continuation.resume() }
+            }
+        }
+
+        func open() {
+            let continuation: CheckedContinuation<Void, Never>? = lock.withLock {
+                guard !isOpen else { return nil }
+                isOpen = true
+                let continuation = self.continuation
+                self.continuation = nil
+                return continuation
+            }
+            continuation?.resume()
+        }
+    }
+
+    private final class LockedCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage = 0
+
+        var value: Int { lock.withLock { storage } }
+
+        func increment() {
+            lock.withLock { storage += 1 }
+        }
+    }
+
     private static let bareBin: URL? = {
         if let p = ProcessInfo.processInfo.environment["QVAC_BARE_BIN"] {
             return URL(fileURLWithPath: p)
@@ -76,8 +184,13 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
                     file: file,
                     line: line
                 )
-            case .transport(let reason, _):
-                XCTFail("\(name): transport failure — \(reason)", file: file, line: line)
+            case .transport(let reason, let underlying):
+                XCTFail(
+                    "\(name): transport failure — \(reason); "
+                        + "underlying=\(String(reflecting: underlying))",
+                    file: file,
+                    line: line
+                )
             case .connectionReset:
                 XCTFail("\(name): worker reconnected and lost in-memory state", file: file, line: line)
             case .requestTimedOut:
@@ -108,29 +221,205 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
         }
     }
 
-    /// A missing model can make the worker fail a duplex response immediately after
-    /// opening both half-streams. In that ordering the remote error has already closed
-    /// the request half by the time `end()` runs, so `end()` reports a local closed-stream
-    /// error even though the authoritative application error remains available from the
-    /// response half. Always drain that response before deciding which failure to report.
-    private func finishDuplexProbe(
-        end: () async throws -> Void,
-        drainResponses: () async throws -> Void
+    /// The pinned QVAC 0.17 missing-model paths return without awaiting additional
+    /// request-stream input or a local half-close. Completion orchestration starts its
+    /// background tool-result reader first, but model resolution does not await it.
+    /// Starting `end()` here would race the worker's own request-half teardown and could
+    /// correctly fail-close the transport while a write is in flight. Drain first, bound
+    /// the probe independently, and always destroy the session so a worker regression
+    /// cannot leave this required suite hanging.
+    private static func drainRejectedDuplexProbe(
+        operation: String,
+        timeout: Duration = .seconds(10),
+        destroy: @escaping @Sendable () -> Void,
+        drainResponses: @escaping @Sendable () async throws -> Void
     ) async throws {
-        let endError: Error?
-        do {
-            try await end()
-            endError = nil
-        } catch {
-            endError = error
+        let race = DuplexProbeRace()
+        let drainTask = Task {
+            do {
+                try await drainResponses()
+                race.resolve(.completed)
+            } catch let error as QVACError {
+                race.resolve(.failed(error))
+            } catch is CancellationError {
+                race.resolve(.cancelled)
+            } catch {
+                race.resolve(.failedUnexpectedly(String(reflecting: error)))
+            }
+        }
+        let timeoutTask = Task {
+            do {
+                try await Task.sleep(for: timeout)
+                race.resolve(.timedOut)
+            } catch {
+                // The probe resolved through its response or caller cancellation.
+            }
         }
 
-        do {
-            try await drainResponses()
-        } catch {
+        let outcome = await race.wait()
+        destroy()
+        drainTask.cancel()
+        timeoutTask.cancel()
+
+        switch outcome {
+        case .completed:
+            return
+        case .failed(let error):
             throw error
+        case .failedUnexpectedly(let diagnostic):
+            throw DuplexProbeFailure(operation: operation, diagnostic: diagnostic)
+        case .timedOut:
+            throw DuplexProbeTimeout(operation: operation, timeout: timeout)
+        case .cancelled:
+            throw CancellationError()
         }
-        if let endError { throw endError }
+    }
+
+    /// Exercise both deadline and caller-cancellation paths with a drain that deliberately
+    /// ignores cancellation. The safety tasks bound a broken implementation; the assertions
+    /// prove that a correct implementation returns before either losing drain can finish.
+    private func assertDuplexProbeWatchdogSemantics(
+        file: StaticString = #file,
+        line: UInt = #line
+    ) async {
+        let timeoutRelease = DuplexProbeGate()
+        let timeoutDrainFinished = DuplexProbeGate()
+        let timeoutDestroyCount = LockedCounter()
+        let timeoutSafety = Task {
+            do {
+                try await Task.sleep(for: .seconds(2))
+                timeoutRelease.open()
+            } catch {}
+        }
+        do {
+            try await Self.drainRejectedDuplexProbe(
+                operation: "watchdog-timeout-self-test",
+                timeout: .zero,
+                destroy: { timeoutDestroyCount.increment() },
+                drainResponses: {
+                    await timeoutRelease.wait()
+                    timeoutDrainFinished.open()
+                }
+            )
+            XCTFail("deadline probe unexpectedly completed", file: file, line: line)
+        } catch is DuplexProbeTimeout {
+            // expected
+        } catch {
+            XCTFail("deadline probe returned \(error)", file: file, line: line)
+        }
+        XCTAssertFalse(
+            timeoutDrainFinished.hasOpened,
+            "deadline waited for a cancellation-oblivious drain task",
+            file: file,
+            line: line
+        )
+        timeoutRelease.open()
+        await timeoutDrainFinished.wait()
+        timeoutSafety.cancel()
+        _ = await timeoutSafety.result
+        XCTAssertEqual(timeoutDestroyCount.value, 1, file: file, line: line)
+
+        let cancellationRelease = DuplexProbeGate()
+        let cancellationDrainFinished = DuplexProbeGate()
+        let cancellationDestroyCount = LockedCounter()
+        let cancellationSafety = Task {
+            do {
+                try await Task.sleep(for: .seconds(2))
+                cancellationRelease.open()
+            } catch {}
+        }
+        let cancellationOperation: @Sendable () async -> String = {
+            do {
+                try await Self.drainRejectedDuplexProbe(
+                    operation: "watchdog-cancellation-self-test",
+                    timeout: .seconds(10),
+                    destroy: { cancellationDestroyCount.increment() },
+                    drainResponses: {
+                        await cancellationRelease.wait()
+                        cancellationDrainFinished.open()
+                    }
+                )
+                return "completed"
+            } catch is CancellationError {
+                return "cancelled"
+            } catch {
+                return "failed: \(String(reflecting: error))"
+            }
+        }
+        let cancelledProbe = Task(operation: cancellationOperation)
+        cancelledProbe.cancel()
+        let cancellationResult = await cancelledProbe.value
+        XCTAssertFalse(
+            cancellationDrainFinished.hasOpened,
+            "caller cancellation waited for a cancellation-oblivious drain task",
+            file: file,
+            line: line
+        )
+        cancellationRelease.open()
+        await cancellationDrainFinished.wait()
+        cancellationSafety.cancel()
+        _ = await cancellationSafety.result
+        XCTAssertEqual(cancellationResult, "cancelled", file: file, line: line)
+        XCTAssertEqual(cancellationDestroyCount.value, 1, file: file, line: line)
+    }
+
+    /// The pinned worker must report the typed application error and keep the shared
+    /// process usable; either a transport substitute or an implicit reconnect is a failure.
+    private func assertMissingModelDuplexRoundTrip(
+        _ name: String,
+        client: QVACClient,
+        file: StaticString = #file,
+        line: UInt = #line,
+        block: () async throws -> Void
+    ) async {
+        var receivedExpectedError = false
+        do {
+            try await block()
+            XCTFail("\(name): missing-model probe unexpectedly succeeded", file: file, line: line)
+        } catch let error as QVACError {
+            switch error {
+            case .server(let code, let message):
+                XCTAssertEqual(code, .modelNotFound, file: file, line: line)
+                XCTAssertFalse(
+                    message?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true,
+                    "\(name): worker returned an empty missing-model diagnostic",
+                    file: file,
+                    line: line
+                )
+                receivedExpectedError = code == .modelNotFound
+            case .transport(let reason, let underlying):
+                XCTFail(
+                    "\(name): transport failure — \(reason); "
+                        + "underlying=\(String(reflecting: underlying))",
+                    file: file,
+                    line: line
+                )
+            default:
+                XCTFail("\(name): expected modelNotFound, got \(error)", file: file, line: line)
+            }
+        } catch {
+            XCTFail("\(name): unexpected error type — \(error)", file: file, line: line)
+        }
+
+        guard receivedExpectedError else { return }
+        do {
+            let heartbeat = try await client.heartbeat(
+                rpcOptions: .init(timeout: .seconds(5))
+            )
+            XCTAssertGreaterThan(
+                heartbeat.number,
+                0,
+                "\(name): worker generation was not reusable after rejection",
+                file: file,
+                line: line
+            )
+        } catch {
+            XCTFail(
+                "\(name): worker generation was not reusable after rejection — \(error)",
+                file: file,
+                line: line
+            )
+        }
     }
 
     /// Build a fresh client, run the closure, close.
@@ -156,6 +445,8 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
     // MARK: - The actual round-trip
 
     func test_all_public_apis_round_trip_at_the_wire_level() async throws {
+        await assertDuplexProbeWatchdogSemantics()
+
         try await withClient { client in
             let rpc = QVACRPCOptions(timeout: .seconds(5))
             let registryRPC = QVACRPCOptions(timeout: .seconds(60))
@@ -430,51 +721,67 @@ final class AllRPCTypesRoundTripTests: XCTestCase {
             }
 
             exercised.append("bciTranscribeStream")
-            await self.assertWireRoundTrip("bciTranscribeStream") {
+            await self.assertMissingModelDuplexRoundTrip(
+                "bciTranscribeStream",
+                client: client
+            ) {
                 let session = try await client.bciTranscribeStream(
                     modelId: missingModel,
                     rpcOptions: rpc
                 )
-                try await self.finishDuplexProbe(
-                    end: { try await session.end() },
+                try await Self.drainRejectedDuplexProbe(
+                    operation: "bciTranscribeStream",
+                    destroy: { session.destroy() },
                     drainResponses: { for try await _ in session.events {} }
                 )
             }
 
             exercised.append("completionOrchestrate")
-            await self.assertWireRoundTrip("completionOrchestrate") {
+            await self.assertMissingModelDuplexRoundTrip(
+                "completionOrchestrate",
+                client: client
+            ) {
                 let session = try await client.completionOrchestrate(
                     modelId: missingModel,
                     history: [.user("hello")],
                     tools: [],
                     rpcOptions: rpc
                 )
-                try await self.finishDuplexProbe(
-                    end: { try await session.end() },
+                try await Self.drainRejectedDuplexProbe(
+                    operation: "completionOrchestrate",
+                    destroy: { session.destroy() },
                     drainResponses: { for try await _ in session.events {} }
                 )
             }
 
             exercised.append("textToSpeechStream")
-            await self.assertWireRoundTrip("textToSpeechStream") {
+            await self.assertMissingModelDuplexRoundTrip(
+                "textToSpeechStream",
+                client: client
+            ) {
                 let session = try await client.textToSpeechStream(
                     modelId: missingModel,
                     rpcOptions: rpc
                 )
-                try await self.finishDuplexProbe(
-                    end: { try await session.end() },
+                try await Self.drainRejectedDuplexProbe(
+                    operation: "textToSpeechStream",
+                    destroy: { session.destroy() },
                     drainResponses: { for try await _ in session.chunks {} }
                 )
             }
 
             exercised.append("transcribeStream")
-            await self.assertWireRoundTrip("transcribeStream") {
+            await self.assertMissingModelDuplexRoundTrip(
+                "transcribeStream",
+                client: client
+            ) {
                 let session = try await client.transcribeStream(
                     modelId: missingModel,
                     rpcOptions: rpc
                 )
-                try await self.finishDuplexProbe(
-                    end: { try await session.end() },
+                try await Self.drainRejectedDuplexProbe(
+                    operation: "transcribeStream",
+                    destroy: { session.destroy() },
                     drainResponses: { for try await _ in session.events {} }
                 )
             }
