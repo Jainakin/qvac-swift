@@ -356,11 +356,20 @@ function validateWorkspaceState(derivedData, sourceRoot, artifactInventory) {
     maximumMetadataBytes,
   )
   const state = parseJSON(workspaceStateBytes, 'SwiftPM workspace state')
-  if (state.version !== 7 || !state.object || typeof state.object !== 'object'
-      || !Array.isArray(state.object.artifacts)
+  exactKeys(state, ['object', 'version'], 'SwiftPM workspace state')
+  if (state.version !== 7) fail('SwiftPM workspace state has an unsupported schema')
+  exactKeys(
+    state.object,
+    ['artifacts', 'dependencies', 'prebuilts'],
+    'SwiftPM workspace state object',
+  )
+  if (!Array.isArray(state.object.artifacts)
       || !Array.isArray(state.object.dependencies) || state.object.dependencies.length !== 0
       || !Array.isArray(state.object.prebuilts) || state.object.prebuilts.length !== 0) {
     fail('SwiftPM workspace state has an unsupported schema or external dependencies')
+  }
+  if (basename(sourceRoot) !== isolatedSourceRootName) {
+    fail(`isolated source root must be named ${isolatedSourceRootName}`)
   }
   const artifacts = state.object.artifacts
   const names = artifacts.map(artifact => artifact?.targetName).sort()
@@ -373,13 +382,23 @@ function validateWorkspaceState(derivedData, sourceRoot, artifactInventory) {
     'isolated staged artifact root',
   )
   for (const artifact of artifacts) {
-    if (!artifact || typeof artifact !== 'object'
-        || artifact.source?.type !== 'local'
-        || artifact.packageRef?.identity !== isolatedSourceRootName
-        || artifact.packageRef?.kind !== 'root'
-        || artifact.packageRef?.name !== isolatedSourceRootName
-        || artifact.kind?.xcframework === undefined) {
-      fail(`resolved artifact ${artifact?.targetName ?? '<unknown>'} is not a local root-package XCFramework`)
+    const label = `resolved artifact ${artifact?.targetName ?? '<unknown>'}`
+    exactKeys(artifact, ['kind', 'packageRef', 'path', 'source', 'targetName'], label)
+    exactKeys(artifact.source, ['type'], `${label} source`)
+    exactKeys(
+      artifact.packageRef,
+      ['identity', 'kind', 'location', 'name'],
+      `${label} package reference`,
+    )
+    exactKeys(artifact.kind, ['xcframework'], `${label} kind`)
+    exactKeys(artifact.kind.xcframework, [], `${label} XCFramework kind`)
+    if (artifact.source.type !== 'local'
+        || artifact.packageRef.identity !== isolatedSourceRootName
+        || artifact.packageRef.kind !== 'root'
+        || artifact.packageRef.name !== isolatedSourceRootName
+        || typeof artifact.path !== 'string'
+        || typeof artifact.targetName !== 'string') {
+      fail(`${label} is not a local root-package XCFramework`)
     }
     let packageLocation
     let artifactPath
@@ -1070,6 +1089,34 @@ function selfTest() {
         label,
       )
     }
+    expectWorkspaceFailure(
+      state => { state.unreviewed = true },
+      'an extra workspace-state field',
+    )
+    expectWorkspaceFailure(
+      state => { state.object.unreviewed = [] },
+      'an extra workspace object field',
+    )
+    expectWorkspaceFailure(
+      state => { state.object.artifacts[0].unreviewed = true },
+      'an extra artifact field',
+    )
+    expectWorkspaceFailure(
+      state => { state.object.artifacts[0].source.url = 'https://example.invalid' },
+      'hybrid local and remote source metadata',
+    )
+    expectWorkspaceFailure(
+      state => { state.object.artifacts[0].packageRef.unreviewed = true },
+      'an extra package-reference field',
+    )
+    expectWorkspaceFailure(
+      state => { state.object.artifacts[0].kind.artifactBundle = {} },
+      'contradictory artifact-kind metadata',
+    )
+    expectWorkspaceFailure(
+      state => { state.object.artifacts[0].kind.xcframework = null },
+      'a malformed XCFramework kind',
+    )
     expectWorkspaceFailure(
       state => { state.object.artifacts[0].packageRef.identity = 'qvac-swift' },
       'the pre-isolation package identity',
