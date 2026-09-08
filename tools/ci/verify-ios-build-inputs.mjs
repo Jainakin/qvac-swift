@@ -850,7 +850,7 @@ export function verifyIsolatedBuildInputs({
 
   const fixture = mkdtempSync(join(tmpdir(), 'qvac-isolated-source-reproduction.'))
   try {
-    const expectedRoot = join(fixture, 'source')
+    const expectedRoot = join(fixture, isolatedSourceRootName)
     mkdirSync(expectedRoot)
     run(
       'tar',
